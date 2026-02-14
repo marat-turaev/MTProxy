@@ -790,7 +790,13 @@ static int _notify_remote_closed (JOB_REF_ARG(C), long long out_conn_id) {
 
 void push_rpc_confirmation (JOB_REF_ARG (C), int confirm) {
 
-  if ((lrand48_j() & 1) || !(TCP_RPC_DATA(C)->flags & RPC_F_PAD)) {
+  /*
+   * In padded modes (dd / TLS transport), avoid emitting the special 5-byte
+   * quick-ack packet (0xdd + 4 bytes).
+   *
+   * Keep it only for non-padded modes for compatibility.
+   */
+  if (!(TCP_RPC_DATA(C)->flags & RPC_F_PAD)) {
     struct raw_message *msg = malloc (sizeof (struct raw_message));
     rwm_create (msg, "\xdd", 1);
     rwm_push_data (msg, &confirm, 4);
