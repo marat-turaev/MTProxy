@@ -252,6 +252,10 @@ struct connection_info {
   int listening, listening_generation;
   int window_clamp;
   int left_tls_packet_length;
+  // If >0, socket writer will limit writev() sizes for the first bytes (TLS server flight shaping).
+  // Used to influence TCP segmentation without changing TLS record structure.
+  int tls_write_shaping_left;
+  int tls_write_shaping_chunk_left;
 
   struct raw_message in_u, in, out, out_p;
 

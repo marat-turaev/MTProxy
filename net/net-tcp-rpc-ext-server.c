@@ -1394,6 +1394,11 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         mpq_push_w (c->out_queue, m, 0);
         job_signal (JOB_REF_CREATE_PASS (C), JS_RUN);
 
+        // Shape TCP segmentation of the first server flight for TLS transport.
+        // This does not change bytes on the wire, only how many bytes we attempt to write per syscall.
+        __atomic_store_n (&c->tls_write_shaping_left, response_size, __ATOMIC_RELAXED);
+        __atomic_store_n (&c->tls_write_shaping_chunk_left, 0, __ATOMIC_RELAXED);
+
         free (buffer);
         return 11; // waiting for dummy ChangeCipherSpec and first packet
       }

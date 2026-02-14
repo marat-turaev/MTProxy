@@ -943,6 +943,27 @@ int net_server_socket_reader (socket_connection_job_t C) /* {{{ */ {
 /* 
   Get data from out raw message and writes it to socket 
 */
+static int clamp_iovec_bytes (struct iovec *iov, int *iovcnt, int limit) {
+  if (limit <= 0) {
+    return 0;
+  }
+  int t = 0;
+  int i;
+  for (i = 0; i < *iovcnt; i++) {
+    if (t + (int)iov[i].iov_len >= limit) {
+      int left = limit - t;
+      if (left < 0) {
+        left = 0;
+      }
+      iov[i].iov_len = (size_t)left;
+      *iovcnt = i + 1;
+      return limit;
+    }
+    t += (int)iov[i].iov_len;
+  }
+  return t;
+}
+
 int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
   assert_net_net_thread ();
   struct socket_connection_info *c = SOCKET_CONN_INFO (C);
@@ -965,6 +986,28 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
 
     int s = tcp_prepare_iovec (iov, &iovcnt, sizeof (iov) / sizeof (iov[0]), out);
     assert (iovcnt > 0 && s > 0);
+
+    // TCP segmentation shaping for TLS server flight: limit writev() chunk sizes for the first bytes.
+    // This keeps TLS record structure intact while changing packetization.
+    connection_job_t CC = c->conn;
+    struct connection_info *ci = CC ? CONN_INFO (CC) : NULL;
+    int tls_shape_left = ci ? __atomic_load_n (&ci->tls_write_shaping_left, __ATOMIC_RELAXED) : 0;
+    if (ci && tls_shape_left > 0) {
+      int tls_shape_chunk_left = __atomic_load_n (&ci->tls_write_shaping_chunk_left, __ATOMIC_RELAXED);
+      if (tls_shape_chunk_left <= 0) {
+          // Pick a chunk size close to MSS but slightly jittered.
+          int chunk = 1200 + (lrand48_j () % 241); // 1200..1440
+          if (chunk < 256) { chunk = 256; }
+          if (chunk > tls_shape_left) { chunk = tls_shape_left; }
+          tls_shape_chunk_left = chunk;
+          __atomic_store_n (&ci->tls_write_shaping_chunk_left, tls_shape_chunk_left, __ATOMIC_RELAXED);
+      }
+      int lim = tls_shape_chunk_left;
+      if (lim > 0 && lim < s) {
+        clamp_iovec_bytes (iov, &iovcnt, lim);
+        s = lim;
+      }
+    }
 
     __sync_fetch_and_or (&c->flags, C_NOWR);
     int r = writev (c->fd, iov, iovcnt);
@@ -1002,6 +1045,18 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
 
     if (r > 0) {
       rwm_skip_data (out, r);
+      if (ci && tls_shape_left > 0) {
+        int new_left = tls_shape_left - r;
+        if (new_left <= 0) {
+          __atomic_store_n (&ci->tls_write_shaping_left, 0, __ATOMIC_RELAXED);
+          __atomic_store_n (&ci->tls_write_shaping_chunk_left, 0, __ATOMIC_RELAXED);
+        } else {
+          __atomic_store_n (&ci->tls_write_shaping_left, new_left, __ATOMIC_RELAXED);
+          int new_chunk_left = __atomic_load_n (&ci->tls_write_shaping_chunk_left, __ATOMIC_RELAXED) - r;
+          if (new_chunk_left < 0) { new_chunk_left = 0; }
+          __atomic_store_n (&ci->tls_write_shaping_chunk_left, new_chunk_left, __ATOMIC_RELAXED);
+        }
+      }
       if (c->type->data_sent) {
         c->type->data_sent (C, r);
       }
