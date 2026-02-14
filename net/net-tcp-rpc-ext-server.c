@@ -1314,17 +1314,33 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         c->flags |= C_IS_TLS;
         c->left_tls_packet_length = -1;
 
-        int records = get_domain_server_hello_encrypted_records (info);
+        // TLS-transport clients expect exactly one ApplicationData record in the server flight.
+        // Emitting multiple records here makes some clients disconnect immediately.
+        // However, to better mimic real servers that may use multiple encrypted records, we can fold the
+        // total wire size of the "encrypted" part into a single record payload (same total bytes, fewer records).
+        int records_real = get_domain_server_hello_encrypted_records (info);
         int encrypted_sizes[3] = {0, 0, 0};
-        int response_size = 127 + 6;
         int ri;
-        for (ri = 0; ri < records; ri++) {
+        int encrypted_wire_total = 0; // includes per-record 5-byte TLS record headers
+        for (ri = 0; ri < records_real; ri++) {
           encrypted_sizes[ri] = get_domain_server_hello_encrypted_size_n (info, ri);
           if (encrypted_sizes[ri] <= 0) {
             encrypted_sizes[ri] = 1;
           }
-          response_size += 5 + encrypted_sizes[ri];
+          encrypted_wire_total += 5 + encrypted_sizes[ri];
         }
+        // single ApplicationData record payload length; preserve total bytes on wire:
+        // payload = sum(payloads) + 5*(records_real-1)
+        int encrypted_payload_size = encrypted_wire_total - 5;
+        if (encrypted_payload_size <= 0) {
+          encrypted_payload_size = 1;
+        }
+        // TLS record length is 16-bit and normally limited to 16384 bytes.
+        if (encrypted_payload_size > 16384) {
+          encrypted_payload_size = 16384;
+        }
+
+        int response_size = 127 + 6 + 5 + encrypted_payload_size;
         unsigned char *buffer = malloc (32 + response_size);
         assert (buffer != NULL);
         memcpy (buffer, client_random, 32);
@@ -1361,15 +1377,12 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         assert (pos == 127);
         memcpy (response_buffer + pos, "\x14\x03\x03\x00\x01\x01", 6);
         pos += 6;
-        for (ri = 0; ri < records; ri++) {
-          int esz = encrypted_sizes[ri];
           memcpy (response_buffer + pos, "\x17\x03\x03", 3);
           pos += 3;
-          response_buffer[pos++] = esz / 256;
-          response_buffer[pos++] = esz % 256;
-          RAND_bytes (response_buffer + pos, esz);
-          pos += esz;
-        }
+        response_buffer[pos++] = encrypted_payload_size / 256;
+        response_buffer[pos++] = encrypted_payload_size % 256;
+        RAND_bytes (response_buffer + pos, encrypted_payload_size);
+        pos += encrypted_payload_size;
         assert (pos == response_size);
 
         unsigned char server_random[32];
