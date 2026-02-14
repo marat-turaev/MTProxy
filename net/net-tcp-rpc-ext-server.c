@@ -162,8 +162,13 @@ struct domain_info {
   struct in_addr target;
   unsigned char target_ipv6[16];
   short server_hello_encrypted_size;
+  short server_hello_encrypted_size2;
+  short server_hello_encrypted_size3;
   char use_random_encrypted_size;
+  char use_random_encrypted_size2;
+  char use_random_encrypted_size3;
   char is_reversed_extension_order;
+  char server_hello_encrypted_records;  // number of TLS ApplicationData records to emulate (1..3)
   struct domain_info *next;
 };
 
@@ -198,6 +203,32 @@ static int get_domain_server_hello_encrypted_size (const struct domain_info *inf
     return info->server_hello_encrypted_size + ((r >> 1) & 1) - (r & 1);
   } else {
     return info->server_hello_encrypted_size;
+  }
+}
+
+static int get_domain_server_hello_encrypted_records (const struct domain_info *info) {
+  int n = info->server_hello_encrypted_records;
+  return (n >= 1 && n <= 3) ? n : 1;
+}
+
+static int get_domain_server_hello_encrypted_size_n (const struct domain_info *info, int idx) {
+  switch (idx) {
+  case 0:
+    return get_domain_server_hello_encrypted_size (info);
+  case 1:
+    if (info->use_random_encrypted_size2) {
+      int r = rand();
+      return info->server_hello_encrypted_size2 + ((r >> 1) & 1) - (r & 1);
+    }
+    return info->server_hello_encrypted_size2;
+  case 2:
+    if (info->use_random_encrypted_size3) {
+      int r = rand();
+      return info->server_hello_encrypted_size3 + ((r >> 1) & 1) - (r & 1);
+    }
+    return info->server_hello_encrypted_size3;
+  default:
+    return 0;
   }
 }
 
@@ -387,7 +418,10 @@ static int read_length (const unsigned char *response, int *pos) {
   return response[*pos - 2] * 256 + response[*pos - 1];
 }
 
-static int check_response (const unsigned char *response, int len, const unsigned char *request_session_id, int *is_reversed_extension_order, int *encrypted_application_data_length) {
+static int check_response (const unsigned char *response, int len, const unsigned char *request_session_id,
+                           int *is_reversed_extension_order,
+                           int *encrypted_application_data_records,
+                           int encrypted_application_data_lengths[3]) {
 #define FAIL(error) {                                               \
     kprintf ("Failed to parse upstream TLS response: " error "\n"); \
     return 0;                                                       \
@@ -464,20 +498,31 @@ static int check_response (const unsigned char *response, int len, const unsigne
 
   CHECK_LENGTH(9);
   EXPECT_STR(pos, "\x14\x03\x03\x00\x01\x01", "Expected dummy ChangeCipherSpec");
-  EXPECT_STR(pos + 6, "\x17\x03\x03", "Expected encrypted application data");
-  pos += 9;
+  pos += 6;
 
-  CHECK_LENGTH(2);
-  *encrypted_application_data_length = read_length (response, &pos);
-  if (*encrypted_application_data_length == 0) {
-    FAIL("Receive empty encrypted application data");
+  int rec_cnt = 0;
+  while (pos < len) {
+    CHECK_LENGTH(5);
+    EXPECT_STR(pos, "\x17\x03\x03", "Expected encrypted application data");
+    pos += 3;
+
+    CHECK_LENGTH(2);
+    int rlen = read_length (response, &pos);
+    if (rlen == 0) {
+      FAIL("Receive empty encrypted application data");
+    }
+    CHECK_LENGTH(rlen);
+    if (rec_cnt < 3) {
+      encrypted_application_data_lengths[rec_cnt] = rlen;
+    }
+    rec_cnt++;
+    pos += rlen;
   }
 
-  CHECK_LENGTH(*encrypted_application_data_length);
-  pos += *encrypted_application_data_length;
   if (pos != len) {
     FAIL("Too long");
   }
+  *encrypted_application_data_records = rec_cnt;
 #undef FAIL
 #undef CHECK_LENGTH
 #undef EXPECT_STR
@@ -553,16 +598,17 @@ static int update_domain_info (struct domain_info *info) {
   }
   unsigned char *responses[TRIES] = {};
   int response_len[TRIES] = {};
-  int is_encrypted_application_data_length_read[TRIES] = {};
+  int is_encrypted_application_data_length_read[TRIES] = {};  // 0 = need first appdata length; 1 = have it
+  int encrypted_application_data_records_read[TRIES] = {};    // number of complete appdata records read into buffer (max 3)
 
   int finished_count = 0;
   int is_written[TRIES] = {};
   int is_finished[TRIES] = {};
   int read_pos[TRIES] = {};
   double finish_time = get_utime_monotonic() + 5.0;
-  int encrypted_application_data_length_min = 0;
-  int encrypted_application_data_length_sum = 0;
-  int encrypted_application_data_length_max = 0;
+  int try_is_reversed_extension_order[TRIES] = {};
+  int try_encrypted_application_data_records[TRIES] = {};
+  int try_encrypted_application_data_lengths[TRIES][3] = {{0}};
   int is_reversed_extension_order_min = 0;
   int is_reversed_extension_order_max = 0;
   int have_error = 0;
@@ -623,10 +669,10 @@ static int update_domain_info (struct domain_info *info) {
             have_error = 1;
             break;
           }
-          read_pos[i] += read_res;
+	          read_pos[i] += read_res;
 
-          if (read_pos[i] == response_len[i]) {
-            if (!is_encrypted_application_data_length_read[i]) {
+	          if (read_pos[i] == response_len[i]) {
+	            if (!is_encrypted_application_data_length_read[i]) {
               if (memcmp (responses[i] + response_len[i] - 11, "\x14\x03\x03\x00\x01\x01\x17\x03\x03", 9) != 0) {
                 kprintf ("Not found TLS 1.3 support on domain %s\n", domain);
                 have_error = 1;
@@ -636,40 +682,53 @@ static int update_domain_info (struct domain_info *info) {
               is_encrypted_application_data_length_read[i] = 1;
               int encrypted_application_data_length = responses[i][response_len[i] - 2] * 256 + responses[i][response_len[i] - 1];
               response_len[i] += encrypted_application_data_length;
-              unsigned char *new_buffer = realloc (responses[i], response_len[i]);
-              assert (new_buffer != NULL);
-              responses[i] = new_buffer;
-              continue;
-            }
+	              unsigned char *new_buffer = realloc (responses[i], response_len[i]);
+	              assert (new_buffer != NULL);
+	              responses[i] = new_buffer;
+	              continue;
+	            }
 
-            int is_reversed_extension_order = -1;
-            int encrypted_application_data_length = -1;
-            if (check_response (responses[i], response_len[i], requests[i] + 44, &is_reversed_extension_order, &encrypted_application_data_length)) {
-              assert (is_reversed_extension_order != -1);
-              assert (encrypted_application_data_length != -1);
-              if (finished_count == 0) {
-                is_reversed_extension_order_min = is_reversed_extension_order;
-                is_reversed_extension_order_max = is_reversed_extension_order;
-                encrypted_application_data_length_min = encrypted_application_data_length;
-                encrypted_application_data_length_max = encrypted_application_data_length;
-              } else {
-                if (is_reversed_extension_order < is_reversed_extension_order_min) {
-                  is_reversed_extension_order_min = is_reversed_extension_order;
-                }
-                if (is_reversed_extension_order > is_reversed_extension_order_max) {
-                  is_reversed_extension_order_max = is_reversed_extension_order;
-                }
-                if (encrypted_application_data_length < encrypted_application_data_length_min) {
-                  encrypted_application_data_length_min = encrypted_application_data_length;
-                }
-                if (encrypted_application_data_length > encrypted_application_data_length_max) {
-                  encrypted_application_data_length_max = encrypted_application_data_length;
-                }
-              }
-              encrypted_application_data_length_sum += encrypted_application_data_length;
+	            // Finished reading one full encrypted application data record.
+	            if (encrypted_application_data_records_read[i] < 3) {
+	              encrypted_application_data_records_read[i]++;
+	            }
 
-              FD_CLR(sockets[i], &write_fd);
-              FD_CLR(sockets[i], &read_fd);
+	            // Try to read additional TLS ApplicationData records if they are immediately available.
+	            if (encrypted_application_data_records_read[i] < 3) {
+	              unsigned char hdr2[5];
+	              ssize_t pr = recv (sockets[i], hdr2, 5, MSG_PEEK);
+	              if (pr == 5 && !memcmp (hdr2, "\x17\x03\x03", 3)) {
+	                int l2 = hdr2[3] * 256 + hdr2[4];
+	                if (l2 > 0) {
+	                  response_len[i] += 5 + l2;
+	                  unsigned char *new_buffer = realloc (responses[i], response_len[i]);
+	                  assert (new_buffer != NULL);
+	                  responses[i] = new_buffer;
+	                  continue;
+	                }
+	              }
+	            }
+
+	            int is_reversed_extension_order = -1;
+	            int encrypted_application_data_records = -1;
+	            int encrypted_application_data_lengths[3] = {0, 0, 0};
+	            if (check_response (responses[i], response_len[i], requests[i] + 44,
+	                                &is_reversed_extension_order,
+	                                &encrypted_application_data_records,
+	                                encrypted_application_data_lengths)) {
+	              assert (is_reversed_extension_order != -1);
+	              assert (encrypted_application_data_records > 0);
+	              try_is_reversed_extension_order[i] = is_reversed_extension_order;
+	              try_encrypted_application_data_records[i] = encrypted_application_data_records;
+	              {
+	                int k;
+	                for (k = 0; k < 3; k++) {
+	                  try_encrypted_application_data_lengths[i][k] = encrypted_application_data_lengths[k];
+	                }
+	              }
+
+	              FD_CLR(sockets[i], &write_fd);
+	              FD_CLR(sockets[i], &read_fd);
               FD_CLR(sockets[i], &except_fd);
               is_finished[i] = 1;
               finished_count++;
@@ -711,30 +770,93 @@ static int update_domain_info (struct domain_info *info) {
     return 0;
   }
 
+  // Compute min/max extension order flags and most common record count.
+  is_reversed_extension_order_min = try_is_reversed_extension_order[0];
+  is_reversed_extension_order_max = try_is_reversed_extension_order[0];
+  int records_cnt_hist[8] = {};
+  for (i = 0; i < TRIES; i++) {
+    int rev = try_is_reversed_extension_order[i];
+    if (rev < is_reversed_extension_order_min) { is_reversed_extension_order_min = rev; }
+    if (rev > is_reversed_extension_order_max) { is_reversed_extension_order_max = rev; }
+
+    int rc = try_encrypted_application_data_records[i];
+    if (rc < 0) { rc = 0; }
+    if (rc > 7) { rc = 7; }
+    records_cnt_hist[rc]++;
+  }
+
   if (is_reversed_extension_order_min != is_reversed_extension_order_max) {
     kprintf ("Upstream server %s uses non-deterministic extension order\n", domain);
   }
 
   info->is_reversed_extension_order = (char)is_reversed_extension_order_min;
 
-  if (encrypted_application_data_length_min == encrypted_application_data_length_max) {
-    info->server_hello_encrypted_size = encrypted_application_data_length_min;
-    info->use_random_encrypted_size = 0;
-  } else if (encrypted_application_data_length_max - encrypted_application_data_length_min <= 3) {
-    info->server_hello_encrypted_size = encrypted_application_data_length_max - 1;
-    info->use_random_encrypted_size = 1;
-  } else {
-    kprintf ("Unrecognized encrypted application data length pattern with min = %d, max = %d, mean = %.3lf\n",
-             encrypted_application_data_length_min, encrypted_application_data_length_max, encrypted_application_data_length_sum * 1.0 / TRIES);
-    info->server_hello_encrypted_size = (int)(encrypted_application_data_length_sum * 1.0 / TRIES + 0.5);
-    info->use_random_encrypted_size = 1;
+  int best_records = 1, best_cnt = records_cnt_hist[1];
+  int r;
+  for (r = 2; r < 8; r++) {
+    if (records_cnt_hist[r] > best_cnt) {
+      best_cnt = records_cnt_hist[r];
+      best_records = r;
+    }
+  }
+  if (best_records < 1) { best_records = 1; }
+  if (best_records > 3) { best_records = 3; }
+  info->server_hello_encrypted_records = (char)best_records;
+
+  // Per-record stats only over tries matching the chosen record count.
+  {
+    int cnt = 0;
+    int mn[3] = {0, 0, 0};
+    int mx[3] = {0, 0, 0};
+    long long sum[3] = {0, 0, 0};
+
+    for (i = 0; i < TRIES; i++) {
+      if (try_encrypted_application_data_records[i] != best_records) {
+        continue;
+      }
+      int k;
+      for (k = 0; k < best_records && k < 3; k++) {
+        int v = try_encrypted_application_data_lengths[i][k];
+        if (!cnt) {
+          mn[k] = mx[k] = v;
+        } else {
+          if (v < mn[k]) { mn[k] = v; }
+          if (v > mx[k]) { mx[k] = v; }
+        }
+        sum[k] += v;
+      }
+      cnt++;
+    }
+
+    int idx;
+    for (idx = 0; idx < 3; idx++) {
+      short *dst_size = idx == 0 ? &info->server_hello_encrypted_size : (idx == 1 ? &info->server_hello_encrypted_size2 : &info->server_hello_encrypted_size3);
+      char *dst_rand = idx == 0 ? &info->use_random_encrypted_size : (idx == 1 ? &info->use_random_encrypted_size2 : &info->use_random_encrypted_size3);
+
+      if (idx >= best_records) {
+        *dst_size = 0;
+        *dst_rand = 0;
+        continue;
+      }
+
+      int mnv = mn[idx];
+      int mxv = mx[idx];
+      if (mnv == mxv) {
+        *dst_size = mnv;
+        *dst_rand = 0;
+      } else if (mxv - mnv <= 3) {
+        *dst_size = mxv - 1;
+        *dst_rand = 1;
+      } else {
+        *dst_size = (short)(sum[idx] * 1.0 / (cnt ? cnt : 1) + 0.5);
+        *dst_rand = 1;
+      }
+    }
   }
 
-  vkprintf (0, "Successfully checked domain %s in %.3lf seconds: is_reversed_extension_order = %d, server_hello_encrypted_size = %d, use_random_encrypted_size = %d\n",
-            domain, get_utime_monotonic() - (finish_time - 5.0), info->is_reversed_extension_order, info->server_hello_encrypted_size, info->use_random_encrypted_size);
-  if (info->is_reversed_extension_order && info->server_hello_encrypted_size <= 1250) {
-    kprintf ("Multiple encrypted client data packets are unsupported, so handshake with %s will not be fully emulated\n", domain);
-  }
+  vkprintf (0, "Successfully checked domain %s in %.3lf seconds: is_reversed_extension_order = %d, records = %d, size = %d,%d,%d\n",
+            domain, get_utime_monotonic() - (finish_time - 5.0), info->is_reversed_extension_order, (int)info->server_hello_encrypted_records,
+            info->server_hello_encrypted_size, info->server_hello_encrypted_size2, info->server_hello_encrypted_size3);
   return 1;
 #undef TRIES
 }
@@ -816,8 +938,13 @@ void tcp_rpc_init_proxy_domains() {
         kprintf ("Failed to update response data about %s, so default response settings wiil be used\n", info->domain);
         // keep target addresses as is
         info->is_reversed_extension_order = 0;
+        info->server_hello_encrypted_records = 1;
         info->use_random_encrypted_size = 1;
         info->server_hello_encrypted_size = 2500 + rand() % 1120;
+        info->use_random_encrypted_size2 = 0;
+        info->use_random_encrypted_size3 = 0;
+        info->server_hello_encrypted_size2 = 0;
+        info->server_hello_encrypted_size3 = 0;
       }
 
       info = info->next;
@@ -1187,8 +1314,17 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         c->flags |= C_IS_TLS;
         c->left_tls_packet_length = -1;
 
-        int encrypted_size = get_domain_server_hello_encrypted_size (info);
-        int response_size = 127 + 6 + 5 + encrypted_size;
+        int records = get_domain_server_hello_encrypted_records (info);
+        int encrypted_sizes[3] = {0, 0, 0};
+        int response_size = 127 + 6;
+        int ri;
+        for (ri = 0; ri < records; ri++) {
+          encrypted_sizes[ri] = get_domain_server_hello_encrypted_size_n (info, ri);
+          if (encrypted_sizes[ri] <= 0) {
+            encrypted_sizes[ri] = 1;
+          }
+          response_size += 5 + encrypted_sizes[ri];
+        }
         unsigned char *buffer = malloc (32 + response_size);
         assert (buffer != NULL);
         memcpy (buffer, client_random, 32);
@@ -1223,12 +1359,18 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
           }
         }
         assert (pos == 127);
-        memcpy (response_buffer + 127, "\x14\x03\x03\x00\x01\x01\x17\x03\x03", 9);
-        pos += 9;
-        response_buffer[pos++] = encrypted_size / 256;
-        response_buffer[pos++] = encrypted_size % 256;
-        assert (pos + encrypted_size == response_size);
-        RAND_bytes (response_buffer + pos, encrypted_size);
+        memcpy (response_buffer + pos, "\x14\x03\x03\x00\x01\x01", 6);
+        pos += 6;
+        for (ri = 0; ri < records; ri++) {
+          int esz = encrypted_sizes[ri];
+          memcpy (response_buffer + pos, "\x17\x03\x03", 3);
+          pos += 3;
+          response_buffer[pos++] = esz / 256;
+          response_buffer[pos++] = esz % 256;
+          RAND_bytes (response_buffer + pos, esz);
+          pos += esz;
+        }
+        assert (pos == response_size);
 
         unsigned char server_random[32];
         sha256_hmac (ext_secret[secret_id], 16, buffer, 32 + response_size, server_random);
