@@ -256,6 +256,9 @@ struct connection_info {
   // Used to influence TCP segmentation without changing TLS record structure.
   int tls_write_shaping_left;
   int tls_write_shaping_chunk_left;
+  // Count of synthetic TLS ApplicationData records we emitted on this connection.
+  // Used for post-handshake TLS record sizing heuristics (traffic shaping).
+  int tls_out_records_sent;
 
   struct raw_message in_u, in, out, out_p;
 

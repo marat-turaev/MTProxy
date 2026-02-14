@@ -243,14 +243,50 @@ int cpu_tcp_aes_crypto_ctr128_encrypt_output (connection_job_t C) /* {{{ */ {
     int len = c->out.total_bytes;
     if (c->flags & C_IS_TLS) {
       assert (c->left_tls_packet_length >= 0);
-      const int MAX_PACKET_LENGTH = 1425;
-      if (MAX_PACKET_LENGTH < len) {
-        len = MAX_PACKET_LENGTH;
+      // TLS transport historically used a fixed max record size (1425),
+      // which is a fixed fixed-pattern behavior. Vary record sizes (especially early) while
+      // keeping them within reasonable limits for MTU and buffering.
+      const int LEGACY_MAX_PACKET_LENGTH = 1425;
+      const int EARLY_MAX_PACKET_LENGTH = 4096;
+      const int EARLY_RECORDS = 32;
+
+      int max_len = len;
+      int min_len = 1;
+
+      if (c->tls_out_records_sent < EARLY_RECORDS) {
+        if (max_len > EARLY_MAX_PACKET_LENGTH) {
+          max_len = EARLY_MAX_PACKET_LENGTH;
+        }
+        // If we have enough buffered plaintext, avoid always sending tiny records.
+        if (max_len >= 256) {
+          min_len = 256;
+        } else {
+          min_len = max_len;
+        }
+      } else {
+        if (max_len > LEGACY_MAX_PACKET_LENGTH) {
+          max_len = LEGACY_MAX_PACKET_LENGTH;
+        }
+        // Occasionally deviate from the legacy max even in steady state.
+        if (max_len == LEGACY_MAX_PACKET_LENGTH && ((lrand48_j () & 31) == 0)) {
+          int jitter = 1 + (lrand48_j () % 256);
+          max_len -= jitter;
+        }
+        min_len = max_len;
+      }
+
+      if (min_len < 1) { min_len = 1; }
+      if (max_len < min_len) { max_len = min_len; }
+
+      len = max_len;
+      if (max_len > min_len) {
+        len = min_len + (lrand48_j () % (max_len - min_len + 1));
       }
 
       unsigned char header[5] = {0x17, 0x03, 0x03, len >> 8, len & 255};
       rwm_push_data (&c->out_p, header, 5);
-      vkprintf (2, "Send TLS-packet of length %d\n", len);
+      c->tls_out_records_sent++;
+      vkprintf (2, "Send TLS-packet of length %d (records_sent=%d)\n", len, c->tls_out_records_sent);
     }
 
     assert (rwm_encrypt_decrypt_to (&c->out, &c->out_p, len, T->write_aeskey, 1) == len);
