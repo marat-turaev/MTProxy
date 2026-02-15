@@ -58,6 +58,8 @@
 #include "net/net-tcp-rpc-ext-server.h"
 #include "net/net-crypto-aes.h"
 #include "net/net-crypto-dh.h"
+#include "net/net-msg.h"
+#include "net/net-thread.h"
 #include "mtproto-common.h"
 #include "mtproto-config.h"
 #include "common/tl-parse.h"
@@ -2081,6 +2083,16 @@ void cron (void) {
   compute_stats_sum ();
   check_special_connections_overflow ();
   check_all_conn_buffers ();
+
+  static int last_pool_trim_time;
+  if (!last_pool_trim_time) {
+    last_pool_trim_time = now;
+  }
+  if (now - last_pool_trim_time >= 60) {
+    net_msg_pools_trim ();
+    notification_event_pool_trim ();
+    last_pool_trim_time = now;
+  }
 }
 
 int sfd;

@@ -23,8 +23,16 @@
 #include "net/net-msg.h"
 #include "net/net-connections.h"
 
+typedef struct stats_buffer stats_buffer_t;
+
 void notification_event_insert_tcp_conn_alarm (connection_job_t C);
 void notification_event_insert_tcp_conn_wakeup (connection_job_t C);
 void notification_event_insert_tcp_conn_close (connection_job_t C);
 void notification_event_insert_tcp_conn_ready (connection_job_t C);
 void notification_event_job_create (void);
+
+// Opportunistically frees cached pool entries to keep memory bounded after bursts.
+void notification_event_pool_trim (void);
+
+// Exposes notification_event pool stats via /stats.
+int notification_event_prepare_stat (stats_buffer_t *sb);

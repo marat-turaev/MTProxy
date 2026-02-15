@@ -74,6 +74,7 @@ int raw_msg_buffer_prepare_stat (stats_buffer_t *sb);
 int crypto_aes_prepare_stat (stats_buffer_t *sb);
 int crypto_dh_prepare_stat (stats_buffer_t *sb);
 int jobs_prepare_stat (stats_buffer_t *sb);
+int notification_event_prepare_stat (stats_buffer_t *sb);
 int aio_prepare_stat (stats_buffer_t *sb);
 int mp_queue_prepare_stat (stats_buffer_t *sb);
 int timers_prepare_stat (stats_buffer_t *sb);
@@ -144,6 +145,7 @@ int prepare_stats (char *buff, int buff_size) {
   crypto_aes_prepare_stat (&sb);
   crypto_dh_prepare_stat (&sb);
   jobs_prepare_stat (&sb);
+  notification_event_prepare_stat (&sb);
   mp_queue_prepare_stat (&sb);
   timers_prepare_stat (&sb);
   rpc_targets_prepare_stat (&sb);

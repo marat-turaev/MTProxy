@@ -35,6 +35,7 @@
 #include "common/mp-queue.h"
 #include "common/kprintf.h"
 #include "common/server-functions.h"
+#include "common/common-stats.h"
 
 #define NEV_TCP_CONN_READY 1
 #define NEV_TCP_CONN_CLOSE 2
@@ -54,6 +55,16 @@ struct notification_event {
 static struct mp_queue *nev_pool;
 static volatile int nev_pool_inited;
 static volatile int nev_pool_size;
+static volatile long long nev_pool_trim_freed;
+
+static volatile long long nev_tls_hits;
+static volatile long long nev_tls_misses;
+static volatile long long nev_pool_hits;
+static volatile long long nev_pool_misses;
+static volatile long long nev_malloc;
+static volatile long long nev_free;
+static volatile long long nev_pool_push;
+static volatile long long nev_pool_drop;
 
 #define NEV_TLS_MAX 256
 static __thread struct notification_event *nev_tls_head;
@@ -78,18 +89,23 @@ static struct notification_event *notification_event_alloc (void) {
     struct notification_event *ev = nev_tls_head;
     nev_tls_head = (struct notification_event *)ev->who;
     nev_tls_cnt--;
+    __sync_fetch_and_add (&nev_tls_hits, 1);
     memset (ev, 0, sizeof (*ev));
     return ev;
   }
+  __sync_fetch_and_add (&nev_tls_misses, 1);
   if (!nev_pool) {
     nev_pool_init ();
   }
   struct notification_event *ev = nev_pool ? mpq_pop_nw (nev_pool, 4) : NULL;
   if (ev) {
     __sync_fetch_and_add (&nev_pool_size, -1);
+    __sync_fetch_and_add (&nev_pool_hits, 1);
   } else {
     ev = malloc (sizeof (*ev));
     assert (ev);
+    __sync_fetch_and_add (&nev_pool_misses, 1);
+    __sync_fetch_and_add (&nev_malloc, 1);
   }
   memset (ev, 0, sizeof (*ev));
   return ev;
@@ -110,13 +126,47 @@ static void notification_event_free (struct notification_event *ev) {
   }
   if (!nev_pool) {
     free (ev);
+    __sync_fetch_and_add (&nev_free, 1);
     return;
   }
   int sz = __sync_add_and_fetch (&nev_pool_size, 1);
   if (sz <= NEV_POOL_MAX) {
     mpq_push_w (nev_pool, ev, 0);
+    __sync_fetch_and_add (&nev_pool_push, 1);
   } else {
     __sync_fetch_and_add (&nev_pool_size, -1);
+    free (ev);
+    __sync_fetch_and_add (&nev_pool_drop, 1);
+    __sync_fetch_and_add (&nev_free, 1);
+  }
+}
+
+int notification_event_prepare_stat (stats_buffer_t *sb) {
+  sb_printf (sb, ">>>>>>notification_event>>>>>>\tstart\n");
+  sb_printf (sb, "nev_tls_hits\t%lld\n", (long long) nev_tls_hits);
+  sb_printf (sb, "nev_tls_misses\t%lld\n", (long long) nev_tls_misses);
+  sb_printf (sb, "nev_pool_hits\t%lld\n", (long long) nev_pool_hits);
+  sb_printf (sb, "nev_pool_misses\t%lld\n", (long long) nev_pool_misses);
+  sb_printf (sb, "nev_malloc\t%lld\n", (long long) nev_malloc);
+  sb_printf (sb, "nev_free\t%lld\n", (long long) nev_free);
+  sb_printf (sb, "nev_pool_push\t%lld\n", (long long) nev_pool_push);
+  sb_printf (sb, "nev_pool_drop\t%lld\n", (long long) nev_pool_drop);
+  sb_printf (sb, "nev_pool_size\t%d\n", (int) nev_pool_size);
+  sb_printf (sb, "nev_pool_trim_freed\t%lld\n", (long long) nev_pool_trim_freed);
+  sb_printf (sb, "<<<<<<notification_event<<<<<<\tend\n");
+  return sb->pos;
+}
+
+#define NEV_POOL_TRIM_TARGET (NEV_POOL_MAX / 4)
+void notification_event_pool_trim (void) {
+  if (!nev_pool) {
+    return;
+  }
+  while (__atomic_load_n (&nev_pool_size, __ATOMIC_RELAXED) > NEV_POOL_TRIM_TARGET) {
+    struct notification_event *ev = mpq_pop_nw (nev_pool, 4);
+    if (!ev) { break; }
+    __sync_fetch_and_add (&nev_pool_size, -1);
+    __sync_fetch_and_add (&nev_pool_trim_freed, 1);
     free (ev);
   }
 }

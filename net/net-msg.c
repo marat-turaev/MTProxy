@@ -60,6 +60,7 @@ struct raw_message empty_rwm = {
 static struct mp_queue *raw_msg_pool;
 static volatile int raw_msg_pool_inited;
 static volatile int raw_msg_pool_size;
+static volatile long long raw_msg_pool_trim_freed;
 
 #define RAW_MSG_TLS_MAX 512
 static __thread struct raw_message *raw_msg_tls_head;
@@ -85,18 +86,24 @@ struct raw_message *rwm_alloc_raw_message (void) {
     struct raw_message *r = raw_msg_tls_head;
     raw_msg_tls_head = (struct raw_message *)(void *)r->first;
     raw_msg_tls_cnt--;
+    MODULE_STAT->raw_msg_tls_hits++;
+    MODULE_STAT->raw_msg_tls_cached = raw_msg_tls_cnt;
     memset (r, 0, sizeof (*r));
     return r;
   }
+  MODULE_STAT->raw_msg_tls_misses++;
   if (!raw_msg_pool) {
     raw_msg_pool_init ();
   }
   struct raw_message *r = raw_msg_pool ? mpq_pop_nw (raw_msg_pool, 4) : NULL;
   if (r) {
     __sync_fetch_and_add (&raw_msg_pool_size, -1);
+    MODULE_STAT->raw_msg_pool_hits++;
   } else {
     r = malloc (sizeof (*r));
     assert (r);
+    MODULE_STAT->raw_msg_pool_misses++;
+    MODULE_STAT->raw_msg_malloc++;
   }
   memset (r, 0, sizeof (*r));
   return r;
@@ -116,6 +123,7 @@ void rwm_free_raw_message (struct raw_message *raw) {
     raw->first = (struct msg_part *)(void *)raw_msg_tls_head;
     raw_msg_tls_head = raw;
     raw_msg_tls_cnt++;
+    MODULE_STAT->raw_msg_tls_cached = raw_msg_tls_cnt;
     return;
   }
   if (!raw_msg_pool) {
@@ -123,14 +131,43 @@ void rwm_free_raw_message (struct raw_message *raw) {
   }
   if (!raw_msg_pool) {
     free (raw);
+    MODULE_STAT->raw_msg_free++;
     return;
   }
   int sz = __sync_add_and_fetch (&raw_msg_pool_size, 1);
   if (sz <= RAW_MSG_POOL_MAX) {
     mpq_push_w (raw_msg_pool, raw, 0);
+    MODULE_STAT->raw_msg_pool_push++;
   } else {
     __sync_fetch_and_add (&raw_msg_pool_size, -1);
     free (raw);
+    MODULE_STAT->raw_msg_pool_drop++;
+    MODULE_STAT->raw_msg_free++;
+  }
+}
+
+#define RAW_MSG_POOL_TRIM_TARGET (RAW_MSG_POOL_MAX / 4)
+#define MSG_PART_POOL_TRIM_TARGET (MSG_PART_POOL_MAX / 4)
+
+void net_msg_pools_trim (void) {
+  if (raw_msg_pool) {
+    while (__atomic_load_n (&raw_msg_pool_size, __ATOMIC_RELAXED) > RAW_MSG_POOL_TRIM_TARGET) {
+      struct raw_message *r = mpq_pop_nw (raw_msg_pool, 4);
+      if (!r) { break; }
+      __sync_fetch_and_add (&raw_msg_pool_size, -1);
+      __sync_fetch_and_add (&raw_msg_pool_trim_freed, 1);
+      free (r);
+    }
+  }
+
+  if (msg_part_pool) {
+    while (__atomic_load_n (&msg_part_pool_size, __ATOMIC_RELAXED) > MSG_PART_POOL_TRIM_TARGET) {
+      struct msg_part *mp = mpq_pop_nw (msg_part_pool, 4);
+      if (!mp) { break; }
+      __sync_fetch_and_add (&msg_part_pool_size, -1);
+      __sync_fetch_and_add (&msg_part_pool_trim_freed, 1);
+      free (mp);
+    }
   }
 }
 
@@ -139,6 +176,26 @@ void rwm_free_raw_message (struct raw_message *raw) {
 MODULE_STAT_TYPE {
   int rwm_total_msgs;
   int rwm_total_msg_parts;
+
+  long long raw_msg_tls_hits;
+  long long raw_msg_tls_misses;
+  long long raw_msg_pool_hits;
+  long long raw_msg_pool_misses;
+  long long raw_msg_malloc;
+  long long raw_msg_free;
+  long long raw_msg_pool_push;
+  long long raw_msg_pool_drop;
+  int raw_msg_tls_cached;
+
+  long long msg_part_tls_hits;
+  long long msg_part_tls_misses;
+  long long msg_part_pool_hits;
+  long long msg_part_pool_misses;
+  long long msg_part_malloc;
+  long long msg_part_free;
+  long long msg_part_pool_push;
+  long long msg_part_pool_drop;
+  int msg_part_tls_cached;
 };
 
 MODULE_INIT
@@ -146,6 +203,29 @@ MODULE_INIT
 MODULE_STAT_FUNCTION
   SB_SUM_ONE_I (rwm_total_msgs);
   SB_SUM_ONE_I (rwm_total_msg_parts);
+
+  SB_SUM_ONE_LL (raw_msg_tls_hits);
+  SB_SUM_ONE_LL (raw_msg_tls_misses);
+  SB_SUM_ONE_LL (raw_msg_pool_hits);
+  SB_SUM_ONE_LL (raw_msg_pool_misses);
+  SB_SUM_ONE_LL (raw_msg_malloc);
+  SB_SUM_ONE_LL (raw_msg_free);
+  SB_SUM_ONE_LL (raw_msg_pool_push);
+  SB_SUM_ONE_LL (raw_msg_pool_drop);
+  SB_SUM_ONE_I (raw_msg_tls_cached);
+  sb_printf (sb, "raw_msg_pool_size\t%d\n", (int) raw_msg_pool_size);
+  sb_printf (sb, "raw_msg_pool_trim_freed\t%lld\n", (long long) raw_msg_pool_trim_freed);
+
+  SB_SUM_ONE_LL (msg_part_tls_hits);
+  SB_SUM_ONE_LL (msg_part_tls_misses);
+  SB_SUM_ONE_LL (msg_part_pool_hits);
+  SB_SUM_ONE_LL (msg_part_pool_misses);
+  SB_SUM_ONE_LL (msg_part_malloc);
+  SB_SUM_ONE_LL (msg_part_free);
+  SB_SUM_ONE_LL (msg_part_pool_push);
+  SB_SUM_ONE_LL (msg_part_pool_drop);
+  SB_SUM_ONE_I (msg_part_tls_cached);
+  sb_printf (sb, "msg_part_pool_size\t%d\n", (int) msg_part_pool_size);
 MODULE_STAT_FUNCTION_END
 
 
@@ -153,6 +233,7 @@ MODULE_STAT_FUNCTION_END
 static struct mp_queue *msg_part_pool;
 static volatile int msg_part_pool_inited;
 static volatile int msg_part_pool_size;
+static volatile long long msg_part_pool_trim_freed;
 
 #define MSG_PART_TLS_MAX 2048
 static __thread struct msg_part *msg_part_tls_head;
@@ -178,19 +259,25 @@ static inline struct msg_part *alloc_msg_part (void) {
     struct msg_part *mp = msg_part_tls_head;
     msg_part_tls_head = mp->next;
     msg_part_tls_cnt--;
+    MODULE_STAT->msg_part_tls_hits++;
+    MODULE_STAT->msg_part_tls_cached = msg_part_tls_cnt;
     memset (mp, 0, sizeof (*mp));
     mp->magic = MSG_PART_MAGIC;
     return mp;
   }
+  MODULE_STAT->msg_part_tls_misses++;
   if (!msg_part_pool) {
     msg_part_pool_init ();
   }
   struct msg_part *mp = msg_part_pool ? mpq_pop_nw (msg_part_pool, 4) : NULL;
   if (mp) {
     __sync_fetch_and_add (&msg_part_pool_size, -1);
+    MODULE_STAT->msg_part_pool_hits++;
   } else {
     mp = (struct msg_part *) malloc (sizeof (*mp));
     assert (mp);
+    MODULE_STAT->msg_part_pool_misses++;
+    MODULE_STAT->msg_part_malloc++;
   }
   memset (mp, 0, sizeof (*mp));
   mp->magic = MSG_PART_MAGIC;
@@ -205,6 +292,7 @@ static inline void free_msg_part (struct msg_part *mp) {
     mp->next = msg_part_tls_head;
     msg_part_tls_head = mp;
     msg_part_tls_cnt++;
+    MODULE_STAT->msg_part_tls_cached = msg_part_tls_cnt;
     return;
   }
   if (!msg_part_pool) {
@@ -212,14 +300,18 @@ static inline void free_msg_part (struct msg_part *mp) {
   }
   if (!msg_part_pool) {
     free (mp);
+    MODULE_STAT->msg_part_free++;
     return;
   }
   int sz = __sync_add_and_fetch (&msg_part_pool_size, 1);
   if (sz <= MSG_PART_POOL_MAX) {
     mpq_push_w (msg_part_pool, mp, 0);
+    MODULE_STAT->msg_part_pool_push++;
   } else {
     __sync_fetch_and_add (&msg_part_pool_size, -1);
     free (mp);
+    MODULE_STAT->msg_part_pool_drop++;
+    MODULE_STAT->msg_part_free++;
   }
 }
 

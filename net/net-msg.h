@@ -108,6 +108,9 @@ void rwm_move (struct raw_message *dest_raw, struct raw_message *src_raw);
 // These are safe to call from any thread.
 struct raw_message *rwm_alloc_raw_message (void);
 void rwm_free_raw_message (struct raw_message *raw);
+
+// Opportunistically frees cached pool entries to keep memory bounded after bursts.
+void net_msg_pools_trim (void);
 int rwm_push_data (struct raw_message *raw, const void *data, int alloc_bytes);
 int rwm_push_data_ext (struct raw_message *raw, const void *data, int alloc_bytes, int prepend, int small_buffer, int std_buffer);
 int rwm_push_data_front (struct raw_message *raw, const void *data, int alloc_bytes);
