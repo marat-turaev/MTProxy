@@ -1069,6 +1069,15 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
           tls_noise_left = budget;
         }
       }
+
+      // Similarly, re-arm a tiny amount of timing jitter occasionally later in the connection,
+      // to avoid a stable pattern of "only the first writes were jittered".
+      if (__atomic_load_n (&ci->tls_write_jitter_left, __ATOMIC_RELAXED) <= 0) {
+        if (out->total_bytes >= 4096 && ci->tls_out_records_sent > 32 && ((lrand48_j () & 2047) == 0)) { // ~1/2048
+          __atomic_store_n (&ci->tls_write_jitter_left, 1 + (lrand48_j () & 1), __ATOMIC_RELAXED); // 1..2 delays
+        }
+      }
+
       if (tls_noise_left > 0) {
         tls_noise_active = 1;
         tls_noise_chunk_left = __atomic_load_n (&ci->tls_write_noise_chunk_left, __ATOMIC_RELAXED);
