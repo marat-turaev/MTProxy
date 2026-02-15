@@ -981,6 +981,21 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
       break;
     }
 
+    // Small timing jitter for early post-handshake TLS transport writes.
+    // Implemented as a short timer on the socket job itself (no sleeps in the IO thread).
+    connection_job_t CC = c->conn;
+    struct connection_info *ci = CC ? CONN_INFO (CC) : NULL;
+    if (ci && (ci->flags & C_IS_TLS)) {
+      int left = __atomic_load_n (&ci->tls_write_jitter_left, __ATOMIC_RELAXED);
+      if (left > 0 && !job_timer_active (C)) {
+        int ms = 1 + (lrand48_j () % 12); // 1..12ms
+        __atomic_store_n (&ci->tls_write_jitter_left, left - 1, __ATOMIC_RELAXED);
+        __sync_fetch_and_or (&c->flags, C_NOWR);
+        job_timer_insert (C, precise_now + 0.001 * ms);
+        return out->total_bytes;
+      }
+    }
+
     struct iovec iov[384];
     int iovcnt = -1;
 
@@ -989,8 +1004,7 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
 
     // TCP segmentation shaping for TLS server flight: limit writev() chunk sizes for the first bytes.
     // This keeps TLS record structure intact while changing packetization.
-    connection_job_t CC = c->conn;
-    struct connection_info *ci = CC ? CONN_INFO (CC) : NULL;
+    // (ci) already initialized above.
     int tls_shape_left = ci ? __atomic_load_n (&ci->tls_write_shaping_left, __ATOMIC_ACQUIRE) : 0;
     if (ci && tls_shape_left > 0) {
       int tls_shape_chunk_left = __atomic_load_n (&ci->tls_write_shaping_chunk_left, __ATOMIC_RELAXED);
@@ -1259,6 +1273,20 @@ int do_socket_connection_job (job_t job, int op, struct job_thread *JT) /* {{{ *
   if (op == JS_ABORT) { // MAIN THREAD 
     fail_socket_connection (C, -200);
     return JOB_COMPLETED;
+  }
+  if (op == JS_ALARM) { // IO THREAD (job timer)
+    if (!job_timer_check (job)) {
+      return 0;
+    }
+    __sync_fetch_and_and (&c->flags, ~C_NOWR);
+    if (!(c->flags & C_ERROR)) {
+      int res = c->type->socket_read_write (job);
+      if (res != c->current_epoll_status) {
+        c->current_epoll_status = res;
+        return JOB_SENDSIG (JS_AUX);
+      }
+    }
+    return 0;
   }
   if (op == JS_RUN) { // IO THREAD
     if (!(c->flags & C_ERROR)) {

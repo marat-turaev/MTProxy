@@ -263,6 +263,8 @@ struct connection_info {
   // (allowing TLS records to be split across TCP packets).
   int tls_write_noise_left;
   int tls_write_noise_chunk_left;
+  // Number of early post-handshake write delays to inject (small timing variation).
+  int tls_write_jitter_left;
   // Count of synthetic TLS ApplicationData records emitted on this connection.
   // Used for post-handshake TLS record sizing heuristics (traffic shaping).
   int tls_out_records_sent;

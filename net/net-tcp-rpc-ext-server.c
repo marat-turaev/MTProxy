@@ -1685,6 +1685,14 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
           __atomic_store_n (&c->tls_write_noise_chunk_left, 0, __ATOMIC_RELAXED);
         }
 
+        // Add tiny timing jitter to the first few post-handshake writes (server->client).
+        // This delays a couple of early encrypted records by a few milliseconds.
+        if (__atomic_load_n (&c->tls_write_jitter_left, __ATOMIC_RELAXED) <= 0) {
+          if ((lrand48_j () & 3) == 0) { // ~25% of connections
+            __atomic_store_n (&c->tls_write_jitter_left, 1 + (lrand48_j () & 1), __ATOMIC_RELAXED); // 1..2 delays
+          }
+        }
+
         if (c->left_tls_packet_length < 64) {
           vkprintf (1, "error while parsing packet: too short first TLS packet: %d\n", c->left_tls_packet_length);
           return tls_send_alert_and_close (C, 50 /* decode_error */);
