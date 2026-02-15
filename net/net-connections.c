@@ -996,6 +996,21 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
       }
     }
 
+    // TLS transport: occasionally delay very small writes for a couple of milliseconds
+    // to give the connection a chance to coalesce bursts into a single TCP write.
+    // This is probabilistic and should not affect steady-state throughput.
+    if (ci && (ci->flags & C_IS_TLS) && !job_timer_active (C)) {
+      int shape_left = __atomic_load_n (&ci->tls_write_shaping_left, __ATOMIC_RELAXED);
+      if (shape_left <= 0 && out->total_bytes > 0 && out->total_bytes < 1200 && ci->tls_out_records_sent > 3) {
+        if ((lrand48_j () & 15) == 0) { // ~1/16
+          int ms = 1 + (lrand48_j () % 4); // 1..4ms
+          __sync_fetch_and_or (&c->flags, C_NOWR);
+          job_timer_insert (C, precise_now + 0.001 * ms);
+          return out->total_bytes;
+        }
+      }
+    }
+
     struct iovec iov[384];
     int iovcnt = -1;
 
