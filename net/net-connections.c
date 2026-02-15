@@ -1018,10 +1018,23 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
         clamp_iovec_bytes (iov, &iovcnt, lim);
         s = lim;
       }
-    } else if (ci) {
+    } else if (ci && (ci->flags & C_IS_TLS)) {
       // Post-handshake write variation for TLS transport: shape TCP chunk sizes for a small amount of bytes.
       // This is separate from TLS record sizing and can split records across packets.
+      //
+      // We also re-arm small variation windows occasionally to avoid a stable pattern
+      // of "only the beginning is packetized oddly".
       int tls_noise_left = __atomic_load_n (&ci->tls_write_noise_left, __ATOMIC_RELAXED);
+      if (tls_noise_left <= 0) {
+        // Low-probability re-arm when we have enough pending bytes to make it meaningful.
+        // Out is a socket-level buffer (already encrypted for TLS transport here).
+        if (out->total_bytes >= 4096 && ((lrand48_j () & 511) == 0)) { // ~1/512
+          int budget = 1024 + (lrand48_j () % 4097); // 1024..5120 bytes
+          __atomic_store_n (&ci->tls_write_noise_left, budget, __ATOMIC_RELAXED);
+          __atomic_store_n (&ci->tls_write_noise_chunk_left, 0, __ATOMIC_RELAXED);
+          tls_noise_left = budget;
+        }
+      }
       if (tls_noise_left > 0) {
         int tls_noise_chunk_left = __atomic_load_n (&ci->tls_write_noise_chunk_left, __ATOMIC_RELAXED);
         if (tls_noise_chunk_left <= 0) {
