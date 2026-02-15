@@ -69,6 +69,27 @@ It's only enabled for clients which request it.
 Add `dd` prefix to secret (`cafe...babe` => `ddcafe...babe`) to enable
 this mode on client side.
 
+## TLS-transport mode (-D)
+The proxy also supports "TLS-transport" mode. In this mode, the proxy only
+accepts TLS-looking connections with SNI matching an allowed domain.
+
+To enable it, add one or more `-D <domain>` options when starting the proxy:
+```bash
+./mtproto-proxy -u nobody -p 8888 -H 443 -S <secret> -D example.com --aes-pwd proxy-secret proxy-multi.conf -M 1
+```
+Notes:
+- You can specify `-D` multiple times (allowlist). The first `-D` domain is used as default.
+- When `-D` is used, other transports are disabled (TLS-transport only).
+- On startup, the proxy may make outbound connections to the configured domains to learn realistic TLS response sizing. If that fails, it falls back to defaults.
+
+Client secret format for TLS-transport is:
+`ee<secret_hex><domain_hex>`
+
+Where `<domain_hex>` is the ASCII domain name encoded as hex, for example:
+```bash
+echo -n example.com | xxd -ps
+```
+
 ## Systemd example configuration
 1. Create systemd service file (it's standard path for the most Linux distros, but you should check it before):
 ```bash
