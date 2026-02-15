@@ -82,6 +82,18 @@ Notes:
 - When `-D` is used, other transports are disabled (TLS-transport only).
 - On startup, the proxy may make outbound connections to the configured domains to learn realistic TLS response sizing. If that fails, it falls back to defaults.
 
+### Fallback backend (--fallback-backend)
+In TLS-transport mode (`-D`), you can optionally configure a local fallback backend:
+```bash
+./mtproto-proxy ... -D example.com --fallback-backend 127.0.0.1:8443
+```
+Behavior:
+- Non-MTProxy connections on a TLS-only listener (for example: plain HTTP, regular TLS handshakes that are not TLS-transport) are proxied (TCP passthrough) to the fallback backend.
+- This can be used to serve something plausible on the same port (for example: an HTTP `301 Moved Permanently` to a public website, or a simple landing page).
+
+Security note:
+- Be careful: `--fallback-backend` can unintentionally expose an internal service to the Internet. Prefer `127.0.0.1:<port>` and do not point it at admin panels/databases/metadata endpoints.
+
 Client secret format for TLS-transport is:
 `ee<secret_hex><domain_hex>`
 
