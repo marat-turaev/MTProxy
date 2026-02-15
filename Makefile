@@ -2,7 +2,9 @@ OBJ	=	objs
 DEP	=	dep
 EXE = ${OBJ}/bin
 
-COMMIT := $(shell git log -1 --pretty=format:"%H")
+# If COMMIT is provided on the command line (e.g. deploy scripts using rsync
+# without .git), don't try to call git here.
+COMMIT ?= $(shell git log -1 --pretty=format:"%H" 2>/dev/null || echo unknown)
 
 ARCH =
 ifeq ($m, 32)
@@ -100,4 +102,3 @@ clean:
 	rm -rf ${OBJ} ${DEP} ${EXE} || true
 
 force-clean: clean
-
