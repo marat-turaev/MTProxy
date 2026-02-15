@@ -1473,8 +1473,16 @@ static int http_send_301_and_close (connection_job_t C) {
 
   struct raw_message *m = rwm_alloc_raw_message ();
   rwm_create (m, resp, rlen);
+  socket_connection_job_t S = c->io_conn;
+  if (S) {
+    // Bypass MTProto framing/encryption: write directly to the socket job output queue.
+    mpq_push_w (SOCKET_CONN_INFO (S)->out_packet_queue, m, 0);
+    job_signal (JOB_REF_CREATE_PASS (S), JS_RUN);
+  } else {
+    // Should not normally happen for inbound connections, but keep a fallback.
   mpq_push_w (c->out_queue, m, 0);
   job_signal (JOB_REF_CREATE_PASS (C), JS_RUN);
+  }
   connection_write_close (C);
   return NEED_MORE_BYTES;
 }
