@@ -243,37 +243,48 @@ int cpu_tcp_aes_crypto_ctr128_encrypt_output (connection_job_t C) /* {{{ */ {
     int len = c->out.total_bytes;
     if (c->flags & C_IS_TLS) {
       assert (c->left_tls_packet_length >= 0);
-      // TLS transport historically used a fixed max record size (1425),
-      // which is a fixed fixed-pattern behavior. Vary record sizes (especially early) while
-      // keeping them within reasonable limits for MTU and buffering.
-      const int LEGACY_MAX_PACKET_LENGTH = 1425;
-      const int EARLY_MAX_PACKET_LENGTH = 4096;
+      // TLS transport historically used a fixed max record size (~1425).
+      // Keep record sizes variable for the whole connection (not only during the first few records).
+      //
+      // Cap sizes to keep buffering and latency reasonable; TCP packetization shaping
+      // is handled elsewhere (socket writer shaping).
+      const int TLS_MAX_RECORD = 4096;
       const int EARLY_RECORDS = 32;
 
       int max_len = len;
       int min_len = 1;
 
       if (c->tls_out_records_sent < EARLY_RECORDS) {
-        if (max_len > EARLY_MAX_PACKET_LENGTH) {
-          max_len = EARLY_MAX_PACKET_LENGTH;
-        }
-        // If we have enough buffered plaintext, avoid always sending tiny records.
-        if (max_len >= 256) {
-          min_len = 256;
+        // Early after handshake: allow a wider range (including smaller records),
+        // but avoid pathological 1-byte records when we have enough buffered data.
+        if (max_len > TLS_MAX_RECORD) { max_len = TLS_MAX_RECORD; }
+        min_len = (max_len >= 256) ? 256 : max_len;
         } else {
-          min_len = max_len;
-        }
+        // Steady state: prefer MSS-ish sizes, with occasional smaller/larger records.
+        if (max_len > TLS_MAX_RECORD) { max_len = TLS_MAX_RECORD; }
+
+        int r = lrand48_j ();
+        if ((r & 15) < 10) {
+          // Most of the time: near-MSS to look like typical TLS over the Internet.
+          min_len = 1100;
+          if (max_len < min_len) { min_len = max_len; }
+          int hi = 1700;
+          if (hi > max_len) { hi = max_len; }
+          max_len = hi;
+        } else if ((r & 15) < 14) {
+          // Sometimes: smaller records.
+          min_len = 600;
+          if (max_len < min_len) { min_len = max_len; }
+          int hi = 1200;
+          if (hi > max_len) { hi = max_len; }
+          max_len = hi;
       } else {
-        if (max_len > LEGACY_MAX_PACKET_LENGTH) {
-          max_len = LEGACY_MAX_PACKET_LENGTH;
+          // Rarely: larger records (still capped).
+          min_len = 1700;
+          if (max_len < min_len) { min_len = max_len; }
+          // keep max_len as-is (<= TLS_MAX_RECORD)
         }
-        // Occasionally deviate from the legacy max even in steady state.
-        if (max_len == LEGACY_MAX_PACKET_LENGTH && ((lrand48_j () & 31) == 0)) {
-          int jitter = 1 + (lrand48_j () % 256);
-          max_len -= jitter;
         }
-        min_len = max_len;
-      }
 
       if (min_len < 1) { min_len = 1; }
       if (max_len < min_len) { max_len = min_len; }
