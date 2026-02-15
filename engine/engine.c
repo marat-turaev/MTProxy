@@ -175,14 +175,23 @@ void engine_set_epoll_wait_timeout (int epoll_wait_timeout) /* {{{ */ {
 
 static void raise_file_limit (int maxconn) /* {{{ */ {
   const int gap = 16;
-  if (getuid ()) {
+  if (maxconn < 1) {
+    maxconn = 1;
+  }
+  if (geteuid ()) {
     struct rlimit rlim;
     if (getrlimit (RLIMIT_NOFILE, &rlim) < 0) {
       kprintf ("%s: getrlimit (RLIMIT_NOFILE) fail. %m\n", __func__);
       exit (1);
     }
-    if (maxconn > rlim.rlim_cur - gap) {
-      maxconn = rlim.rlim_cur - gap;
+    if (rlim.rlim_cur != RLIM_INFINITY) {
+      long long lim = (long long)rlim.rlim_cur - gap;
+      if (lim < 1) {
+        lim = 1;
+      }
+      if (maxconn > lim) {
+        maxconn = (int)lim;
+      }
     }
     tcp_set_max_connections (maxconn);
   } else {
