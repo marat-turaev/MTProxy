@@ -1248,6 +1248,27 @@ static int tls_send_alert_and_close (connection_job_t C, unsigned char descripti
   return NEED_MORE_BYTES;
 }
 
+static int proxy_connection_fallback (connection_job_t C);
+
+static int tls_reject_or_fallback (connection_job_t C, unsigned char alert_description) {
+  // For TLS-looking inputs: either forward to local fallback HTTPS (if configured),
+  // or send a standard TLS alert and close (avoid proxying to the -D domain).
+  if (fallback_backend_enabled) {
+    return proxy_connection_fallback (C);
+  }
+  return tls_send_alert_and_close (C, alert_description);
+}
+
+static int reject_or_fallback_close (connection_job_t C) {
+  // For non-TLS inputs on a TLS-only listener: forward to fallback backend if present,
+  // otherwise just close without sending protocol-specific bytes.
+  if (fallback_backend_enabled) {
+    return proxy_connection_fallback (C);
+  }
+  connection_write_close (C);
+  return NEED_MORE_BYTES;
+}
+
 static int proxy_connection_fallback (connection_job_t C) {
   struct connection_info *c = CONN_INFO(C);
   assert (fallback_backend_enabled);
@@ -1487,7 +1508,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
 
         const struct domain_info *info = get_sni_domain_info (client_hello, read_len);
         if (info == NULL) {
-          RETURN_TLS_ERROR(default_domain_info);
+          return tls_reject_or_fallback (C, 112 /* unrecognized_name */);
         }
 
         vkprintf (1, "TLS type with domain %s from %s:%d\n", info->domain, show_remote_ip (C), c->remote_port);
@@ -1499,11 +1520,11 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
 
         if (len > min_len) {
           vkprintf (1, "Too much data in ClientHello, receive %d instead of %d\n", len, min_len);
-          RETURN_TLS_ERROR(info);
+          return tls_reject_or_fallback (C, 50 /* decode_error */);
         }
         if (len != read_len) {
           vkprintf (1, "Too big ClientHello: receive %d bytes\n", len);
-          RETURN_TLS_ERROR(info);
+          return tls_reject_or_fallback (C, 50 /* decode_error */);
         }
 
         unsigned char client_random[32];
@@ -1512,7 +1533,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
 
         if (have_client_random (client_random)) {
           vkprintf (1, "Receive again request with the same client random\n");
-          RETURN_TLS_ERROR(info);
+          return tls_reject_or_fallback (C, 40 /* handshake_failure */);
         }
         add_client_random (client_random);
         delete_old_client_randoms();
@@ -1527,18 +1548,18 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         }
         if (secret_id == ext_secret_cnt) {
           vkprintf (1, "Receive request with unmatched client random\n");
-          RETURN_TLS_ERROR(info);
+          return tls_reject_or_fallback (C, 40 /* handshake_failure */);
         }
         int timestamp = *(int *)(expected_random + 28) ^ *(int *)(client_random + 28);
         if (!is_allowed_timestamp (timestamp)) {
-          RETURN_TLS_ERROR(info);
+          return tls_reject_or_fallback (C, 40 /* handshake_failure */);
         }
 
         int pos = 76;
         int cipher_suites_length = read_length (client_hello, &pos);
         if (pos + cipher_suites_length > read_len) {
           vkprintf (1, "Too long cipher suites list of length %d\n", cipher_suites_length);
-          RETURN_TLS_ERROR(info);
+          return tls_reject_or_fallback (C, 50 /* decode_error */);
         }
         while (cipher_suites_length >= 2 && (client_hello[pos] & 0x0F) == 0x0A && (client_hello[pos + 1] & 0x0F) == 0x0A) {
           // skip grease
@@ -1547,7 +1568,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         }
         if (cipher_suites_length <= 1 || client_hello[pos] != 0x13 || client_hello[pos + 1] < 0x01 || client_hello[pos + 1] > 0x03) {
           vkprintf (1, "Can't find supported cipher suite\n");
-          RETURN_TLS_ERROR(info);
+          return tls_reject_or_fallback (C, 40 /* handshake_failure */);
         }
         unsigned char cipher_suite_id = client_hello[pos + 1];
 
@@ -1697,7 +1718,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
 
       if (allow_only_tls && !(c->flags & C_IS_TLS)) {
         vkprintf (1, "Expected TLS-transport\n");
-        RETURN_TLS_ERROR(default_domain_info);
+        return reject_or_fallback_close (C);
       }
 
 #if __ALLOW_UNOBFS__
@@ -1764,7 +1785,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         if (tag == 0xdddddddd || tag == 0xeeeeeeee || tag == 0xefefefef) {
           if (tag != 0xdddddddd && allow_only_tls) {
             vkprintf (1, "Expected random padding mode\n");
-            RETURN_TLS_ERROR(default_domain_info);
+            return reject_or_fallback_close (C);
           }
           assert (rwm_skip_data (&c->in, 64) == 64);
           rwm_union (&c->in_u, &c->in);
