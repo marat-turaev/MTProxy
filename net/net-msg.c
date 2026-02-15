@@ -132,8 +132,61 @@ MODULE_STAT_FUNCTION
 MODULE_STAT_FUNCTION_END
 
 
-static inline struct msg_part *alloc_msg_part (void) { MODULE_STAT->rwm_total_msg_parts ++; struct msg_part *mp = (struct msg_part *) malloc (sizeof (struct msg_part)); mp->magic = MSG_PART_MAGIC; return mp; }
-static inline void free_msg_part (struct msg_part *mp) { MODULE_STAT->rwm_total_msg_parts --; assert (mp->magic == MSG_PART_MAGIC); free (mp); }
+#define MSG_PART_POOL_MAX 262144
+static struct mp_queue *msg_part_pool;
+static volatile int msg_part_pool_inited;
+static volatile int msg_part_pool_size;
+
+static void msg_part_pool_init (void) {
+  if (msg_part_pool) {
+    return;
+  }
+  if (__sync_bool_compare_and_swap (&msg_part_pool_inited, 0, 1)) {
+    msg_part_pool = alloc_mp_queue_w ();
+    __sync_synchronize ();
+  } else {
+    while (!msg_part_pool) {
+      __sync_synchronize ();
+    }
+  }
+}
+
+static inline struct msg_part *alloc_msg_part (void) {
+  MODULE_STAT->rwm_total_msg_parts ++;
+  if (!msg_part_pool) {
+    msg_part_pool_init ();
+  }
+  struct msg_part *mp = msg_part_pool ? mpq_pop_nw (msg_part_pool, 4) : NULL;
+  if (mp) {
+    __sync_fetch_and_add (&msg_part_pool_size, -1);
+  } else {
+    mp = (struct msg_part *) malloc (sizeof (*mp));
+    assert (mp);
+  }
+  memset (mp, 0, sizeof (*mp));
+  mp->magic = MSG_PART_MAGIC;
+  return mp;
+}
+
+static inline void free_msg_part (struct msg_part *mp) {
+  MODULE_STAT->rwm_total_msg_parts --;
+  assert (mp->magic == MSG_PART_MAGIC);
+  mp->magic = 0;
+  if (!msg_part_pool) {
+    msg_part_pool_init ();
+  }
+  if (!msg_part_pool) {
+    free (mp);
+    return;
+  }
+  int sz = __sync_add_and_fetch (&msg_part_pool_size, 1);
+  if (sz <= MSG_PART_POOL_MAX) {
+    mpq_push_w (msg_part_pool, mp, 0);
+  } else {
+    __sync_fetch_and_add (&msg_part_pool_size, -1);
+    free (mp);
+  }
+}
 
 struct msg_part *new_msg_part (struct msg_part *neighbor, struct msg_buffer *X) /* {{{ */{
   struct msg_part *mp = alloc_msg_part ();
