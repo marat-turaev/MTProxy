@@ -95,7 +95,7 @@ Behavior:
 - This can be used to serve something plausible on the same port (for example: an HTTP `301 Moved Permanently` to a public website, or a simple landing page).
 
 Security note:
-- Be careful: `--fallback-backend` can unintentionally expose an internal service to the Internet. Prefer `127.0.0.1:<port>` and do not point it at admin panels/databases/metadata endpoints.
+- Be careful: `--fallback-backend` can unintentionally expose an internal service to the Internet. This fork only allows loopback targets (`127.0.0.1:<port>` or `[::1]:<port>`) to reduce the chance of misconfiguration; do not point it at admin panels/databases/metadata endpoints.
 
 Client secret format for TLS-transport is:
 `ee<secret_hex><domain_hex>`

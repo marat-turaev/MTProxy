@@ -1169,23 +1169,43 @@ int tcp_rpc_set_fallback_backend (const char *backend) {
     return -9;
   }
 
-  memset (&fallback_backend_target, 0, sizeof (fallback_backend_target));
-  memset (fallback_backend_target_ipv6, 0, sizeof (fallback_backend_target_ipv6));
-  fallback_backend_is_ipv6 = 0;
-  fallback_backend_port = port;
-  snprintf (fallback_backend_printable, sizeof (fallback_backend_printable), "%s", backend);
+  struct in_addr target4;
+  unsigned char target6[16];
+  int is_ipv6 = 0;
+  memset (&target4, 0, sizeof (target4));
+  memset (target6, 0, sizeof (target6));
 
   if (ai->ai_family == AF_INET) {
     struct sockaddr_in *sin = (struct sockaddr_in *)ai->ai_addr;
-    fallback_backend_target = sin->sin_addr;
-    fallback_backend_is_ipv6 = 0;
+    target4 = sin->sin_addr;
+    is_ipv6 = 0;
+    if (!is_ipv4_loopback (target4)) {
+      freeaddrinfo (res);
+      return -10;
+    }
   } else {
     struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)ai->ai_addr;
-    memcpy (fallback_backend_target_ipv6, &sin6->sin6_addr, 16);
-    fallback_backend_is_ipv6 = 1;
+    memcpy (target6, &sin6->sin6_addr, 16);
+    is_ipv6 = 1;
+    if (!is_ipv6_loopback (target6)) {
+      freeaddrinfo (res);
+      return -10;
+    }
   }
 
   freeaddrinfo (res);
+
+  memset (&fallback_backend_target, 0, sizeof (fallback_backend_target));
+  memset (fallback_backend_target_ipv6, 0, sizeof (fallback_backend_target_ipv6));
+  fallback_backend_is_ipv6 = is_ipv6;
+  fallback_backend_port = port;
+  snprintf (fallback_backend_printable, sizeof (fallback_backend_printable), "%s", backend);
+  if (!fallback_backend_is_ipv6) {
+    fallback_backend_target = target4;
+  } else {
+    memcpy (fallback_backend_target_ipv6, target6, 16);
+  }
+
   fallback_backend_enabled = 1;
   return 0;
 }
