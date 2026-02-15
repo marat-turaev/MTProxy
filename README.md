@@ -48,12 +48,15 @@ head -c 16 /dev/urandom | xxd -ps
 ... where:
 - `nobody` is the username. `mtproto-proxy` calls `setuid()` to drop privileges.
 - `443` is the port, used by clients to connect to the proxy.
-- `8888` is the local port. You can use it to get statistics from `mtproto-proxy`. Like `wget localhost:8888/stats`. You can only get this stat via loopback.
+- `8888` is the local port (loopback-only). You can use it to get statistics from `mtproto-proxy` (enable with `--http-stats`). Like `wget localhost:8888/stats`.
 - `<secret>` is the secret generated at step 3. Also you can set multiple secrets: `-S <secret1> -S <secret2>`.
 - `proxy-secret` and `proxy-multi.conf` are obtained at steps 1 and 2.
 - `1` is the number of workers. You can increase the number of workers, if you have a powerful server.
 
 Also feel free to check out other options using `mtproto-proxy --help`.
+
+Note:
+- `/stats` is only served to loopback clients (`127.0.0.1` / `::1`) and the local port (`-p`) is loopback-only. If you need remote access, use an SSH tunnel instead of exposing the stats port.
 
 5. Generate the link with following schema: `tg://proxy?server=SERVER_NAME&port=PORT&secret=SECRET` (or let the official bot generate it for you).
 6. Register your proxy with [@MTProxybot](https://t.me/MTProxybot) on Telegram.
