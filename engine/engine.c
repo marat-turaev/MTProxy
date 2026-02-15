@@ -143,7 +143,12 @@ void wakeup_main_thread (void) {
   if (!pipe_write_end) { return; }
   int x = 0;
   int r = write (pipe_write_end, &x, 4);
-  if (r < 0) { assert (errno == EINTR || errno == EAGAIN); }
+  if (r < 0) {
+    if (errno == EINTR || errno == EAGAIN || errno == EPIPE) {
+      return;
+    }
+    vkprintf (1, "%s: write() failed: %m\n", __func__);
+  }
 }
 
 static int epoll_nop (int fd, void *data, event_t *ev) {
