@@ -1001,7 +1001,8 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
     // This is probabilistic and should not affect steady-state throughput.
     if (ci && (ci->flags & C_IS_TLS) && !job_timer_active (C)) {
       int shape_left = __atomic_load_n (&ci->tls_write_shaping_left, __ATOMIC_RELAXED);
-      if (shape_left <= 0 && out->total_bytes > 0 && out->total_bytes < 1200 && ci->tls_out_records_sent > 3) {
+      if (shape_left <= 0 && out->total_bytes > 0 && out->total_bytes < 1200 &&
+          __atomic_load_n (&ci->tls_out_records_sent, __ATOMIC_RELAXED) > 3) {
         if ((lrand48_j () & 15) == 0) { // ~1/16
           int ms = 1 + (lrand48_j () % 4); // 1..4ms
           __sync_fetch_and_or (&c->flags, C_NOWR);
@@ -1073,7 +1074,9 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
       // Similarly, re-arm a tiny amount of timing jitter occasionally later in the connection,
       // to avoid a stable pattern of "only the first writes were jittered".
       if (__atomic_load_n (&ci->tls_write_jitter_left, __ATOMIC_RELAXED) <= 0) {
-        if (out->total_bytes >= 4096 && ci->tls_out_records_sent > 32 && ((lrand48_j () & 2047) == 0)) { // ~1/2048
+        if (out->total_bytes >= 4096 &&
+            __atomic_load_n (&ci->tls_out_records_sent, __ATOMIC_RELAXED) > 32 &&
+            ((lrand48_j () & 2047) == 0)) { // ~1/2048
           __atomic_store_n (&ci->tls_write_jitter_left, 1 + (lrand48_j () & 1), __ATOMIC_RELAXED); // 1..2 delays
         }
       }

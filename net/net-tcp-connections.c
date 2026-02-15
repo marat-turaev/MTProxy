@@ -254,7 +254,8 @@ int cpu_tcp_aes_crypto_ctr128_encrypt_output (connection_job_t C) /* {{{ */ {
       int max_len = len;
       int min_len = 1;
 
-      if (c->tls_out_records_sent < EARLY_RECORDS) {
+      int records_sent = __atomic_load_n (&c->tls_out_records_sent, __ATOMIC_RELAXED);
+      if (records_sent < EARLY_RECORDS) {
         // Early after handshake: allow a wider range (including smaller records),
         // but avoid pathological 1-byte records when we have enough buffered data.
         if (max_len > TLS_MAX_RECORD) { max_len = TLS_MAX_RECORD; }
@@ -322,8 +323,8 @@ int cpu_tcp_aes_crypto_ctr128_encrypt_output (connection_job_t C) /* {{{ */ {
 
       unsigned char header[5] = {0x17, 0x03, 0x03, len >> 8, len & 255};
       rwm_push_data (&c->out_p, header, 5);
-      c->tls_out_records_sent++;
-      vkprintf (2, "Send TLS-packet of length %d (records_sent=%d)\n", len, c->tls_out_records_sent);
+      records_sent = __atomic_add_fetch (&c->tls_out_records_sent, 1, __ATOMIC_RELAXED);
+      vkprintf (2, "Send TLS-packet of length %d (records_sent=%d)\n", len, records_sent);
     }
 
     assert (rwm_encrypt_decrypt_to (&c->out, &c->out_p, len, T->write_aeskey, 1) == len);
