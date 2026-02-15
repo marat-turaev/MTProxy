@@ -34,6 +34,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <netdb.h>
+
 #include <openssl/bn.h>
 #include <openssl/rand.h>
 
@@ -156,6 +158,13 @@ void tcp_rpcs_set_ext_secret (unsigned char secret[16]) {
 }
 
 static int allow_only_tls;
+
+static int fallback_backend_enabled;
+static struct in_addr fallback_backend_target;
+static unsigned char fallback_backend_target_ipv6[16];
+static int fallback_backend_is_ipv6;
+static int fallback_backend_port;
+static char fallback_backend_printable[256];
 
 struct domain_info {
   const char *domain;
@@ -952,6 +961,105 @@ void tcp_rpc_init_proxy_domains() {
   }
 }
 
+static int is_ipv4_loopback (struct in_addr a) {
+  // 127.0.0.0/8
+  return (ntohl (a.s_addr) & 0xff000000U) == 0x7f000000U;
+}
+
+static int is_ipv6_loopback (const unsigned char a[16]) {
+  static const unsigned char loopback[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+  return memcmp (a, loopback, 16) == 0;
+}
+
+int tcp_rpc_set_fallback_backend (const char *backend) {
+  if (backend == NULL || *backend == 0) {
+    return -1;
+  }
+
+  char host[256];
+  char serv[16];
+  memset (host, 0, sizeof (host));
+  memset (serv, 0, sizeof (serv));
+
+  if (backend[0] == '[') {
+    // [ipv6]:port
+    const char *end = strchr (backend, ']');
+    if (end == NULL || end[1] != ':' || end[2] == 0) {
+      return -2;
+    }
+    size_t hlen = (size_t)(end - backend - 1);
+    if (hlen == 0 || hlen >= sizeof (host)) {
+      return -3;
+    }
+    memcpy (host, backend + 1, hlen);
+    snprintf (serv, sizeof (serv), "%s", end + 2);
+  } else {
+    // host:port (ipv6 must be bracketed)
+    const char *colon = strrchr (backend, ':');
+    if (colon == NULL || colon[1] == 0) {
+      return -4;
+    }
+    if (strchr (backend, ':') != colon) {
+      // multiple ':' -> looks like unbracketed ipv6
+      return -5;
+    }
+    size_t hlen = (size_t)(colon - backend);
+    if (hlen == 0 || hlen >= sizeof (host)) {
+      return -6;
+    }
+    memcpy (host, backend, hlen);
+    snprintf (serv, sizeof (serv), "%s", colon + 1);
+  }
+
+  int port = atoi (serv);
+  if (port <= 0 || port > 65535) {
+    return -7;
+  }
+
+  struct addrinfo hints;
+  memset (&hints, 0, sizeof (hints));
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_flags = AI_ADDRCONFIG | AI_NUMERICSERV;
+
+  struct addrinfo *res = NULL;
+  int err = getaddrinfo (host, serv, &hints, &res);
+  if (err != 0 || res == NULL) {
+    return -8;
+  }
+
+  struct addrinfo *ai = res;
+  for (; ai != NULL; ai = ai->ai_next) {
+    if (ai->ai_family == AF_INET || ai->ai_family == AF_INET6) {
+      break;
+    }
+  }
+  if (ai == NULL) {
+    freeaddrinfo (res);
+    return -9;
+  }
+
+  memset (&fallback_backend_target, 0, sizeof (fallback_backend_target));
+  memset (fallback_backend_target_ipv6, 0, sizeof (fallback_backend_target_ipv6));
+  fallback_backend_is_ipv6 = 0;
+  fallback_backend_port = port;
+  snprintf (fallback_backend_printable, sizeof (fallback_backend_printable), "%s", backend);
+
+  if (ai->ai_family == AF_INET) {
+    struct sockaddr_in *sin = (struct sockaddr_in *)ai->ai_addr;
+    fallback_backend_target = sin->sin_addr;
+    fallback_backend_is_ipv6 = 0;
+  } else {
+    struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)ai->ai_addr;
+    memcpy (fallback_backend_target_ipv6, &sin6->sin6_addr, 16);
+    fallback_backend_is_ipv6 = 1;
+  }
+
+  freeaddrinfo (res);
+  fallback_backend_enabled = 1;
+  return 0;
+}
+
 struct client_random {
   unsigned char random[16];
   struct client_random *next_by_time;
@@ -1063,7 +1171,64 @@ static int is_allowed_timestamp (int timestamp) {
   return 0;
 }
 
+static int proxy_connection_fallback (connection_job_t C) {
+  struct connection_info *c = CONN_INFO(C);
+  assert (fallback_backend_enabled);
+  assert (check_conn_functions (&ct_proxy_pass, 0) >= 0);
+
+  // Avoid obvious self-proxy loops (common footgun: 127.0.0.1:443 while listening on :443).
+  if (fallback_backend_port == (int)c->our_port) {
+    if ((!fallback_backend_is_ipv6 && is_ipv4_loopback (fallback_backend_target)) ||
+        (fallback_backend_is_ipv6 && is_ipv6_loopback (fallback_backend_target_ipv6))) {
+      vkprintf (0, "refusing to proxy to fallback-backend %s from port %d (loop risk)\n", fallback_backend_printable, c->our_port);
+      fail_connection (C, -17);
+      return 0;
+    }
+  }
+
+  int cfd = -1;
+  if (!fallback_backend_is_ipv6) {
+    cfd = client_socket (fallback_backend_target.s_addr, fallback_backend_port, 0);
+  } else {
+    cfd = client_socket_ipv6 (fallback_backend_target_ipv6, fallback_backend_port, SM_IPV6);
+  }
+
+  if (cfd < 0) {
+    kprintf ("failed to create fallback proxy pass connection to %s: %d (%m)", fallback_backend_printable, errno);
+    fail_connection (C, -27);
+    return 0;
+  }
+
+  c->type->crypto_free (C);
+  job_incref (C);
+  job_t EJ = alloc_new_connection (cfd, NULL, NULL, ct_outbound, &ct_proxy_pass, C,
+                                  !fallback_backend_is_ipv6 ? ntohl (*(int *)&fallback_backend_target.s_addr) : 0,
+                                  (void *)(fallback_backend_is_ipv6 ? fallback_backend_target_ipv6 : NULL),
+                                  fallback_backend_port);
+
+  if (!EJ) {
+    kprintf ("failed to create fallback proxy pass connection (2)");
+    job_decref_f (C);
+    fail_connection (C, -37);
+    return 0;
+  }
+
+  c->type = &ct_proxy_pass;
+  c->extra = job_incref (EJ);
+
+  assert (CONN_INFO(EJ)->io_conn);
+  unlock_job (JOB_REF_PASS (EJ));
+
+  return c->type->parse_execute (C);
+}
+
 static int proxy_connection (connection_job_t C, const struct domain_info *info) {
+  if (fallback_backend_enabled) {
+    vkprintf (2, "proxying to fallback-backend %s for connection from %s:%d\n",
+              fallback_backend_printable, show_remote_ip (C), CONN_INFO(C)->remote_port);
+    return proxy_connection_fallback (C);
+  }
+
   struct connection_info *c = CONN_INFO(C);
   assert (check_conn_functions (&ct_proxy_pass, 0) >= 0);
 

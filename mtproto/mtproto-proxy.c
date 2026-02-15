@@ -2234,6 +2234,12 @@ int f_parse_option (int val) {
       }
     }
     break;
+  case 2001:
+    if (tcp_rpc_set_fallback_backend (optarg) < 0) {
+      kprintf ("'--fallback-backend' expects 'host:port' or '[ipv6]:port', got '%s'\n", optarg);
+      usage ();
+    }
+    break;
   default:
     return -1;
   }
@@ -2242,6 +2248,7 @@ int f_parse_option (int val) {
 
 void mtfront_prepare_parse_options (void) {
   parse_option ("http-stats", no_argument, 0, 2000, "allow http server to answer on stats queries");
+  parse_option ("fallback-backend", required_argument, 0, 2001, "proxy non-MTProxy TLS connections to <host:port> instead of SNI domain");
   parse_option ("mtproto-secret", required_argument, 0, 'S', "16-byte secret in hex mode");
   parse_option ("proxy-tag", required_argument, 0, 'P', "16-byte proxy tag in hex mode to be passed along with all forwarded queries");
   parse_option ("domain", required_argument, 0, 'D', "adds allowed domain for TLS-transport mode, disables other transports; can be specified more than once");
