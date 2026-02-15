@@ -1859,10 +1859,15 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         assert (rwm_fetch_lookup (&c->in, &packet_len, 4) == 4);
 
         c->left_tls_packet_length -= 64; // skip header length
-      } else if (((packet_len & 0xFFFFFF) == 0x010316 || (packet_len & 0xFFFFFF) == 0x020316 || (packet_len & 0xFFFFFF) == 0x030316) &&
-                 ext_secret_cnt > 0 && allow_only_tls) {
+      } else if (ext_secret_cnt > 0 && allow_only_tls) {
+        // TLS-transport mode: expect a TLS Handshake record (ClientHello) as the very first bytes.
+        // Use explicit byte checks instead of relying on host endianness of `packet_len`.
         unsigned char header[5];
         assert (rwm_fetch_lookup (&c->in, header, 5) == 5);
+        if (header[0] != 0x16 || header[1] != 0x03 || header[2] < 0x01 || header[2] > 0x03) {
+          // Not TLS-looking input on a TLS-only listener: treat as non-TLS (HTTP redirect or close).
+          return reject_or_fallback_close (C);
+        }
         min_len = 5 + 256 * header[3] + header[4];
         if (len < min_len) {
           return min_len - len;
