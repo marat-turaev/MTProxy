@@ -46,7 +46,7 @@ void tcp_rpc_conn_send_init (connection_job_t C, struct raw_message *raw, int fl
   int Q[2];
   Q[0] = raw->total_bytes + 12;
   Q[1] = TCP_RPC_DATA(C)->out_packet_num ++;
-  struct raw_message *r = malloc (sizeof (*r));
+  struct raw_message *r = rwm_alloc_raw_message ();
   if (flags & 1) {
     rwm_clone (r, raw);
   } else {
@@ -61,6 +61,8 @@ void tcp_rpc_conn_send_init (connection_job_t C, struct raw_message *raw, int fl
   if (S) {
     mpq_push_w (SOCKET_CONN_INFO (S)->out_packet_queue, r, 0);
     job_signal (JOB_REF_CREATE_PASS (S), JS_RUN);
+  } else {
+    rwm_free_raw_message (r);
   }
 }
 
@@ -71,7 +73,7 @@ void tcp_rpc_conn_send_im (JOB_REF_ARG (C), struct raw_message *raw, int flags) 
   int Q[2];
   Q[0] = raw->total_bytes + 12;
   Q[1] = TCP_RPC_DATA(C)->out_packet_num ++;
-  struct raw_message *r = malloc (sizeof (*r));
+  struct raw_message *r = rwm_alloc_raw_message ();
   if (flags & 1) {
     rwm_clone (r, raw);
   } else {
@@ -82,7 +84,7 @@ void tcp_rpc_conn_send_im (JOB_REF_ARG (C), struct raw_message *raw, int flags) 
   rwm_push_data (r, &crc32, 4);
 
   rwm_union (&c->out, r);
-  free (r);
+  rwm_free_raw_message (r);
 
   job_signal (JOB_REF_PASS (C), JS_RUN);
 }
@@ -98,7 +100,7 @@ void tcp_rpc_conn_send (JOB_REF_ARG (C), struct raw_message *raw, int flags) {
     r = raw;
     assert (!(flags & 1));
   } else {
-    r = malloc (sizeof (*r));
+    r = rwm_alloc_raw_message ();
     if (flags & 1) {
       rwm_clone (r, raw);
     } else {

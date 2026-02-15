@@ -166,7 +166,7 @@ static inline void __tl_raw_msg_fetch_lookup_raw_message (struct tl_in_state *tl
   
 static inline void __tl_raw_msg_fetch_mark (struct tl_in_state *tlio_in) {
   assert (!TL_IN_MARK);
-  struct raw_message *T = malloc (sizeof (*T));
+  struct raw_message *T = rwm_alloc_raw_message ();
   rwm_clone (T, TL_IN_RAW_MSG);
   TL_IN_MARK = T;
   TL_IN_MARK_POS = TL_IN_POS;
@@ -175,8 +175,8 @@ static inline void __tl_raw_msg_fetch_mark (struct tl_in_state *tlio_in) {
 static inline void __tl_raw_msg_fetch_mark_restore (struct tl_in_state *tlio_in) {
   assert (TL_IN_MARK);
   rwm_free (TL_IN_RAW_MSG);
-  *TL_IN_RAW_MSG = *(struct raw_message *)TL_IN_MARK;
-  free (TL_IN_MARK);
+  rwm_move (TL_IN_RAW_MSG, TL_IN_MARK);
+  rwm_free_raw_message (TL_IN_MARK);
   TL_IN_MARK = 0;
   int x = TL_IN_POS - TL_IN_MARK_POS;
   TL_IN_POS -= x;
@@ -185,8 +185,7 @@ static inline void __tl_raw_msg_fetch_mark_restore (struct tl_in_state *tlio_in)
 
 static inline void __tl_raw_msg_fetch_mark_delete (struct tl_in_state *tlio_in) {
   assert (TL_IN_MARK);
-  rwm_free (TL_IN_MARK);
-  free (TL_IN_MARK);
+  rwm_free_raw_message (TL_IN_MARK);
   TL_IN_MARK = 0;
 }
 
@@ -243,16 +242,14 @@ static inline void __tl_raw_msg_str_copy_through (struct tl_in_state *tlio_in, s
 
 static inline void __tl_raw_msg_fetch_clear (struct tl_in_state *tlio_in) {
   if (TL_IN_RAW_MSG) {
-    rwm_free (TL_IN_RAW_MSG);
-    free (TL_IN_RAW_MSG);
+    rwm_free_raw_message (TL_IN_RAW_MSG);
     TL_IN = 0;
   }
 }
 
 static inline void __tl_raw_msg_store_clear (struct tl_out_state *tlio_out) {
   if (TL_OUT_RAW_MSG) {
-    rwm_free (TL_OUT_RAW_MSG);
-    free (TL_OUT_RAW_MSG);
+    rwm_free_raw_message (TL_OUT_RAW_MSG);
     TL_OUT = 0;
   }
 }
@@ -280,8 +277,7 @@ static inline void __tl_raw_msg_store_flush (struct tl_out_state *tlio_out) {
 
 static inline void __tl_tcp_raw_msg_store_clear (struct tl_out_state *tlio_out) {
   if (TL_OUT_RAW_MSG) {
-    rwm_free (TL_OUT_RAW_MSG);
-    free (TL_OUT_RAW_MSG);
+    rwm_free_raw_message (TL_OUT_RAW_MSG);
     job_decref (JOB_REF_PASS (TL_OUT_EXTRA));
     TL_OUT = NULL;
     TL_OUT_EXTRA = NULL;
@@ -575,7 +571,7 @@ int __tl_fetch_init (struct tl_in_state *tlio_in, void *in, void *in_extra, enum
 }
 
 int tlf_init_raw_message (struct tl_in_state *tlio_in, struct raw_message *msg, int size, int dup) {
-  struct raw_message *r = (struct raw_message *)malloc (sizeof (*r));
+  struct raw_message *r = rwm_alloc_raw_message ();
   if (dup == 0) {
     rwm_move (r, msg);
   } else if (dup == 1) {

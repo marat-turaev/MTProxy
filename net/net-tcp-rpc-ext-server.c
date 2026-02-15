@@ -122,7 +122,7 @@ int tcp_proxy_pass_parse_execute (connection_job_t C) {
   job_t E = job_incref (c->extra);
   struct connection_info *e = CONN_INFO(E);
 
-  struct raw_message *r = malloc (sizeof (*r));
+  struct raw_message *r = rwm_alloc_raw_message ();
   rwm_move (r, &c->in);
   rwm_init (&c->in, 0);
   vkprintf (3, "proxying %d bytes to %s:%d\n", r->total_bytes, show_remote_ip (E), e->remote_port);
@@ -1351,8 +1351,7 @@ static int tls_send_alert_and_close (connection_job_t C, unsigned char descripti
   alert[6] = description;
 
   struct connection_info *c = CONN_INFO (C);
-  struct raw_message *m = calloc (sizeof (struct raw_message), 1);
-  assert (m != NULL);
+  struct raw_message *m = rwm_alloc_raw_message ();
   rwm_create (m, alert, (int)sizeof (alert));
   mpq_push_w (c->out_queue, m, 0);
   job_signal (JOB_REF_CREATE_PASS (C), JS_RUN);
@@ -1888,7 +1887,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         sha256_hmac (ext_secret[secret_id], 16, buffer, 32 + response_size, server_random);
         memcpy (response_buffer + 11, server_random, 32);
 
-        struct raw_message *m = calloc (sizeof (struct raw_message), 1);
+        struct raw_message *m = rwm_alloc_raw_message ();
         rwm_create (m, response_buffer, response_size);
         mpq_push_w (c->out_queue, m, 0);
         // Add tiny jitter before sending the first server flight. This makes timing patterns

@@ -65,12 +65,12 @@ int cpu_tcp_server_writer (connection_job_t C) /* {{{ */ {
     if (!raw) { break; }
     //rwm_union (out, raw);
     c->type->write_packet (C, raw);
-    free (raw);
+    rwm_free_raw_message (raw);
   }
   
   c->type->flush (C);
 
-  struct raw_message *raw = malloc (sizeof (*raw));
+  struct raw_message *raw = rwm_alloc_raw_message ();
 
   if (c->type->crypto_encrypt_output && c->crypto) {
     c->type->crypto_encrypt_output (C);
@@ -88,8 +88,7 @@ int cpu_tcp_server_writer (connection_job_t C) /* {{{ */ {
     }
     job_signal (JOB_REF_CREATE_PASS (c->io_conn), JS_RUN);
   } else {
-    rwm_free (raw);
-    free (raw);
+    rwm_free_raw_message (raw);
   }
 
   return 0;
@@ -109,7 +108,7 @@ int cpu_tcp_server_reader (connection_job_t C) /* {{{ */ {
     } else {
       rwm_union (&c->in, raw);
     }
-    free (raw);
+    rwm_free_raw_message (raw);
   }
         
   if (c->crypto) {

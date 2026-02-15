@@ -45,6 +45,7 @@
 #include "jobs/jobs.h"
 #include "common/common-stats.h"
 #include "common/server-functions.h"
+#include "common/mp-queue.h"
 
 struct raw_message empty_rwm = {
   .first = NULL,
@@ -54,6 +55,67 @@ struct raw_message empty_rwm = {
   .first_offset = 0,
   .last_offset = 0
 };
+
+#define RAW_MSG_POOL_MAX 16384
+static struct mp_queue *raw_msg_pool;
+static volatile int raw_msg_pool_inited;
+static volatile int raw_msg_pool_size;
+
+static void raw_msg_pool_init (void) {
+  if (raw_msg_pool) {
+    return;
+  }
+  if (__sync_bool_compare_and_swap (&raw_msg_pool_inited, 0, 1)) {
+    raw_msg_pool = alloc_mp_queue_w ();
+    __sync_synchronize ();
+  } else {
+    // Wait until the initializing thread publishes the pointer.
+    while (!raw_msg_pool) {
+      __sync_synchronize ();
+    }
+  }
+}
+
+struct raw_message *rwm_alloc_raw_message (void) {
+  if (!raw_msg_pool) {
+    raw_msg_pool_init ();
+  }
+  struct raw_message *r = raw_msg_pool ? mpq_pop_nw (raw_msg_pool, 4) : NULL;
+  if (r) {
+    __sync_fetch_and_add (&raw_msg_pool_size, -1);
+  } else {
+    r = malloc (sizeof (*r));
+    assert (r);
+  }
+  memset (r, 0, sizeof (*r));
+  return r;
+}
+
+void rwm_free_raw_message (struct raw_message *raw) {
+  if (!raw) {
+    return;
+  }
+  if (raw->magic == RM_INIT_MAGIC || raw->magic == RM_TMP_MAGIC) {
+    rwm_free (raw);
+  } else {
+    // Some callers already consumed the chain via rwm_union(), which clears the struct.
+    assert (raw->magic == 0);
+  }
+  if (!raw_msg_pool) {
+    raw_msg_pool_init ();
+  }
+  if (!raw_msg_pool) {
+    free (raw);
+    return;
+  }
+  int sz = __sync_add_and_fetch (&raw_msg_pool_size, 1);
+  if (sz <= RAW_MSG_POOL_MAX) {
+    mpq_push_w (raw_msg_pool, raw, 0);
+  } else {
+    __sync_fetch_and_add (&raw_msg_pool_size, -1);
+    free (raw);
+  }
+}
 
 #define MODULE raw_msg
 

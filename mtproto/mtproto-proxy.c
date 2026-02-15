@@ -797,7 +797,7 @@ void push_rpc_confirmation (JOB_REF_ARG (C), int confirm) {
    * Keep it only for non-padded flows for compatibility.
    */
   if (!(TCP_RPC_DATA(C)->flags & RPC_F_PAD)) {
-    struct raw_message *msg = malloc (sizeof (struct raw_message));
+    struct raw_message *msg = rwm_alloc_raw_message ();
     rwm_create (msg, "\xdd", 1);
     rwm_push_data (msg, &confirm, 4);
     mpq_push_w (CONN_INFO(C)->out_queue, msg, 0);

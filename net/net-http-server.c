@@ -196,7 +196,7 @@ int write_http_error_raw (connection_job_t C, struct raw_message *raw, int code)
 }
 
 int write_http_error (connection_job_t C, int code) {
-  struct raw_message *raw = calloc (sizeof (*raw), 1);
+  struct raw_message *raw = rwm_alloc_raw_message ();
   rwm_init (raw, 0);
   int r = write_http_error_raw (C, raw, code);
   
@@ -883,4 +883,3 @@ void http_flush (connection_job_t C, struct raw_message *raw) {
  *                END (HTTP SERVER)
  *
  */
-

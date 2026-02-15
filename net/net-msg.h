@@ -103,6 +103,11 @@ int rwm_init (struct raw_message *raw, int alloc_bytes);
 int rwm_create (struct raw_message *raw, const void *data, int alloc_bytes);
 void rwm_clone (struct raw_message *dest_raw, struct raw_message *src_raw);
 void rwm_move (struct raw_message *dest_raw, struct raw_message *src_raw);
+
+// Allocates/frees the raw_message wrapper itself (not just its msg_part chain).
+// These are safe to call from any thread.
+struct raw_message *rwm_alloc_raw_message (void);
+void rwm_free_raw_message (struct raw_message *raw);
 int rwm_push_data (struct raw_message *raw, const void *data, int alloc_bytes);
 int rwm_push_data_ext (struct raw_message *raw, const void *data, int alloc_bytes, int prepend, int small_buffer, int std_buffer);
 int rwm_push_data_front (struct raw_message *raw, const void *data, int alloc_bytes);

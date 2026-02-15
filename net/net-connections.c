@@ -439,8 +439,7 @@ int cpu_server_free_connection (connection_job_t C) /* {{{ */ {
   while (1) {
     struct raw_message *raw = mpq_pop_nw (c->out_queue, 4);
     if (!raw) { break; }
-    rwm_free (raw);
-    free (raw);
+    rwm_free_raw_message (raw);
   }
 
   free_mp_queue (c->out_queue);
@@ -449,8 +448,7 @@ int cpu_server_free_connection (connection_job_t C) /* {{{ */ {
   while (1) {
     struct raw_message *raw = mpq_pop_nw (c->in_queue, 4);
     if (!raw) { break; }
-    rwm_free (raw);
-    free (raw);
+    rwm_free_raw_message (raw);
   }
 
   free_mp_queue (c->in_queue);
@@ -851,8 +849,7 @@ int net_server_socket_free (socket_connection_job_t C) /* {{{ */ {
   while (1) {
     struct raw_message *raw = mpq_pop_nw (c->out_packet_queue, 4);
     if (!raw) { break; }
-    rwm_free (raw);
-    free (raw);
+    rwm_free_raw_message (raw);
   }
 
   free_mp_queue (c->out_packet_queue);
@@ -877,7 +874,7 @@ int net_server_socket_reader (socket_connection_job_t C) /* {{{ */ {
       prealloc_tcp_buffers ();
     }
 
-    struct raw_message *in = malloc (sizeof (*in));
+    struct raw_message *in = rwm_alloc_raw_message ();
     rwm_init (in, 0);
     
     int s = tcp_recv_buffers_total_size;
@@ -911,8 +908,7 @@ int net_server_socket_reader (socket_connection_job_t C) /* {{{ */ {
     vkprintf (2, "readv from %d: %d read out of %d\n", c->fd, r, s);
 
     if (r <= 0) {
-      rwm_free (in);
-      free (in);
+      rwm_free_raw_message (in);
       break;
     }
 
@@ -1232,7 +1228,7 @@ int net_server_socket_read_write (socket_connection_job_t C) /* {{{ */ {
     struct raw_message *raw = mpq_pop_nw (c->out_packet_queue, 4);
     if (!raw) { break; }
     rwm_union (out, raw);
-    free (raw);
+    rwm_free_raw_message (raw);
   }
 
   if (out->total_bytes) {
