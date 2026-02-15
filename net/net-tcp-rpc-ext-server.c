@@ -1527,6 +1527,22 @@ static int tls_schedule_delayed_alert (connection_job_t C, unsigned char alert_d
   return NEED_MORE_BYTES;
 }
 
+static int tls_schedule_delayed_close (connection_job_t C, int delay_ms) {
+  struct tcp_rpc_data *D = TCP_RPC_DATA (C);
+  if (D->extra_int2 != TLS_DELAY_ACTION_NONE) {
+    return NEED_MORE_BYTES;
+  }
+  if (delay_ms <= 0) {
+    connection_write_close (C);
+    return NEED_MORE_BYTES;
+  }
+  D->extra_int2 = TLS_DELAY_ACTION_CLOSE;
+  D->extra_int3 = 0;
+  stop_reading_temporarily (C);
+  job_timer_insert (C, precise_now + 0.001 * delay_ms);
+  return NEED_MORE_BYTES;
+}
+
 static int tls_schedule_delayed_run (connection_job_t C, int delay_ms) {
   struct tcp_rpc_data *D = TCP_RPC_DATA (C);
   if (D->extra_int2 != TLS_DELAY_ACTION_NONE) {
@@ -1589,9 +1605,12 @@ static int reject_or_fallback_close (connection_job_t C) {
   }
 
   int blocked = 0;
-  (void)probe_note_failure (C, 1, &blocked);
+  int delay_ms = probe_note_failure (C, 1, &blocked);
+  if (blocked) {
   connection_write_close (C);
   return NEED_MORE_BYTES;
+  }
+  return tls_schedule_delayed_close (C, delay_ms);
 }
 
 static int proxy_connection_fallback (connection_job_t C) {
@@ -2248,8 +2267,13 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         // Previously we entered "global skip mode" (skip a huge amount of bytes without parsing).
         // That keeps the socket open and is easy to abuse for resource holding / easy identification.
         vkprintf (1, "invalid \"random\" 64-byte header, closing\n");
+        int blocked = 0;
+        int delay_ms = probe_note_failure (C, 2, &blocked);
+        if (blocked) {
         connection_write_close (C);
         return NEED_MORE_BYTES;
+      }
+        return tls_schedule_delayed_close (C, delay_ms);
       }
 
 #if __ALLOW_UNOBFS__
@@ -2262,8 +2286,13 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
       continue;
 #else
       vkprintf (1, "invalid \"random\" 64-byte header, closing\n");
+      int blocked = 0;
+      int delay_ms = probe_note_failure (C, 2, &blocked);
+      if (blocked) {
       connection_write_close (C);
       return NEED_MORE_BYTES;
+      }
+      return tls_schedule_delayed_close (C, delay_ms);
 #endif
     }
 
