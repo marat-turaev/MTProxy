@@ -236,7 +236,12 @@ void engine_init (const char *const pwd_filename, int do_not_open_port) {
 
   if (E->settings_addr.s_addr) {
     ipv4 = ntohl (E->settings_addr.s_addr);
-    if ((ipv4 >> 24) != 10) {
+    unsigned a = (ipv4 >> 24) & 255;
+    unsigned b = (ipv4 >> 16) & 255;
+    int is_rfc1918 = (a == 10) ||
+                     (a == 172 && b >= 16 && b <= 31) ||
+                     (a == 192 && b == 168);
+    if (!is_rfc1918) {
       kprintf ("Bad binded IP address " IP_PRINT_STR ", search in ifconfig\n", IP_TO_PRINT (ipv4));
       ipv4 = 0;
     }
