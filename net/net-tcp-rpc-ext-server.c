@@ -175,6 +175,10 @@ static char fallback_backend_printable[256];
 #define MAX_UNDETERMINED_CONNS 1024
 static __thread int undetermined_conn_count;
 
+// Upper bound on buffered bytes while the connection is still undetermined.
+// If a peer sends a lot of junk before we can classify the transport, close early.
+#define MAX_UNDETERMINED_BUFFER_BYTES 8192
+
 // D->extra_int bit used by this file to track whether the connection is counted above.
 #define EXT_TCPRPC_F_UNDET_COUNTED 1
 
@@ -1934,6 +1938,18 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
     len = c->in.total_bytes; 
     if (len <= 0) {
       return NEED_MORE_BYTES;
+    }
+
+    if (D->in_packet_num == -3 && len > MAX_UNDETERMINED_BUFFER_BYTES) {
+      vkprintf (1, "too much data while undetermined (%d bytes) from %s:%d, closing\n",
+                len, show_remote_ip (C), c->remote_port);
+      int blocked = 0;
+      int delay_ms = probe_note_failure (C, 2, &blocked);
+      if (blocked) {
+        connection_write_close (C);
+        return NEED_MORE_BYTES;
+      }
+      return tls_schedule_delayed_close (C, delay_ms);
     }
 
     int min_len = (D->flags & RPC_F_MEDIUM) ? 4 : 1;
