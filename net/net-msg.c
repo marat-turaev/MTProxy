@@ -61,6 +61,10 @@ static struct mp_queue *raw_msg_pool;
 static volatile int raw_msg_pool_inited;
 static volatile int raw_msg_pool_size;
 
+#define RAW_MSG_TLS_MAX 512
+static __thread struct raw_message *raw_msg_tls_head;
+static __thread int raw_msg_tls_cnt;
+
 static void raw_msg_pool_init (void) {
   if (raw_msg_pool) {
     return;
@@ -77,6 +81,13 @@ static void raw_msg_pool_init (void) {
 }
 
 struct raw_message *rwm_alloc_raw_message (void) {
+  if (raw_msg_tls_head) {
+    struct raw_message *r = raw_msg_tls_head;
+    raw_msg_tls_head = (struct raw_message *)(void *)r->first;
+    raw_msg_tls_cnt--;
+    memset (r, 0, sizeof (*r));
+    return r;
+  }
   if (!raw_msg_pool) {
     raw_msg_pool_init ();
   }
@@ -100,6 +111,12 @@ void rwm_free_raw_message (struct raw_message *raw) {
   } else {
     // Some callers already consumed the chain via rwm_union(), which clears the struct.
     assert (raw->magic == 0);
+  }
+  if (raw_msg_tls_cnt < RAW_MSG_TLS_MAX) {
+    raw->first = (struct msg_part *)(void *)raw_msg_tls_head;
+    raw_msg_tls_head = raw;
+    raw_msg_tls_cnt++;
+    return;
   }
   if (!raw_msg_pool) {
     raw_msg_pool_init ();
@@ -137,6 +154,10 @@ static struct mp_queue *msg_part_pool;
 static volatile int msg_part_pool_inited;
 static volatile int msg_part_pool_size;
 
+#define MSG_PART_TLS_MAX 2048
+static __thread struct msg_part *msg_part_tls_head;
+static __thread int msg_part_tls_cnt;
+
 static void msg_part_pool_init (void) {
   if (msg_part_pool) {
     return;
@@ -153,6 +174,14 @@ static void msg_part_pool_init (void) {
 
 static inline struct msg_part *alloc_msg_part (void) {
   MODULE_STAT->rwm_total_msg_parts ++;
+  if (msg_part_tls_head) {
+    struct msg_part *mp = msg_part_tls_head;
+    msg_part_tls_head = mp->next;
+    msg_part_tls_cnt--;
+    memset (mp, 0, sizeof (*mp));
+    mp->magic = MSG_PART_MAGIC;
+    return mp;
+  }
   if (!msg_part_pool) {
     msg_part_pool_init ();
   }
@@ -172,6 +201,12 @@ static inline void free_msg_part (struct msg_part *mp) {
   MODULE_STAT->rwm_total_msg_parts --;
   assert (mp->magic == MSG_PART_MAGIC);
   mp->magic = 0;
+  if (msg_part_tls_cnt < MSG_PART_TLS_MAX) {
+    mp->next = msg_part_tls_head;
+    msg_part_tls_head = mp;
+    msg_part_tls_cnt++;
+    return;
+  }
   if (!msg_part_pool) {
     msg_part_pool_init ();
   }

@@ -55,6 +55,10 @@ static struct mp_queue *nev_pool;
 static volatile int nev_pool_inited;
 static volatile int nev_pool_size;
 
+#define NEV_TLS_MAX 256
+static __thread struct notification_event *nev_tls_head;
+static __thread int nev_tls_cnt;
+
 static void nev_pool_init (void) {
   if (nev_pool) {
     return;
@@ -70,6 +74,13 @@ static void nev_pool_init (void) {
 }
 
 static struct notification_event *notification_event_alloc (void) {
+  if (nev_tls_head) {
+    struct notification_event *ev = nev_tls_head;
+    nev_tls_head = (struct notification_event *)ev->who;
+    nev_tls_cnt--;
+    memset (ev, 0, sizeof (*ev));
+    return ev;
+  }
   if (!nev_pool) {
     nev_pool_init ();
   }
@@ -86,6 +97,12 @@ static struct notification_event *notification_event_alloc (void) {
 
 static void notification_event_free (struct notification_event *ev) {
   if (!ev) {
+    return;
+  }
+  if (nev_tls_cnt < NEV_TLS_MAX) {
+    ev->who = nev_tls_head;
+    nev_tls_head = ev;
+    nev_tls_cnt++;
     return;
   }
   if (!nev_pool) {
