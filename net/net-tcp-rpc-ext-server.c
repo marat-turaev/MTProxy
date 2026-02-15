@@ -1406,8 +1406,15 @@ static int tls_send_alert_and_close (connection_job_t C, unsigned char descripti
   struct connection_info *c = CONN_INFO (C);
   struct raw_message *m = rwm_alloc_raw_message ();
   rwm_create (m, alert, (int)sizeof (alert));
+  socket_connection_job_t S = c->io_conn;
+  if (S) {
+    // Bypass MTProto framing/encryption: send a raw TLS alert record.
+    mpq_push_w (SOCKET_CONN_INFO (S)->out_packet_queue, m, 0);
+    job_signal (JOB_REF_CREATE_PASS (S), JS_RUN);
+  } else {
   mpq_push_w (c->out_queue, m, 0);
   job_signal (JOB_REF_CREATE_PASS (C), JS_RUN);
+  }
   connection_write_close (C);
   return NEED_MORE_BYTES;
 }
