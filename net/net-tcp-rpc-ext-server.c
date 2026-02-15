@@ -1412,6 +1412,73 @@ static int tls_send_alert_and_close (connection_job_t C, unsigned char descripti
   return NEED_MORE_BYTES;
 }
 
+static int http_send_301_and_close (connection_job_t C) {
+  // Plain HTTP request on a TLS-only port is common for automated clients. Reply with a simple redirect
+  // to the configured default -D domain to look more like a regular HTTPS endpoint.
+  struct connection_info *c = CONN_INFO (C);
+
+  const char *host = (default_domain_info && default_domain_info->domain) ? default_domain_info->domain : "example.com";
+  char path[1024];
+  strcpy (path, "/");
+
+  // Best-effort path extraction: METHOD SP <path> SP HTTP/...
+  int avail = c->in.total_bytes;
+  if (avail > 0) {
+    if (avail > 2047) {
+      avail = 2047;
+    }
+    unsigned char buf[2048];
+    if (rwm_fetch_lookup (&c->in, buf, avail) == avail) {
+      int i;
+      // Find first space after method token
+      for (i = 0; i < avail && buf[i] != ' ' && buf[i] != '\r' && buf[i] != '\n'; i++) {}
+      if (i < avail && buf[i] == ' ') {
+        int j = i + 1;
+        while (j < avail && buf[j] == ' ') { j++; }
+        int k = j;
+        while (k < avail && buf[k] != ' ' && buf[k] != '\r' && buf[k] != '\n') { k++; }
+        if (k > j) {
+          int n = k - j;
+          if (n > (int)sizeof (path) - 1) {
+            n = (int)sizeof (path) - 1;
+          }
+          memcpy (path, buf + j, n);
+          path[n] = 0;
+          if (path[0] != '/') {
+            // Absolute-form or garbage; don't reflect it.
+            strcpy (path, "/");
+          }
+        }
+      }
+    }
+  }
+
+  char location[2048];
+  snprintf (location, sizeof (location), "https://%s%s", host, path);
+
+  char resp[4096];
+  int rlen = snprintf (resp, sizeof (resp),
+                       "HTTP/1.1 301 Moved Permanently\r\n"
+                       "Location: %s\r\n"
+                       "Content-Length: 0\r\n"
+                       "Connection: close\r\n"
+                       "\r\n",
+                       location);
+  if (rlen < 0) {
+    rlen = 0;
+  }
+  if (rlen > (int)sizeof (resp)) {
+    rlen = (int)sizeof (resp);
+  }
+
+  struct raw_message *m = rwm_alloc_raw_message ();
+  rwm_create (m, resp, rlen);
+  mpq_push_w (c->out_queue, m, 0);
+  job_signal (JOB_REF_CREATE_PASS (C), JS_RUN);
+  connection_write_close (C);
+  return NEED_MORE_BYTES;
+}
+
 static int proxy_connection_fallback (connection_job_t C);
 
 static void stop_reading_temporarily (connection_job_t C) {
@@ -1483,6 +1550,29 @@ static int reject_or_fallback_close (connection_job_t C) {
   if (fallback_backend_enabled) {
     return proxy_connection_fallback (C);
   }
+
+  // If this looks like plain HTTP, reply with a redirect instead of a silent close.
+  {
+    struct connection_info *c = CONN_INFO (C);
+    if (!(c->flags & C_IS_TLS) && c->in.total_bytes >= 4) {
+      unsigned char pfx[4];
+      if (rwm_fetch_lookup (&c->in, pfx, 4) == 4) {
+        if (!memcmp (pfx, "GET ", 4) ||
+            !memcmp (pfx, "HEAD", 4) ||
+            !memcmp (pfx, "POST", 4) ||
+            !memcmp (pfx, "OPTI", 4) ||  // OPTIONS
+            !memcmp (pfx, "PUT ", 4) ||
+            !memcmp (pfx, "DELE", 4) ||  // DELETE
+            !memcmp (pfx, "PATC", 4) ||  // PATCH
+            !memcmp (pfx, "TRAC", 4) ||  // TRACE
+            !memcmp (pfx, "CONN", 4) ||  // CONNECT
+            !memcmp (pfx, "PRI ", 4)) {  // HTTP/2 preface
+          return http_send_301_and_close (C);
+        }
+      }
+    }
+  }
+
   int blocked = 0;
   (void)probe_note_failure (C, 1, &blocked);
   connection_write_close (C);
