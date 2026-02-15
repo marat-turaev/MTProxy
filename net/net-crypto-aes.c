@@ -32,6 +32,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <stdint.h>
 #include <unistd.h>
 
 // #include <openssl/aes.h>
@@ -165,9 +166,12 @@ int aes_load_pwd_file (const char *filename) {
     close (h);
   }
 
-  *(long *) rand_buf ^= lrand48_j();
+  uint64_t seed_u64 = 0;
+  memcpy (&seed_u64, rand_buf, sizeof (seed_u64));
+  seed_u64 ^= (uint64_t)(unsigned)lrand48_j ();
+  memcpy (rand_buf, &seed_u64, sizeof (seed_u64));
 
-  srand48 (*(long *)rand_buf);
+  srand48 ((long)seed_u64);
 
   if (!filename) {
     filename = DEFAULT_PWD_FILE;
@@ -215,14 +219,22 @@ int aes_load_pwd_file (const char *filename) {
 }
 
 int aes_generate_nonce (char res[16]) {
-  *(int *)(rand_buf + 16) = lrand48_j ();
-  *(int *)(rand_buf + 20) = lrand48_j ();
-  *(long long *)(rand_buf + 24) = rdtsc ();
+  int32_t r1 = (int32_t) lrand48_j ();
+  int32_t r2 = (int32_t) lrand48_j ();
+  int64_t tsc = (int64_t) rdtsc ();
+  memcpy (rand_buf + 16, &r1, sizeof (r1));
+  memcpy (rand_buf + 20, &r2, sizeof (r2));
+  memcpy (rand_buf + 24, &tsc, sizeof (tsc));
   struct timespec T;
   assert (clock_gettime(CLOCK_REALTIME, &T) >= 0);
-  *(int *)(rand_buf + 32) = T.tv_sec;
-  *(int *)(rand_buf + 36) = T.tv_nsec;
-  (*(int *)(rand_buf + 40))++;
+  int32_t sec = (int32_t) T.tv_sec;
+  int32_t nsec = (int32_t) T.tv_nsec;
+  memcpy (rand_buf + 32, &sec, sizeof (sec));
+  memcpy (rand_buf + 36, &nsec, sizeof (nsec));
+  uint32_t ctr = 0;
+  memcpy (&ctr, rand_buf + 40, sizeof (ctr));
+  ctr++;
+  memcpy (rand_buf + 40, &ctr, sizeof (ctr));
 
   md5 ((unsigned char *)rand_buf, 44, (unsigned char *)res);
   return 0;

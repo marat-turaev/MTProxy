@@ -1707,7 +1707,7 @@ static int proxy_connection_fallback (connection_job_t C) {
   c->type->crypto_free (C);
   job_incref (C);
   job_t EJ = alloc_new_connection (cfd, NULL, NULL, ct_outbound, &ct_proxy_pass, C,
-                                  !fallback_backend_is_ipv6 ? ntohl (*(int *)&fallback_backend_target.s_addr) : 0,
+                                  !fallback_backend_is_ipv6 ? ntohl (fallback_backend_target.s_addr) : 0,
                                   (void *)(fallback_backend_is_ipv6 ? fallback_backend_target_ipv6 : NULL),
                                   fallback_backend_port);
 
@@ -1761,7 +1761,7 @@ static int proxy_connection (connection_job_t C, const struct domain_info *info)
 
   c->type->crypto_free (C);
   job_incref (C); 
-  job_t EJ = alloc_new_connection (cfd, NULL, NULL, ct_outbound, &ct_proxy_pass, C, ntohl (*(int *)&info->target.s_addr), (void *)info->target_ipv6, port); 
+  job_t EJ = alloc_new_connection (cfd, NULL, NULL, ct_outbound, &ct_proxy_pass, C, ntohl (info->target.s_addr), (void *)info->target_ipv6, port); 
 
   if (!EJ) {
     kprintf ("failed to create proxy pass connection (2)");
