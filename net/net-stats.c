@@ -79,6 +79,7 @@ int aio_prepare_stat (stats_buffer_t *sb);
 int mp_queue_prepare_stat (stats_buffer_t *sb);
 int timers_prepare_stat (stats_buffer_t *sb);
 int rpc_targets_prepare_stat (stats_buffer_t *sb);
+int tcp_rpc_proxy_domains_prepare_stat (stats_buffer_t *sb);
 
 //static double safe_div (double x, double y) { return y > 0 ? x/y : 0; }
 
@@ -149,6 +150,7 @@ int prepare_stats (char *buff, int buff_size) {
   mp_queue_prepare_stat (&sb);
   timers_prepare_stat (&sb);
   rpc_targets_prepare_stat (&sb);
+  tcp_rpc_proxy_domains_prepare_stat (&sb);
 
   sb_printf (&sb,
     "stats_generate_time\t%.6f\n",

@@ -39,6 +39,7 @@
 #include <openssl/bn.h>
 #include <openssl/rand.h>
 
+#include "common/common-stats.h"
 #include "common/kprintf.h"
 #include "common/precise-time.h"
 #include "common/resolver.h"
@@ -245,6 +246,54 @@ static int get_domain_server_hello_encrypted_size_n (const struct domain_info *i
   default:
     return 0;
   }
+}
+
+int tcp_rpc_proxy_domains_prepare_stat (stats_buffer_t *sb) {
+  sb_printf (sb, ">>>>>>tls_transport>>>>>>\tstart\n");
+  sb_printf (sb, "tls_transport_only\t%d\n", allow_only_tls ? 1 : 0);
+
+  if (default_domain_info && default_domain_info->domain) {
+    sb_printf (sb, "tls_default_domain\t%s\n", default_domain_info->domain);
+  } else {
+    sb_printf (sb, "tls_default_domain\t-\n");
+  }
+
+  sb_printf (sb, "tls_fallback_backend_enabled\t%d\n", fallback_backend_enabled ? 1 : 0);
+  if (fallback_backend_enabled) {
+    sb_printf (sb, "tls_fallback_backend\t%s\n", fallback_backend_printable[0] ? fallback_backend_printable : "-");
+    sb_printf (sb, "tls_fallback_backend_is_ipv6\t%d\n", fallback_backend_is_ipv6 ? 1 : 0);
+    sb_printf (sb, "tls_fallback_backend_port\t%d\n", fallback_backend_port);
+  }
+
+  int idx = 0;
+  int i;
+  for (i = 0; i < DOMAIN_HASH_MOD; i++) {
+    struct domain_info *info = domains[i];
+    while (info != NULL) {
+      const char *d = info->domain ? info->domain : "-";
+      sb_printf (sb, "tls_domain_%d\t%s\n", idx, d);
+      sb_printf (sb, "tls_domain_%d_is_reversed_extension_order\t%d\n", idx, (int)info->is_reversed_extension_order);
+      sb_printf (sb, "tls_domain_%d_records\t%d\n", idx, (int)get_domain_server_hello_encrypted_records (info));
+
+      sb_printf (sb, "tls_domain_%d_size0\t%d\n", idx, (int)info->server_hello_encrypted_size);
+      sb_printf (sb, "tls_domain_%d_size1\t%d\n", idx, (int)info->server_hello_encrypted_size2);
+      sb_printf (sb, "tls_domain_%d_size2\t%d\n", idx, (int)info->server_hello_encrypted_size3);
+
+      sb_printf (sb, "tls_domain_%d_use_random0\t%d\n", idx, (int)info->use_random_encrypted_size);
+      sb_printf (sb, "tls_domain_%d_use_random1\t%d\n", idx, (int)info->use_random_encrypted_size2);
+      sb_printf (sb, "tls_domain_%d_use_random2\t%d\n", idx, (int)info->use_random_encrypted_size3);
+
+      sb_printf (sb, "tls_domain_%d_server_hello_template_len\t%d\n", idx, (int)info->server_hello_template_len);
+      sb_printf (sb, "tls_domain_%d_server_hello_keyshare_offset\t%d\n", idx, (int)info->server_hello_keyshare_offset);
+
+      idx++;
+      info = info->next;
+    }
+  }
+
+  sb_printf (sb, "tls_domains_count\t%d\n", idx);
+  sb_printf (sb, "<<<<<<tls_transport<<<<<<\tend\n");
+  return sb->pos;
 }
 
 #define TLS_REQUEST_LENGTH 517
@@ -478,7 +527,11 @@ static int check_response (const unsigned char *response, int len, const unsigne
   if (memcmp (response + 44, request_session_id, 32) != 0) {
     FAIL("TLS <= 1.2: expected mirrored session_id");
   }
-  EXPECT_STR(76, "\x13\x01\x00", "TLS <= 1.2: expected x25519 as a chosen cipher");
+  // In TLS 1.3 the ServerHello selects a cipher suite (2 bytes) and a compression method (1 byte, must be 0).
+  // Our synthetic ClientHello offers 0x1301..0x1303; different domains choose different ones.
+  if (response[76] != 0x13 || response[77] < 0x01 || response[77] > 0x03 || response[78] != 0x00) {
+    FAIL("TLS <= 1.2: can't recognize chosen cipher/compression");
+  }
   pos += 74;
   int extensions_length = read_length (response, &pos);
   if (extensions_length + 76 != server_hello_length) {
