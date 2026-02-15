@@ -1230,6 +1230,24 @@ static int is_allowed_timestamp (int timestamp) {
   return 0;
 }
 
+static int tls_send_alert_and_close (connection_job_t C, unsigned char description) {
+  // Send a minimal TLS alert record and then close the connection gracefully.
+  // This makes failures look more like a normal HTTPS endpoint to generic clients.
+  static const unsigned char alert_tpl[7] = {0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28}; // fatal handshake_failure
+  unsigned char alert[7];
+  memcpy (alert, alert_tpl, sizeof (alert));
+  alert[6] = description;
+
+  struct connection_info *c = CONN_INFO (C);
+  struct raw_message *m = calloc (sizeof (struct raw_message), 1);
+  assert (m != NULL);
+  rwm_create (m, alert, (int)sizeof (alert));
+  mpq_push_w (c->out_queue, m, 0);
+  job_signal (JOB_REF_CREATE_PASS (C), JS_RUN);
+  connection_write_close (C);
+  return NEED_MORE_BYTES;
+}
+
 static int proxy_connection_fallback (connection_job_t C) {
   struct connection_info *c = CONN_INFO(C);
   assert (fallback_backend_enabled);
@@ -1431,8 +1449,8 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         assert (rwm_fetch_lookup (&c->in, header, 11) == 11);
         if (memcmp (header, "\x14\x03\x03\x00\x01\x01\x17\x03\x03", 9) != 0) {
           vkprintf (1, "error while parsing packet: bad client dummy ChangeCipherSpec\n");
-          fail_connection (C, -1);
-          return 0;
+          // Don't abort with a hard error (too distinctive). Reply like a normal TLS endpoint.
+          return tls_send_alert_and_close (C, 10 /* unexpected_message */);
         }
 
         min_len = 11 + 256 * header[9] + header[10];
@@ -1448,8 +1466,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
 
         if (c->left_tls_packet_length < 64) {
           vkprintf (1, "error while parsing packet: too short first TLS packet: %d\n", c->left_tls_packet_length);
-          fail_connection (C, -1);
-          return 0;
+          return tls_send_alert_and_close (C, 50 /* decode_error */);
         }
         // now len >= c->left_tls_packet_length >= 64
 
