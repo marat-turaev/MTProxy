@@ -869,14 +869,15 @@ int net_server_socket_reader (socket_connection_job_t C) /* {{{ */ {
   assert_net_net_thread ();
   struct socket_connection_info *c = SOCKET_CONN_INFO (C);
 
+  // Batch multiple readv() results into fewer queue nodes to reduce cross-thread churn.
+  struct raw_message *batch = NULL;
+  const int BATCH_LIMIT = 65536;
+
   while ((c->flags & (C_WANTRD | C_NORD | C_STOPREAD | C_ERROR | C_NET_FAILED)) == C_WANTRD) {
     if (!tcp_recv_buffers_num) {
       prealloc_tcp_buffers ();
     }
 
-    struct raw_message *in = rwm_alloc_raw_message ();
-    rwm_init (in, 0);
-    
     int s = tcp_recv_buffers_total_size;
     assert (s > 0);
 
@@ -908,37 +909,43 @@ int net_server_socket_reader (socket_connection_job_t C) /* {{{ */ {
     vkprintf (2, "readv from %d: %d read out of %d\n", c->fd, r, s);
 
     if (r <= 0) {
-      rwm_free_raw_message (in);
       break;
     }
 
+    if (!batch) {
+      batch = rwm_alloc_raw_message ();
+      rwm_init (batch, 0);
+    }
+
     MODULE_STAT->tcp_readv_bytes += r;
+    const int bytes_read = r;
     struct msg_part *mp = 0;
+    struct msg_part *first_mp = NULL;
+    struct msg_part *last_mp = NULL;
+    int total_bytes = 0;
     assert (p == 1);
     mp = new_msg_part (0, tcp_recv_buffers[p - 1]);
     assert (tcp_recv_buffers[p - 1]->data == tcp_recv_iovec[p].iov_base);
     mp->offset = 0;
-    mp->data_end = r > tcp_recv_iovec[p].iov_len ? tcp_recv_iovec[p].iov_len : r;
+    mp->data_end = r > (int)tcp_recv_iovec[p].iov_len ? (int)tcp_recv_iovec[p].iov_len : r;
     r -= mp->data_end;
-    in->first = in->last = mp;
-    in->total_bytes = mp->data_end;
-    in->first_offset = 0;
-    in->last_offset = mp->data_end;
+    first_mp = last_mp = mp;
+    total_bytes = mp->data_end;
     p ++;
 
     int rs = r;
     while (rs > 0) {
       mp = new_msg_part (0, tcp_recv_buffers[p - 1]);
       mp->offset = 0;
-      mp->data_end = rs > tcp_recv_iovec[p].iov_len ? tcp_recv_iovec[p].iov_len : rs;
+      mp->data_end = rs > (int)tcp_recv_iovec[p].iov_len ? (int)tcp_recv_iovec[p].iov_len : rs;
       rs -= mp->data_end;
-      in->last->next = mp;
-      in->last = mp;
-      in->last_offset = mp->data_end;
-      in->total_bytes += mp->data_end;
+      last_mp->next = mp;
+      last_mp = mp;
+      total_bytes += mp->data_end;
       p ++;
     }
     assert (!rs);
+    assert (total_bytes == bytes_read);
 
     int i;
     for (i = 0; i < p - 1; i++) {
@@ -953,8 +960,37 @@ int net_server_socket_reader (socket_connection_job_t C) /* {{{ */ {
     }
 
     assert (c->conn);
-    mpq_push_w (CONN_INFO(c->conn)->in_queue, in, 0);
+
+    // Append to batch.
+    if (!batch->first) {
+      batch->first = first_mp;
+      batch->last = last_mp;
+      batch->first_offset = 0;
+      batch->last_offset = last_mp->data_end;
+      batch->total_bytes = total_bytes;
+      batch->magic = RM_INIT_MAGIC;
+    } else {
+      batch->last->next = first_mp;
+      batch->last = last_mp;
+      batch->last_offset = last_mp->data_end;
+      batch->total_bytes += total_bytes;
+    }
+
+    if (batch->total_bytes >= BATCH_LIMIT) {
+      mpq_push_w (CONN_INFO(c->conn)->in_queue, batch, 0);
     job_signal (JOB_REF_CREATE_PASS (c->conn), JS_RUN);
+      batch = NULL;
+  }
+  }
+
+  if (batch) {
+    if (batch->total_bytes > 0) {
+      assert (c->conn);
+      mpq_push_w (CONN_INFO(c->conn)->in_queue, batch, 0);
+      job_signal (JOB_REF_CREATE_PASS (c->conn), JS_RUN);
+    } else {
+      rwm_free_raw_message (batch);
+    }
   }
   return 0;
 }
