@@ -178,6 +178,12 @@ struct domain_info {
   char use_random_encrypted_size3;
   char is_reversed_extension_order;
   char server_hello_encrypted_records;  // number of encrypted appdata records to send (1..3)
+  // Captured from upstream response during startup probing and reused as template.
+  // This is only the first TLS Handshake record:
+  // [0..template_len) == "\x16\x03\x03" + uint16(record_len) + ServerHello payload.
+  unsigned char *server_hello_template;
+  int server_hello_template_len;
+  int server_hello_keyshare_offset; // where 32-byte keyshare starts inside template, or -1
   struct domain_info *next;
 };
 
@@ -766,15 +772,18 @@ static int update_domain_info (struct domain_info *info) {
     }
   }
 
+  // Close sockets first; keep response buffers until we extract stats/templates.
   for (i = 0; i < TRIES; i++) {
     close (sockets[i]);
     free (requests[i]);
-    free (responses[i]);
   }
 
   if (finished_count != TRIES) {
     if (!have_error) {
       kprintf ("Failed to check domain %s in 5 seconds\n", domain);
+    }
+    for (i = 0; i < TRIES; i++) {
+      free (responses[i]);
     }
     return 0;
   }
@@ -811,6 +820,52 @@ static int update_domain_info (struct domain_info *info) {
   if (best_records < 1) { best_records = 1; }
   if (best_records > 3) { best_records = 3; }
   info->server_hello_encrypted_records = (char)best_records;
+
+  // Capture a real ServerHello record as a template for this domain.
+  if (info->server_hello_template) {
+    free (info->server_hello_template);
+    info->server_hello_template = NULL;
+    info->server_hello_template_len = 0;
+    info->server_hello_keyshare_offset = -1;
+  }
+  int template_i;
+  for (template_i = 0; template_i < TRIES; template_i++) {
+    if (try_encrypted_application_data_records[template_i] != best_records) {
+      continue;
+    }
+    const unsigned char *resp = responses[template_i];
+    int rlen = response_len[template_i];
+    if (resp == NULL || rlen < 64) {
+      continue;
+    }
+    if (memcmp (resp, "\x16\x03\x03", 3) != 0) {
+      continue;
+    }
+    int sh_len = resp[3] * 256 + resp[4];
+    int tpl_len = 5 + sh_len;
+    if (sh_len <= 0 || tpl_len > rlen) {
+      continue;
+    }
+    unsigned char *tpl = malloc ((size_t)tpl_len);
+    if (tpl == NULL) {
+      continue;
+    }
+    memcpy (tpl, resp, (size_t)tpl_len);
+    info->server_hello_template = tpl;
+    info->server_hello_template_len = tpl_len;
+    info->server_hello_keyshare_offset = -1;
+
+    // Locate keyshare extension payload: 00 33 00 24 00 1d 00 20 <32 bytes>
+    static const unsigned char ks_hdr[] = {0x00, 0x33, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20};
+    int j;
+    for (j = 0; j + (int)sizeof (ks_hdr) + 32 <= tpl_len; j++) {
+      if (!memcmp (tpl + j, ks_hdr, sizeof (ks_hdr))) {
+        info->server_hello_keyshare_offset = j + (int)sizeof (ks_hdr);
+        break;
+      }
+    }
+    break;
+  }
 
   // Per-record stats over tries matching the selected record count.
   {
@@ -866,6 +921,10 @@ static int update_domain_info (struct domain_info *info) {
   vkprintf (0, "Successfully checked domain %s in %.3lf seconds: is_reversed_extension_order = %d, records = %d, size = %d,%d,%d\n",
             domain, get_utime_monotonic() - (finish_time - 5.0), info->is_reversed_extension_order, (int)info->server_hello_encrypted_records,
             info->server_hello_encrypted_size, info->server_hello_encrypted_size2, info->server_hello_encrypted_size3);
+
+  for (i = 0; i < TRIES; i++) {
+    free (responses[i]);
+  }
   return 1;
 #undef TRIES
 }
@@ -1505,11 +1564,38 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
           encrypted_payload_size = 16384;
         }
 
-        int response_size = 127 + 6 + 5 + encrypted_payload_size;
+        int server_hello_rec_len = 127;
+        if (info->server_hello_template && info->server_hello_template_len > 0) {
+          server_hello_rec_len = info->server_hello_template_len;
+        }
+        int response_size = server_hello_rec_len + 6 + 5 + encrypted_payload_size;
         unsigned char *buffer = malloc (32 + response_size);
         assert (buffer != NULL);
         memcpy (buffer, client_random, 32);
         unsigned char *response_buffer = buffer + 32;
+        if (info->server_hello_template && info->server_hello_template_len > 0) {
+          memcpy (response_buffer, info->server_hello_template, (size_t)info->server_hello_template_len);
+          // Zero server_random before computing our HMAC-based server_random.
+          if (info->server_hello_template_len >= 11 + 32) {
+            memset (response_buffer + 11, 0, 32);
+          }
+          // Always mirror the client's session_id (expected by some clients).
+          if (info->server_hello_template_len >= 44 + 32) {
+            response_buffer[43] = '\x20';
+            memcpy (response_buffer + 44, client_hello + 44, 32);
+          }
+          // Chosen cipher suite: keep compatible with the client's offered list.
+          if (info->server_hello_template_len >= 78) {
+            response_buffer[76] = 0x13;
+            response_buffer[77] = cipher_suite_id;
+          }
+          // Patch keyshare public key to fresh random.
+          if (info->server_hello_keyshare_offset >= 0 &&
+              info->server_hello_keyshare_offset + 32 <= info->server_hello_template_len) {
+            generate_public_key (response_buffer + info->server_hello_keyshare_offset);
+          }
+          pos = info->server_hello_template_len;
+        } else {
         memcpy (response_buffer, "\x16\x03\x03\x00\x7a\x02\x00\x00\x76\x03\x03", 11);
         memset (response_buffer + 11, '\0', 32);
         response_buffer[43] = '\x20';
@@ -1540,6 +1626,8 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
           }
         }
         assert (pos == 127);
+        }
+
         memcpy (response_buffer + pos, "\x14\x03\x03\x00\x01\x01", 6);
         pos += 6;
           memcpy (response_buffer + pos, "\x17\x03\x03", 3);
@@ -1568,8 +1656,8 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         // Even though we emit only one TLS ApplicationData record for client compatibility, chunking
         // still makes packet sizes closer to a real server for classifiers that rely on packet lengths.
         int plan_len = 0;
-        if (records_real > 1) {
-          int chunk0 = 127 + 6 + 5 + encrypted_sizes[0]; // handshake + CCS + (hdr+payload of first AppData)
+        if (records_real > 1 && encrypted_wire_total - 5 <= 16384) {
+          int chunk0 = server_hello_rec_len + 6 + 5 + encrypted_sizes[0]; // handshake + CCS + (hdr+payload of first AppData)
           if (chunk0 > 0 && plan_len < 4) {
             c->tls_write_shaping_plan[plan_len++] = chunk0;
           }
