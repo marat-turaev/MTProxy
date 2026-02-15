@@ -991,12 +991,23 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
     // This keeps TLS record structure intact while changing packetization.
     connection_job_t CC = c->conn;
     struct connection_info *ci = CC ? CONN_INFO (CC) : NULL;
-    int tls_shape_left = ci ? __atomic_load_n (&ci->tls_write_shaping_left, __ATOMIC_RELAXED) : 0;
+    int tls_shape_left = ci ? __atomic_load_n (&ci->tls_write_shaping_left, __ATOMIC_ACQUIRE) : 0;
     if (ci && tls_shape_left > 0) {
       int tls_shape_chunk_left = __atomic_load_n (&ci->tls_write_shaping_chunk_left, __ATOMIC_RELAXED);
       if (tls_shape_chunk_left <= 0) {
-          // Pick a chunk size close to MSS but slightly jittered.
-          int chunk = 1200 + (lrand48_j () % 241); // 1200..1440
+          int chunk = 0;
+
+          // If a domain-shaped plan was installed for this connection, follow it first.
+          int plan_pos = __atomic_load_n (&ci->tls_write_shaping_plan_pos, __ATOMIC_RELAXED);
+          int plan_len = __atomic_load_n (&ci->tls_write_shaping_plan_len, __ATOMIC_RELAXED);
+          if (plan_pos < plan_len) {
+            chunk = ci->tls_write_shaping_plan[plan_pos];
+            __atomic_store_n (&ci->tls_write_shaping_plan_pos, plan_pos + 1, __ATOMIC_RELAXED);
+          } else {
+            // Otherwise, pick a chunk size close to MSS but slightly jittered.
+            chunk = 1200 + (lrand48_j () % 241); // 1200..1440
+          }
+
           if (chunk < 256) { chunk = 256; }
           if (chunk > tls_shape_left) { chunk = tls_shape_left; }
           tls_shape_chunk_left = chunk;
@@ -1048,8 +1059,10 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
       if (ci && tls_shape_left > 0) {
         int new_left = tls_shape_left - r;
         if (new_left <= 0) {
-          __atomic_store_n (&ci->tls_write_shaping_left, 0, __ATOMIC_RELAXED);
+          __atomic_store_n (&ci->tls_write_shaping_left, 0, __ATOMIC_RELEASE);
           __atomic_store_n (&ci->tls_write_shaping_chunk_left, 0, __ATOMIC_RELAXED);
+          __atomic_store_n (&ci->tls_write_shaping_plan_len, 0, __ATOMIC_RELAXED);
+          __atomic_store_n (&ci->tls_write_shaping_plan_pos, 0, __ATOMIC_RELAXED);
         } else {
           __atomic_store_n (&ci->tls_write_shaping_left, new_left, __ATOMIC_RELAXED);
           int new_chunk_left = __atomic_load_n (&ci->tls_write_shaping_chunk_left, __ATOMIC_RELAXED) - r;

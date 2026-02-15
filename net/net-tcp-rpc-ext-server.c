@@ -1561,8 +1561,30 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
 
         // Shape TCP segmentation of the first server flight for TLS transport.
         // This does not change bytes on the wire, only how many bytes we attempt to write per syscall.
-        __atomic_store_n (&c->tls_write_shaping_left, response_size, __ATOMIC_RELAXED);
+        //
+        // To better resemble the chosen -D domain, we use the measured TLS ApplicationData record sizes
+        // and split the first flight into TCP chunks matching the domain's typical record boundaries:
+        //   [Handshake+CCS+AppData(0)] [AppData(1)] [AppData(2)]
+        // Even though we emit only one TLS ApplicationData record for client compatibility, chunking
+        // still makes packet sizes closer to a real server for classifiers that rely on packet lengths.
+        int plan_len = 0;
+        if (records_real > 1) {
+          int chunk0 = 127 + 6 + 5 + encrypted_sizes[0]; // handshake + CCS + (hdr+payload of first AppData)
+          if (chunk0 > 0 && plan_len < 4) {
+            c->tls_write_shaping_plan[plan_len++] = chunk0;
+          }
+          int ri2;
+          for (ri2 = 1; ri2 < records_real && ri2 < 3 && plan_len < 4; ri2++) {
+            int ch = 5 + encrypted_sizes[ri2]; // (hdr+payload) of subsequent AppData records
+            if (ch > 0) {
+              c->tls_write_shaping_plan[plan_len++] = ch;
+            }
+          }
+        }
+        __atomic_store_n (&c->tls_write_shaping_plan_len, plan_len, __ATOMIC_RELAXED);
+        __atomic_store_n (&c->tls_write_shaping_plan_pos, 0, __ATOMIC_RELAXED);
         __atomic_store_n (&c->tls_write_shaping_chunk_left, 0, __ATOMIC_RELAXED);
+        __atomic_store_n (&c->tls_write_shaping_left, response_size, __ATOMIC_RELEASE);
 
         free (buffer);
         return 11; // waiting for dummy ChangeCipherSpec and first packet
