@@ -28,6 +28,8 @@
 
 #pragma once
 
+#include <string.h>
+
 //#include "net/net-buffers.h"
 #include "net/net-events.h"
 #include "net/net-msg.h"
@@ -350,6 +352,19 @@ static inline const char *show_our_ip (connection_job_t c) { return show_ip46 (C
 static inline const char *show_remote_ip (connection_job_t c) { return show_ip46 (CONN_INFO(c)->remote_ip, CONN_INFO(c)->remote_ipv6); }
 static inline const char *show_our_socket_ip (socket_connection_job_t c) { return show_ip46 (SOCKET_CONN_INFO(c)->our_ip, SOCKET_CONN_INFO(c)->our_ipv6); }
 static inline const char *show_remote_socket_ip (socket_connection_job_t c) { return show_ip46 (SOCKET_CONN_INFO(c)->remote_ip, SOCKET_CONN_INFO(c)->remote_ipv6); }
+
+static inline int is_ipv6_loopback_addr (const unsigned char a[16]) {
+  static const unsigned char loopback[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+  return !memcmp (a, loopback, 16);
+}
+
+static inline int conn_is_loopback (connection_job_t C) {
+  struct connection_info *c = CONN_INFO (C);
+  if (c->remote_ip) {
+    return c->remote_ip == 0x7f000001;
+  }
+  return is_ipv6_loopback_addr (c->remote_ipv6);
+}
 
 void fetch_connections_stat (struct connections_stat *st);
 

@@ -334,7 +334,10 @@ int tcp_rpcs_parse_execute (connection_job_t C) {
     }
 
     if (packet_len <= 0 || (packet_len & 0xc0000003)) {
-      if (D->in_packet_num <= -2 && (packet_len == *(int *)"HEAD" || packet_len == *(int *)"POST" || packet_len == *(int *)"GET " || packet_len == *(int *)"OPTI") && TCP_RPCS_FUNC(C)->http_fallback_type) {
+      if (D->in_packet_num <= -2 &&
+          conn_is_loopback (C) &&
+          (packet_len == *(int *)"HEAD" || packet_len == *(int *)"POST" || packet_len == *(int *)"GET " || packet_len == *(int *)"OPTI") &&
+          TCP_RPCS_FUNC(C)->http_fallback_type) {
         vkprintf (1, "switching to http fallback for connection %d\n", c->fd);
         memset (c->custom_data, 0, sizeof (c->custom_data));
         c->type = TCP_RPCS_FUNC(C)->http_fallback_type;
