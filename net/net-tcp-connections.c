@@ -246,9 +246,9 @@ int cpu_tcp_aes_crypto_ctr128_encrypt_output (connection_job_t C) /* {{{ */ {
       // TLS transport historically used a fixed max record size (~1425).
       // Keep record sizes variable for the whole connection (not only during the first few records).
       //
-      // Cap sizes to keep buffering and latency reasonable; TCP packetization shaping
-      // is handled elsewhere (socket writer shaping).
-      const int TLS_MAX_RECORD = 4096;
+      // Cap sizes at the maximum TLS record fragment size (16KB) to keep buffering bounded;
+      // TCP packetization shaping is handled elsewhere (socket writer shaping).
+      const int TLS_MAX_RECORD = 16384;
       const int EARLY_RECORDS = 32;
 
       int max_len = len;
@@ -264,14 +264,25 @@ int cpu_tcp_aes_crypto_ctr128_encrypt_output (connection_job_t C) /* {{{ */ {
         if (max_len > TLS_MAX_RECORD) { max_len = TLS_MAX_RECORD; }
 
         int r = lrand48_j ();
-        if ((r & 15) < 10) {
+        int bucket = r & 255;
+        if (max_len >= 8192) {
+          // If we have lots of buffered plaintext, behave more like a typical TLS stack:
+          // mostly large records (but not always), to avoid "always MSS-ish" signatures.
+          if (bucket >= 160 && bucket < 208) {  // ~18.75%
+            bucket = 200; // map into "small" range [192..239]
+          } else if (bucket < 208) {
+            bucket = 0;   // map into "near-MSS"
+          }
+        }
+
+        if (bucket < 192) {
           // Most of the time: near-MSS to look like typical TLS over the Internet.
           min_len = 1100;
           if (max_len < min_len) { min_len = max_len; }
           int hi = 1700;
           if (hi > max_len) { hi = max_len; }
           max_len = hi;
-        } else if ((r & 15) < 14) {
+        } else if (bucket < 240) {
           // Sometimes: smaller records.
           min_len = 600;
           if (max_len < min_len) { min_len = max_len; }
@@ -279,12 +290,27 @@ int cpu_tcp_aes_crypto_ctr128_encrypt_output (connection_job_t C) /* {{{ */ {
           if (hi > max_len) { hi = max_len; }
           max_len = hi;
       } else {
-          // Rarely: larger records (still capped).
-          min_len = 1700;
+          // Rarely (or when heavily buffered): larger records, up to 16KB.
+          if (max_len >= 4096) {
+            if (max_len > 8192) {
+              // Bias towards "almost full" records when we can.
+              int window = 512 + (lrand48_j () % 2048); // 512..2559
+              min_len = max_len - window;
+              if (min_len < 4096) { min_len = 4096; }
+            } else {
+              min_len = 4096;
+            }
+            // keep max_len as-is
+          } else {
+            // Not enough data for a "large record", fall back to near-MSS-ish.
+            min_len = 1100;
           if (max_len < min_len) { min_len = max_len; }
-          // keep max_len as-is (<= TLS_MAX_RECORD)
+            int hi = 1700;
+            if (hi > max_len) { hi = max_len; }
+            max_len = hi;
         }
         }
+      }
 
       if (min_len < 1) { min_len = 1; }
       if (max_len < min_len) { max_len = min_len; }
