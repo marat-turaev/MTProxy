@@ -447,7 +447,7 @@ void default_engine_server_start (void) /* {{{ */ {
   schedule_job (JOB_REF_PASS (precise_cron_job));
 
   job_t update_job_stats = job_timer_alloc (JC_MAIN, update_job_stats_gw, NULL);
-  job_timer_insert (update_job_stats, 1.0);
+  job_timer_insert (update_job_stats, precise_now + 1.0);
 
   F->pre_loop ();
 
@@ -457,7 +457,7 @@ void default_engine_server_start (void) /* {{{ */ {
   int i;
   vkprintf (0, "main loop\n");
   for (i = 0; ; i++) {
-    epoll_work (engine_check_multithread_enabled () ? E->epoll_wait_timeout : 1);
+    epoll_work (E->epoll_wait_timeout);
     if (interrupt_signal_raised ()) {
       if (F->on_waiting_exit) {
         while (1) {
@@ -718,4 +718,3 @@ int default_parse_option_func (int a) {
     return -1;
   }
 }
-
