@@ -1230,6 +1230,118 @@ static int is_allowed_timestamp (int timestamp) {
   return 0;
 }
 
+// Per-thread invalid-traffic throttling (cheap, lock-free, best-effort).
+// This aims to make repeated invalid TLS handshakes expensive without affecting real clients.
+#define PROBE_TABLE_SIZE 2048
+struct probe_entry {
+  unsigned ip4;
+  unsigned char ip6[16];
+  int is_ipv6;
+  int score;
+  int last_time;
+  int blocked_until;
+};
+static __thread struct probe_entry probe_table[PROBE_TABLE_SIZE];
+
+static unsigned probe_hash4 (unsigned ip4) {
+  // Knuth multiplicative hash.
+  return (ip4 * 2654435761u) >> (32 - 11); // 2^11 == 2048
+}
+
+static unsigned probe_hash6 (const unsigned char ip6[16]) {
+  const unsigned *w = (const unsigned *)ip6;
+  unsigned h = w[0] ^ w[1] ^ w[2] ^ w[3];
+  return (h * 2654435761u) >> (32 - 11);
+}
+
+static int probe_match (const struct probe_entry *e, const struct connection_info *c) {
+  if (!e->last_time) {
+    return 0;
+  }
+  if (c->remote_ip) {
+    return !e->is_ipv6 && e->ip4 == c->remote_ip;
+  }
+  return e->is_ipv6 && !memcmp (e->ip6, c->remote_ipv6, 16);
+}
+
+static void probe_set_key (struct probe_entry *e, const struct connection_info *c) {
+  if (c->remote_ip) {
+    e->is_ipv6 = 0;
+    e->ip4 = c->remote_ip;
+    memset (e->ip6, 0, 16);
+  } else {
+    e->is_ipv6 = 1;
+    e->ip4 = 0;
+    memcpy (e->ip6, c->remote_ipv6, 16);
+  }
+}
+
+static struct probe_entry *probe_get_entry (const struct connection_info *c) {
+  unsigned idx = c->remote_ip ? probe_hash4 (c->remote_ip) : probe_hash6 (c->remote_ipv6);
+  unsigned i;
+  for (i = 0; i < 16; i++) {
+    struct probe_entry *e = &probe_table[(idx + i) & (PROBE_TABLE_SIZE - 1)];
+    if (!e->last_time) {
+      probe_set_key (e, c);
+      return e;
+    }
+    if (probe_match (e, c)) {
+      return e;
+    }
+  }
+  // Table is saturated in this window; fall back to an arbitrary slot.
+  struct probe_entry *e = &probe_table[idx & (PROBE_TABLE_SIZE - 1)];
+  probe_set_key (e, c);
+  e->score = 0;
+  e->blocked_until = 0;
+  e->last_time = 0;
+  return e;
+}
+
+// Returns delay in ms (0..200). Sets *blocked=1 if we should hard-drop this attempt.
+static int probe_note_failure (connection_job_t C, int weight, int *blocked) {
+  struct connection_info *c = CONN_INFO (C);
+  struct probe_entry *e = probe_get_entry (c);
+
+  const int t = now;
+  int dt = t - e->last_time;
+  if (dt < 0) { dt = 0; }
+  if (dt > 0) {
+    // Decay score quickly so occasional mistakes don't penalize.
+    e->score -= dt * 2;
+    if (e->score < 0) { e->score = 0; }
+  }
+  e->last_time = t;
+
+  if (e->blocked_until > t) {
+    *blocked = 1;
+    return 0;
+  }
+
+  if (weight < 1) { weight = 1; }
+  if (weight > 10) { weight = 10; }
+  e->score += weight;
+
+  // If we see many failures in a short period, block for a while.
+  if (e->score >= 20) {
+    int block_s = 15 + (e->score - 20);
+    if (block_s > 60) { block_s = 60; }
+    e->blocked_until = t + block_s;
+    *blocked = 1;
+    return 0;
+  }
+
+  *blocked = 0;
+  if (e->score <= 6) {
+    return 0;
+  }
+  int d = (e->score - 6) * 20;
+  if (d > 200) { d = 200; }
+  d += (lrand48_j () % 31); // small jitter
+  if (d > 200) { d = 200; }
+  return d;
+}
+
 static int tls_send_alert_and_close (connection_job_t C, unsigned char description) {
   // Send a minimal TLS alert record and then close the connection gracefully.
   // This makes failures look more like a normal HTTPS endpoint to generic clients.
@@ -1250,13 +1362,49 @@ static int tls_send_alert_and_close (connection_job_t C, unsigned char descripti
 
 static int proxy_connection_fallback (connection_job_t C);
 
+static void stop_reading_temporarily (connection_job_t C) {
+  struct connection_info *c = CONN_INFO (C);
+  socket_connection_job_t S = c->io_conn;
+  if (S) {
+    __sync_fetch_and_or (&SOCKET_CONN_INFO(S)->flags, C_STOPREAD);
+  }
+  __sync_fetch_and_or (&c->flags, C_STOPREAD | C_STOPPARSE);
+}
+
+enum {
+  TLS_DELAY_ACTION_NONE = 0,
+  TLS_DELAY_ACTION_ALERT = 1,
+  TLS_DELAY_ACTION_CLOSE = 2
+};
+
+static int tls_schedule_delayed_alert (connection_job_t C, unsigned char alert_description, int delay_ms) {
+  struct tcp_rpc_data *D = TCP_RPC_DATA (C);
+  if (D->extra_int2 != TLS_DELAY_ACTION_NONE) {
+    return NEED_MORE_BYTES;
+  }
+  if (delay_ms <= 0) {
+    return tls_send_alert_and_close (C, alert_description);
+  }
+  D->extra_int2 = TLS_DELAY_ACTION_ALERT;
+  D->extra_int3 = (int)alert_description;
+  stop_reading_temporarily (C);
+  job_timer_insert (C, precise_now + 0.001 * delay_ms);
+  return NEED_MORE_BYTES;
+}
+
 static int tls_reject_or_fallback (connection_job_t C, unsigned char alert_description) {
   // For TLS-looking inputs: either forward to local fallback HTTPS (if configured),
   // or send a standard TLS alert and close (avoid proxying to the -D domain).
   if (fallback_backend_enabled) {
     return proxy_connection_fallback (C);
   }
-  return tls_send_alert_and_close (C, alert_description);
+  int blocked = 0;
+  int delay_ms = probe_note_failure (C, 1, &blocked);
+  if (blocked) {
+    connection_write_close (C);
+    return NEED_MORE_BYTES;
+  }
+  return tls_schedule_delayed_alert (C, alert_description, delay_ms);
 }
 
 static int reject_or_fallback_close (connection_job_t C) {
@@ -1265,6 +1413,8 @@ static int reject_or_fallback_close (connection_job_t C) {
   if (fallback_backend_enabled) {
     return proxy_connection_fallback (C);
   }
+  int blocked = 0;
+  (void)probe_note_failure (C, 1, &blocked);
   connection_write_close (C);
   return NEED_MORE_BYTES;
 }
@@ -1374,6 +1524,18 @@ static int proxy_connection (connection_job_t C, const struct domain_info *info)
 
 int tcp_rpcs_ext_alarm (connection_job_t C) {
   struct tcp_rpc_data *D = TCP_RPC_DATA (C);
+  if (D->in_packet_num == -3 && D->extra_int2 != TLS_DELAY_ACTION_NONE) {
+    int action = D->extra_int2;
+    int param = D->extra_int3;
+    D->extra_int2 = TLS_DELAY_ACTION_NONE;
+    D->extra_int3 = 0;
+    if (action == TLS_DELAY_ACTION_ALERT) {
+      return tls_send_alert_and_close (C, (unsigned char)param);
+    } else if (action == TLS_DELAY_ACTION_CLOSE) {
+      connection_write_close (C);
+      return NEED_MORE_BYTES;
+    }
+  }
   if (D->in_packet_num == -3 && default_domain_info != NULL) {
     return proxy_connection (C, default_domain_info);  
   } else {
