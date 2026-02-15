@@ -46,6 +46,64 @@ struct notification_event {
   void *who;
 };
 
+/*
+ * notification_event is a tiny, high-frequency allocation under load.
+ * Pool it and avoid per-event job_signal() to reduce allocator churn and wakeups.
+ */
+#define NEV_POOL_MAX 65536
+static struct mp_queue *nev_pool;
+static volatile int nev_pool_inited;
+static volatile int nev_pool_size;
+
+static void nev_pool_init (void) {
+  if (nev_pool) {
+    return;
+  }
+  if (__sync_bool_compare_and_swap (&nev_pool_inited, 0, 1)) {
+    nev_pool = alloc_mp_queue_w ();
+    __sync_synchronize ();
+  } else {
+    while (!nev_pool) {
+      __sync_synchronize ();
+    }
+  }
+}
+
+static struct notification_event *notification_event_alloc (void) {
+  if (!nev_pool) {
+    nev_pool_init ();
+  }
+  struct notification_event *ev = nev_pool ? mpq_pop_nw (nev_pool, 4) : NULL;
+  if (ev) {
+    __sync_fetch_and_add (&nev_pool_size, -1);
+  } else {
+    ev = malloc (sizeof (*ev));
+    assert (ev);
+  }
+  memset (ev, 0, sizeof (*ev));
+  return ev;
+}
+
+static void notification_event_free (struct notification_event *ev) {
+  if (!ev) {
+    return;
+  }
+  if (!nev_pool) {
+    nev_pool_init ();
+  }
+  if (!nev_pool) {
+    free (ev);
+    return;
+  }
+  int sz = __sync_add_and_fetch (&nev_pool_size, 1);
+  if (sz <= NEV_POOL_MAX) {
+    mpq_push_w (nev_pool, ev, 0);
+  } else {
+    __sync_fetch_and_add (&nev_pool_size, -1);
+    free (ev);
+  }
+}
+
 void run_notification_event (struct notification_event *ev) {
   connection_job_t C = ev->who;
   switch (ev->type) {
@@ -70,11 +128,12 @@ void run_notification_event (struct notification_event *ev) {
   default:
     assert (0);
   }
-  free (ev);
+  notification_event_free (ev);
 }
 
 struct notification_event_job_extra {
   struct mp_queue *queue;
+  volatile int pending; // 1 while job is scheduled/running, 0 when idle
 };
 static job_t notification_job;
 
@@ -85,9 +144,19 @@ int notification_event_run (job_t job, int op, struct job_thread *JT) {
   struct notification_event_job_extra *E = (void *)job->j_custom;
 
   while (1) {
-    struct notification_event *ev = mpq_pop_nw (E->queue, 4);
-    if (!ev) { break; }
+    struct notification_event *ev;
+    while ((ev = mpq_pop_nw (E->queue, 4)) != 0) {
+      run_notification_event (ev);
+    }
 
+    // Mark idle; then do one extra non-blocking pop to avoid a missed wakeup
+    // if an event was enqueued between the last pop and this store.
+    __atomic_store_n (&E->pending, 0, __ATOMIC_RELEASE);
+    ev = mpq_pop_nw (E->queue, 4);
+    if (!ev) {
+      break;
+    }
+    __atomic_store_n (&E->pending, 1, __ATOMIC_RELAXED);
     run_notification_event (ev);
   }
 
@@ -99,18 +168,21 @@ void notification_event_job_create (void) {
 
   struct notification_event_job_extra *E = (void *)notification_job->j_custom;
   E->queue = alloc_mp_queue_w ();
+  E->pending = 0;
   
   unlock_job (JOB_REF_CREATE_PASS (notification_job));
 }
 
 void notification_event_insert_conn (connection_job_t C, int type) {
-  struct notification_event *ev = malloc (sizeof (*ev));
+  struct notification_event *ev = notification_event_alloc ();
   ev->who = job_incref (C);
   ev->type = type;
 
   struct notification_event_job_extra *E = (void *)notification_job->j_custom;
   mpq_push_w (E->queue, ev, 0);
+  if (__sync_bool_compare_and_swap (&E->pending, 0, 1)) {
   job_signal (JOB_REF_CREATE_PASS (notification_job), JS_RUN);
+}
 }
 
 void notification_event_insert_tcp_conn_close (connection_job_t C) {
