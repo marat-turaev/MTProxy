@@ -1769,7 +1769,9 @@ int tcp_rpcs_ext_alarm (connection_job_t C) {
 }
 
 int tcp_rpcs_ext_init_accepted (connection_job_t C) {
-  job_timer_insert (C, precise_now + 10);
+  // Timeout while the connection type is still undetermined (before we see enough bytes).
+  // Keep it short to reduce slowloris/automated socket hold times.
+  job_timer_insert (C, precise_now + 3);
   return tcp_rpcs_init_accepted_nohs (C);
 }
 
