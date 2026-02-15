@@ -1018,6 +1018,29 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
         clamp_iovec_bytes (iov, &iovcnt, lim);
         s = lim;
       }
+    } else if (ci) {
+      // Post-handshake write variation for TLS transport: shape TCP chunk sizes for a small amount of bytes.
+      // This is separate from TLS record sizing and can split records across packets.
+      int tls_noise_left = __atomic_load_n (&ci->tls_write_noise_left, __ATOMIC_RELAXED);
+      if (tls_noise_left > 0) {
+        int tls_noise_chunk_left = __atomic_load_n (&ci->tls_write_noise_chunk_left, __ATOMIC_RELAXED);
+        if (tls_noise_chunk_left <= 0) {
+          int chunk = 1100 + (lrand48_j () % 401); // 1100..1500 (near MSS)
+          // Occasionally use a smaller chunk to avoid rigid segmentation patterns.
+          if ((lrand48_j () & 7) == 0) { // ~12.5%
+            chunk = 600 + (lrand48_j () % 701); // 600..1300
+          }
+          if (chunk < 256) { chunk = 256; }
+          if (chunk > tls_noise_left) { chunk = tls_noise_left; }
+          tls_noise_chunk_left = chunk;
+          __atomic_store_n (&ci->tls_write_noise_chunk_left, tls_noise_chunk_left, __ATOMIC_RELAXED);
+        }
+        int lim = tls_noise_chunk_left;
+        if (lim > 0 && lim < s) {
+          clamp_iovec_bytes (iov, &iovcnt, lim);
+          s = lim;
+        }
+      }
     }
 
     __sync_fetch_and_or (&c->flags, C_NOWR);
@@ -1068,6 +1091,21 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
           int new_chunk_left = __atomic_load_n (&ci->tls_write_shaping_chunk_left, __ATOMIC_RELAXED) - r;
           if (new_chunk_left < 0) { new_chunk_left = 0; }
           __atomic_store_n (&ci->tls_write_shaping_chunk_left, new_chunk_left, __ATOMIC_RELAXED);
+        }
+      }
+      if (ci) {
+        int tls_noise_left = __atomic_load_n (&ci->tls_write_noise_left, __ATOMIC_RELAXED);
+        if (tls_noise_left > 0) {
+          int new_left = tls_noise_left - r;
+          if (new_left <= 0) {
+            __atomic_store_n (&ci->tls_write_noise_left, 0, __ATOMIC_RELAXED);
+            __atomic_store_n (&ci->tls_write_noise_chunk_left, 0, __ATOMIC_RELAXED);
+          } else {
+            __atomic_store_n (&ci->tls_write_noise_left, new_left, __ATOMIC_RELAXED);
+            int new_chunk_left = __atomic_load_n (&ci->tls_write_noise_chunk_left, __ATOMIC_RELAXED) - r;
+            if (new_chunk_left < 0) { new_chunk_left = 0; }
+            __atomic_store_n (&ci->tls_write_noise_chunk_left, new_chunk_left, __ATOMIC_RELAXED);
+          }
         }
       }
       if (c->type->data_sent) {

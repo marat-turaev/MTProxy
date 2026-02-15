@@ -259,6 +259,10 @@ struct connection_info {
   int tls_write_shaping_plan_len;
   int tls_write_shaping_plan_pos;
   int tls_write_shaping_plan[4];
+  // If >0, socket writer will also limit writev() sizes for the next bytes after handshake
+  // (allowing TLS records to be split across TCP packets).
+  int tls_write_noise_left;
+  int tls_write_noise_chunk_left;
   // Count of synthetic TLS ApplicationData records emitted on this connection.
   // Used for post-handshake TLS record sizing heuristics (traffic shaping).
   int tls_out_records_sent;

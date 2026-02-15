@@ -1677,6 +1677,14 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         c->left_tls_packet_length = 256 * header[9] + header[10]; // store left length of current TLS packet in extra_int3
         vkprintf (2, "Receive first TLS packet of length %d\n", c->left_tls_packet_length);
 
+        // Enable a small amount of post-handshake TCP packetization variation for this TLS connection.
+        // This does not change bytes, only how they're split into TCP writes.
+        if (__atomic_load_n (&c->tls_write_noise_left, __ATOMIC_RELAXED) <= 0) {
+          int budget = 2048 + (lrand48_j () % 4097); // 2048..6144 bytes
+          __atomic_store_n (&c->tls_write_noise_left, budget, __ATOMIC_RELAXED);
+          __atomic_store_n (&c->tls_write_noise_chunk_left, 0, __ATOMIC_RELAXED);
+        }
+
         if (c->left_tls_packet_length < 64) {
           vkprintf (1, "error while parsing packet: too short first TLS packet: %d\n", c->left_tls_packet_length);
           return tls_send_alert_and_close (C, 50 /* decode_error */);
