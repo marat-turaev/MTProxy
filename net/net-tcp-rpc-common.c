@@ -157,6 +157,12 @@ int tcp_rpc_flush_packet (connection_job_t C) {
 }
 
 int tcp_rpc_write_packet (connection_job_t C, struct raw_message *raw) {
+  // Defensive: this write_packet is used by non-compact transports, but flags can
+  // be toggled by parsers. If compact/medium is enabled, route through the compact
+  // writer so the raw message is always consumed (avoid leaks / dropped output).
+  if (TCP_RPC_DATA(C)->flags & (RPC_F_COMPACT | RPC_F_MEDIUM)) {
+    return tcp_rpc_write_packet_compact (C, raw);
+  }
   int Q[2];
   if (!(TCP_RPC_DATA(C)->flags & (RPC_F_COMPACT | RPC_F_MEDIUM))) {
     Q[0] = raw->total_bytes + 12;
@@ -271,4 +277,3 @@ int tcp_add_dh_accept (void) {
   }
   return 0;
 }
-
