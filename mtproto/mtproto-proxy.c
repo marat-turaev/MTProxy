@@ -799,7 +799,12 @@ void push_rpc_confirmation (JOB_REF_ARG (C), int confirm) {
   if (!(TCP_RPC_DATA(C)->flags & RPC_F_PAD)) {
     struct raw_message *msg = rwm_alloc_raw_message ();
     rwm_create (msg, "\xdd", 1);
+    void *p = rwm_postpone_alloc (msg, 4);
+    if (p) {
+      memcpy (p, &confirm, 4);
+    } else {
     rwm_push_data (msg, &confirm, 4);
+    }
     mpq_push_w (CONN_INFO(C)->out_queue, msg, 0);
     job_signal (JOB_REF_PASS (C), JS_RUN);
   } else {

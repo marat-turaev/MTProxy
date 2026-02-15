@@ -25,6 +25,7 @@
 
 #include <assert.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/uio.h>
 
 #include "common/precise-time.h"
@@ -54,7 +55,12 @@ void tcp_rpc_conn_send_init (connection_job_t C, struct raw_message *raw, int fl
   }
   rwm_push_data_front (r, Q, 8);
   unsigned crc32 = rwm_custom_crc32 (r, r->total_bytes, TCP_RPC_DATA(C)->custom_crc_partial);
+  void *crc_ptr = rwm_postpone_alloc (r, 4);
+  if (crc_ptr) {
+    memcpy (crc_ptr, &crc32, 4);
+  } else {
   rwm_push_data (r, &crc32, 4);
+  }
 
   socket_connection_job_t S = c->io_conn;
 
@@ -81,7 +87,12 @@ void tcp_rpc_conn_send_im (JOB_REF_ARG (C), struct raw_message *raw, int flags) 
   }
   rwm_push_data_front (r, Q, 8);
   unsigned crc32 = rwm_custom_crc32 (r, r->total_bytes, TCP_RPC_DATA(C)->custom_crc_partial);
+  void *crc_ptr = rwm_postpone_alloc (r, 4);
+  if (crc_ptr) {
+    memcpy (crc_ptr, &crc32, 4);
+  } else {
   rwm_push_data (r, &crc32, 4);
+  }
 
   rwm_union (&c->out, r);
   rwm_free_raw_message (r);
@@ -172,7 +183,12 @@ int tcp_rpc_write_packet (connection_job_t C, struct raw_message *raw) {
   
     rwm_push_data_front (raw, Q, 8);
     unsigned crc32 = rwm_custom_crc32 (raw, raw->total_bytes, TCP_RPC_DATA(C)->custom_crc_partial);
+    void *crc_ptr = rwm_postpone_alloc (raw, 4);
+    if (crc_ptr) {
+      memcpy (crc_ptr, &crc32, 4);
+    } else {
     rwm_push_data (raw, &crc32, 4);
+    }
   
     rwm_union (&CONN_INFO(C)->out, raw);
   }
@@ -201,7 +217,14 @@ int tcp_rpc_write_packet_compact (connection_job_t C, struct raw_message *raw) {
   if (TCP_RPC_DATA(C)->flags & RPC_F_PAD) {
     int x = lrand48_j();
     int y = lrand48_j() & 3;
+    if (y > 0) {
+      void *pad_ptr = rwm_postpone_alloc (raw, y);
+      if (pad_ptr) {
+        memcpy (pad_ptr, &x, y);
+      } else {
     assert (rwm_push_data (raw, &x, y) == y);
+  }
+    }
   }
 
   int len = raw->total_bytes;

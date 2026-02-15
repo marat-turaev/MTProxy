@@ -321,8 +321,17 @@ int cpu_tcp_aes_crypto_ctr128_encrypt_output (connection_job_t C) /* {{{ */ {
         len = min_len + (int)(rlen % (unsigned int)(max_len - min_len + 1));
       }
 
-      unsigned char header[5] = {0x17, 0x03, 0x03, len >> 8, len & 255};
+      unsigned char *hdr = rwm_postpone_alloc (&c->out_p, 5);
+      if (hdr) {
+        hdr[0] = 0x17;
+        hdr[1] = 0x03;
+        hdr[2] = 0x03;
+        hdr[3] = (unsigned char)(len >> 8);
+        hdr[4] = (unsigned char)(len & 255);
+      } else {
+        unsigned char header[5] = {0x17, 0x03, 0x03, (unsigned char)(len >> 8), (unsigned char)(len & 255)};
       rwm_push_data (&c->out_p, header, 5);
+      }
       records_sent = __atomic_add_fetch (&c->tls_out_records_sent, 1, __ATOMIC_RELAXED);
       vkprintf (2, "Send TLS-packet of length %d (records_sent=%d)\n", len, records_sent);
     }
