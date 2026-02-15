@@ -43,7 +43,7 @@ head -c 16 /dev/urandom | xxd -ps
 ```
 4. Run `mtproto-proxy`:
 ```bash
-./mtproto-proxy -u nobody -p 8888 -H 443 -S <secret> --aes-pwd proxy-secret proxy-multi.conf -M 1
+./mtproto-proxy -u nobody -p 8888 -H 443 -S <secret> --http-stats --aes-pwd proxy-secret proxy-multi.conf -M 1
 ```
 ... where:
 - `nobody` is the username. `mtproto-proxy` calls `setuid()` to drop privileges.
