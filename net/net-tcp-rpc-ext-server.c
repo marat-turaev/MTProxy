@@ -1374,7 +1374,8 @@ static void stop_reading_temporarily (connection_job_t C) {
 enum {
   TLS_DELAY_ACTION_NONE = 0,
   TLS_DELAY_ACTION_ALERT = 1,
-  TLS_DELAY_ACTION_CLOSE = 2
+  TLS_DELAY_ACTION_CLOSE = 2,
+  TLS_DELAY_ACTION_RUN = 3
 };
 
 static int tls_schedule_delayed_alert (connection_job_t C, unsigned char alert_description, int delay_ms) {
@@ -1390,6 +1391,23 @@ static int tls_schedule_delayed_alert (connection_job_t C, unsigned char alert_d
   stop_reading_temporarily (C);
   job_timer_insert (C, precise_now + 0.001 * delay_ms);
   return NEED_MORE_BYTES;
+}
+
+static int tls_schedule_delayed_run (connection_job_t C, int delay_ms) {
+  struct tcp_rpc_data *D = TCP_RPC_DATA (C);
+  if (D->extra_int2 != TLS_DELAY_ACTION_NONE) {
+    return 0;
+  }
+  if (delay_ms <= 0) {
+    job_signal (JOB_REF_CREATE_PASS (C), JS_RUN);
+    return 0;
+  }
+  // Save the current alarm deadline so we can restore it after the delayed run.
+  D->extra_double = job_timer_wakeup_time (C);
+  D->extra_int2 = TLS_DELAY_ACTION_RUN;
+  D->extra_int3 = 0;
+  job_timer_insert (C, precise_now + 0.001 * delay_ms);
+  return 0;
 }
 
 static int tls_reject_or_fallback (connection_job_t C, unsigned char alert_description) {
@@ -1534,6 +1552,18 @@ int tcp_rpcs_ext_alarm (connection_job_t C) {
     } else if (action == TLS_DELAY_ACTION_CLOSE) {
       connection_write_close (C);
       return NEED_MORE_BYTES;
+    } else if (action == TLS_DELAY_ACTION_RUN) {
+      // Restore previous timeout (if any) and kick the connection to write pending bytes.
+      double restore = D->extra_double;
+      D->extra_double = 0;
+      if (restore > precise_now) {
+        job_timer_insert (C, restore);
+      } else {
+        // Keep no alarm (it will be removed anyway once the connection type is determined).
+        job_timer_remove (C);
+      }
+      job_signal (JOB_REF_CREATE_PASS (C), JS_RUN);
+      return 0;
     }
   }
   if (D->in_packet_num == -3 && default_domain_info != NULL) {
@@ -1845,7 +1875,18 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         struct raw_message *m = calloc (sizeof (struct raw_message), 1);
         rwm_create (m, response_buffer, response_size);
         mpq_push_w (c->out_queue, m, 0);
+        // Add tiny jitter before sending the first server flight. This makes timing patterns
+        // less rigid for generic clients, without blocking a worker thread.
+        // (Most connections send immediately; a minority are delayed by a few ms.)
+        int jitter_ms = 0;
+        if ((lrand48_j () & 3) == 0) { // 25%
+          jitter_ms = 1 + (lrand48_j () % 12); // 1..12ms
+        }
+        if (jitter_ms > 0) {
+          tls_schedule_delayed_run (C, jitter_ms);
+        } else {
         job_signal (JOB_REF_CREATE_PASS (C), JS_RUN);
+        }
 
         // Shape TCP segmentation of the first server flight for TLS transport.
         // This does not change bytes on the wire, only how many bytes we attempt to write per syscall.
