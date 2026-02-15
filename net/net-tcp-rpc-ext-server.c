@@ -215,7 +215,7 @@ static const struct domain_info *get_domain_info (const char *domain, size_t len
 
 static int get_domain_server_hello_encrypted_size (const struct domain_info *info) {
   if (info->use_random_encrypted_size) {
-    int r = rand();
+    unsigned int r = (unsigned int) lrand48_j ();
     return info->server_hello_encrypted_size + ((r >> 1) & 1) - (r & 1);
   } else {
     return info->server_hello_encrypted_size;
@@ -233,13 +233,13 @@ static int get_domain_server_hello_encrypted_size_n (const struct domain_info *i
     return get_domain_server_hello_encrypted_size (info);
   case 1:
     if (info->use_random_encrypted_size2) {
-      int r = rand();
+      unsigned int r = (unsigned int) lrand48_j ();
       return info->server_hello_encrypted_size2 + ((r >> 1) & 1) - (r & 1);
     }
     return info->server_hello_encrypted_size2;
   case 2:
     if (info->use_random_encrypted_size3) {
-      int r = rand();
+      unsigned int r = (unsigned int) lrand48_j ();
       return info->server_hello_encrypted_size3 + ((r >> 1) & 1) - (r & 1);
     }
     return info->server_hello_encrypted_size3;
@@ -1079,7 +1079,7 @@ void tcp_rpc_init_proxy_domains() {
         info->is_reversed_extension_order = 0;
         info->server_hello_encrypted_records = 1;
         info->use_random_encrypted_size = 1;
-        info->server_hello_encrypted_size = 2500 + rand() % 1120;
+        info->server_hello_encrypted_size = 2500 + (int)((unsigned)lrand48_j () % 1120);
         info->use_random_encrypted_size2 = 0;
         info->use_random_encrypted_size3 = 0;
         info->server_hello_encrypted_size2 = 0;
