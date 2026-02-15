@@ -615,6 +615,9 @@ static int update_domain_info (struct domain_info *info) {
   FD_ZERO(&except_fd);
 
 #define TRIES 20
+#define MAX_PROBE_SERVER_HELLO_PAYLOAD 8192
+#define MAX_PROBE_ENCRYPTED_RECORD_PAYLOAD 16384
+#define MAX_SERVER_HELLO_TEMPLATE_LEN 2048
   int sockets[TRIES];
   int i;
   for (i = 0; i < TRIES; i++) {
@@ -726,7 +729,13 @@ static int update_domain_info (struct domain_info *info) {
             have_error = 1;
             break;
           }
-          response_len[i] = 5 + header[3] * 256 + header[4] + 6 + 5;
+          int sh_len = header[3] * 256 + header[4];
+          if (sh_len <= 0 || sh_len > MAX_PROBE_SERVER_HELLO_PAYLOAD) {
+            kprintf ("Unreasonable ServerHello record length from %s: %d\n", domain, sh_len);
+            have_error = 1;
+            break;
+          }
+          response_len[i] = 5 + sh_len + 6 + 5;
           responses[i] = malloc (response_len[i]);
           memcpy (responses[i], header, sizeof (header));
           read_pos[i] = 5;
@@ -749,6 +758,11 @@ static int update_domain_info (struct domain_info *info) {
 
               is_encrypted_application_data_length_read[i] = 1;
               int encrypted_application_data_length = responses[i][response_len[i] - 2] * 256 + responses[i][response_len[i] - 1];
+              if (encrypted_application_data_length <= 0 || encrypted_application_data_length > MAX_PROBE_ENCRYPTED_RECORD_PAYLOAD) {
+                kprintf ("Unreasonable TLS ApplicationData record length from %s: %d\n", domain, encrypted_application_data_length);
+                have_error = 1;
+                break;
+              }
               response_len[i] += encrypted_application_data_length;
 	              unsigned char *new_buffer = realloc (responses[i], response_len[i]);
 	              assert (new_buffer != NULL);
@@ -767,7 +781,7 @@ static int update_domain_info (struct domain_info *info) {
 	              ssize_t pr = recv (sockets[i], hdr2, 5, MSG_PEEK);
 	              if (pr == 5 && !memcmp (hdr2, "\x17\x03\x03", 3)) {
 	                int l2 = hdr2[3] * 256 + hdr2[4];
-	                if (l2 > 0) {
+		                if (l2 > 0 && l2 <= MAX_PROBE_ENCRYPTED_RECORD_PAYLOAD) {
 	                  response_len[i] += 5 + l2;
 	                  unsigned char *new_buffer = realloc (responses[i], response_len[i]);
 	                  assert (new_buffer != NULL);
@@ -897,6 +911,10 @@ static int update_domain_info (struct domain_info *info) {
     int sh_len = resp[3] * 256 + resp[4];
     int tpl_len = 5 + sh_len;
     if (sh_len <= 0 || tpl_len > rlen) {
+      continue;
+    }
+    if (tpl_len > MAX_SERVER_HELLO_TEMPLATE_LEN) {
+      // Keep templates bounded to avoid per-connection memory/bandwidth spikes.
       continue;
     }
     unsigned char *tpl = malloc ((size_t)tpl_len);
@@ -1184,6 +1202,7 @@ static struct client_random *client_randoms[1 << RANDOM_HASH_BITS];
 
 static struct client_random *first_client_random;
 static struct client_random *last_client_random;
+static int client_random_count;
 
 static struct client_random **get_client_random_bucket (unsigned char random[16]) {
   int i = RANDOM_HASH_BITS;
@@ -1209,6 +1228,8 @@ static int have_client_random (unsigned char random[16]) {
   return 0;
 }
 
+static void trim_client_randoms_limit (void);
+
 static void add_client_random (unsigned char random[16]) {
   struct client_random *entry = malloc (sizeof (struct client_random));
   memcpy (entry->random, random, 16);
@@ -1225,29 +1246,49 @@ static void add_client_random (unsigned char random[16]) {
   struct client_random **bucket = get_client_random_bucket (random);
   entry->next_by_hash = *bucket;
   *bucket = entry;
+
+  client_random_count++;
+  trim_client_randoms_limit ();
 }
 
 #define MAX_CLIENT_RANDOM_CACHE_TIME 2 * 86400
 
-static void delete_old_client_randoms() {
-  while (first_client_random != last_client_random) {
-    assert (first_client_random != NULL);
-    if (first_client_random->time > now - MAX_CLIENT_RANDOM_CACHE_TIME) {
+static void delete_client_random_head (void) {
+  struct client_random *entry = first_client_random;
+  if (!entry) {
       return;
     }
 
-    struct client_random *entry = first_client_random;
-    assert (entry->next_by_hash == NULL);
-
-    first_client_random = first_client_random->next_by_time;
+  first_client_random = entry->next_by_time;
+  if (last_client_random == entry) {
+    last_client_random = first_client_random;
+  }
 
     struct client_random **cur = get_client_random_bucket (entry->random);
-    while (*cur != entry) {
+  while (*cur && *cur != entry) {
       cur = &(*cur)->next_by_hash;
     }
-    *cur = NULL;
+  if (*cur == entry) {
+    *cur = entry->next_by_hash;
+  }
 
     free (entry);
+  if (client_random_count > 0) {
+    client_random_count--;
+  }
+}
+
+#define MAX_CLIENT_RANDOM_ENTRIES 200000
+
+static void trim_client_randoms_limit (void) {
+  while (client_random_count > MAX_CLIENT_RANDOM_ENTRIES && first_client_random) {
+    delete_client_random_head ();
+  }
+}
+
+static void delete_old_client_randoms (void) {
+  while (first_client_random && first_client_random->time <= now - MAX_CLIENT_RANDOM_CACHE_TIME) {
+    delete_client_random_head ();
   }
 }
 
@@ -1302,7 +1343,9 @@ static unsigned probe_hash4 (unsigned ip4) {
 }
 
 static unsigned probe_hash6 (const unsigned char ip6[16]) {
-  const unsigned *w = (const unsigned *)ip6;
+  // Avoid unaligned reads / strict-aliasing UB on some architectures.
+  unsigned w[4];
+  memcpy (w, ip6, 16);
   unsigned h = w[0] ^ w[1] ^ w[2] ^ w[3];
   return (h * 2654435761u) >> (32 - 11);
 }
