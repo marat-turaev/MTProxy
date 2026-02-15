@@ -264,7 +264,7 @@ int cpu_tcp_aes_crypto_ctr128_encrypt_output (connection_job_t C) /* {{{ */ {
         // Steady state: prefer MSS-ish sizes, with occasional smaller/larger records.
         if (max_len > TLS_MAX_RECORD) { max_len = TLS_MAX_RECORD; }
 
-        int r = lrand48_j ();
+        unsigned int r = (unsigned int) lrand48_j ();
         int bucket = r & 255;
         if (max_len >= 8192) {
           // If we have lots of buffered plaintext, behave more like a typical TLS stack:
@@ -295,7 +295,7 @@ int cpu_tcp_aes_crypto_ctr128_encrypt_output (connection_job_t C) /* {{{ */ {
           if (max_len >= 4096) {
             if (max_len > 8192) {
               // Bias towards "almost full" records when we can.
-              int window = 512 + (lrand48_j () % 2048); // 512..2559
+              int window = 512 + (int)((r >> 8) & 2047); // 512..2559
               min_len = max_len - window;
               if (min_len < 4096) { min_len = 4096; }
             } else {
@@ -318,7 +318,8 @@ int cpu_tcp_aes_crypto_ctr128_encrypt_output (connection_job_t C) /* {{{ */ {
 
       len = max_len;
       if (max_len > min_len) {
-        len = min_len + (lrand48_j () % (max_len - min_len + 1));
+        unsigned int rlen = (unsigned int) lrand48_j ();
+        len = min_len + (int)(rlen % (unsigned int)(max_len - min_len + 1));
       }
 
       unsigned char header[5] = {0x17, 0x03, 0x03, len >> 8, len & 255};

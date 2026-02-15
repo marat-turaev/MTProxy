@@ -259,6 +259,30 @@ int tcp_prepare_iovec (struct iovec *iov, int *iovcnt, int maxcnt, struct raw_me
 }
 /* }}} */
 
+static inline int tcp_prepare_iovec_limited (struct iovec *iov, int *iovcnt, int maxcnt, struct raw_message *raw, int bytes) {
+  if (bytes > raw->total_bytes) {
+    bytes = raw->total_bytes;
+  }
+  if (bytes <= 0) {
+    *iovcnt = 0;
+    return 0;
+  }
+  int t = rwm_prepare_iovec (raw, iov, maxcnt, bytes);
+  if (t < 0) {
+    *iovcnt = maxcnt;
+    int i;
+    t = 0;
+    for (i = 0; i < maxcnt; i++) {
+      t += (int)iov[i].iov_len;
+    }
+    assert (t < bytes);
+    return t;
+  } else {
+    *iovcnt = t;
+    return bytes;
+  }
+}
+
 void assert_main_thread (void) {}
 void assert_net_cpu_thread (void) {}
 void assert_net_net_thread (void) {}
@@ -940,30 +964,6 @@ int net_server_socket_reader (socket_connection_job_t C) /* {{{ */ {
 }
 /* }}} */
 
-/* 
-  Get data from out raw message and writes it to socket 
-*/
-static int clamp_iovec_bytes (struct iovec *iov, int *iovcnt, int limit) {
-  if (limit <= 0) {
-    return 0;
-  }
-  int t = 0;
-  int i;
-  for (i = 0; i < *iovcnt; i++) {
-    if (t + (int)iov[i].iov_len >= limit) {
-      int left = limit - t;
-      if (left < 0) {
-        left = 0;
-      }
-      iov[i].iov_len = (size_t)left;
-      *iovcnt = i + 1;
-      return limit;
-    }
-    t += (int)iov[i].iov_len;
-  }
-  return t;
-}
-
 int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
   assert_net_net_thread ();
   struct socket_connection_info *c = SOCKET_CONN_INFO (C);
@@ -1003,8 +1003,9 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
       int shape_left = __atomic_load_n (&ci->tls_write_shaping_left, __ATOMIC_RELAXED);
       if (shape_left <= 0 && out->total_bytes > 0 && out->total_bytes < 1200 &&
           __atomic_load_n (&ci->tls_out_records_sent, __ATOMIC_RELAXED) > 3) {
-        if ((lrand48_j () & 15) == 0) { // ~1/16
-          int ms = 1 + (lrand48_j () % 4); // 1..4ms
+        unsigned int r = (unsigned int) lrand48_j ();
+        if ((r & 15) == 0) { // ~1/16
+          int ms = 1 + ((r >> 4) & 3); // 1..4ms
           __sync_fetch_and_or (&c->flags, C_NOWR);
           job_timer_insert (C, precise_now + 0.001 * ms);
           return out->total_bytes;
@@ -1015,17 +1016,16 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
     struct iovec iov[384];
     int iovcnt = -1;
 
-    int s = tcp_prepare_iovec (iov, &iovcnt, sizeof (iov) / sizeof (iov[0]), out);
-    assert (iovcnt > 0 && s > 0);
-
     // TCP segmentation shaping for TLS server flight: limit writev() chunk sizes for the first bytes.
     // This keeps TLS record structure intact while changing packetization.
+    int write_limit = out->total_bytes;
     int tls_shape_left = ci ? __atomic_load_n (&ci->tls_write_shaping_left, __ATOMIC_ACQUIRE) : 0;
     int tls_shape_chunk_left = 0;
     int tls_shape_active = 0;
     int tls_noise_left = 0;
     int tls_noise_chunk_left = 0;
     int tls_noise_active = 0;
+
     if (ci && tls_shape_left > 0) {
       tls_shape_active = 1;
       tls_shape_chunk_left = __atomic_load_n (&ci->tls_write_shaping_chunk_left, __ATOMIC_RELAXED);
@@ -1048,10 +1048,8 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
           tls_shape_chunk_left = chunk;
           __atomic_store_n (&ci->tls_write_shaping_chunk_left, tls_shape_chunk_left, __ATOMIC_RELAXED);
       }
-      int lim = tls_shape_chunk_left;
-      if (lim > 0 && lim < s) {
-        clamp_iovec_bytes (iov, &iovcnt, lim);
-        s = lim;
+      if (tls_shape_chunk_left > 0 && tls_shape_chunk_left < write_limit) {
+        write_limit = tls_shape_chunk_left;
       }
     } else if (ci && (ci->flags & C_IS_TLS)) {
       // Post-handshake write variation for TLS transport: shape TCP chunk sizes for a small amount of bytes.
@@ -1063,45 +1061,52 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
       if (tls_noise_left <= 0) {
         // Low-probability re-arm when we have enough pending bytes to make it meaningful.
         // Out is a socket-level buffer (already encrypted for TLS transport here).
-        if (out->total_bytes >= 4096 && ((lrand48_j () & 511) == 0)) { // ~1/512
-          int budget = 1024 + (lrand48_j () % 4097); // 1024..5120 bytes
+        if (out->total_bytes >= 4096) {
+          unsigned int r = (unsigned int) lrand48_j ();
+          if ((r & 511) == 0) { // ~1/512
+            int budget = 1024 + (int)((r >> 9) % 4097); // 1024..5120 bytes
           __atomic_store_n (&ci->tls_write_noise_left, budget, __ATOMIC_RELAXED);
           __atomic_store_n (&ci->tls_write_noise_chunk_left, 0, __ATOMIC_RELAXED);
           tls_noise_left = budget;
         }
+      }
       }
 
       // Similarly, re-arm a tiny amount of timing jitter occasionally later in the connection,
       // to avoid a stable pattern of "only the first writes were jittered".
       if (__atomic_load_n (&ci->tls_write_jitter_left, __ATOMIC_RELAXED) <= 0) {
         if (out->total_bytes >= 4096 &&
-            __atomic_load_n (&ci->tls_out_records_sent, __ATOMIC_RELAXED) > 32 &&
-            ((lrand48_j () & 2047) == 0)) { // ~1/2048
-          __atomic_store_n (&ci->tls_write_jitter_left, 1 + (lrand48_j () & 1), __ATOMIC_RELAXED); // 1..2 delays
+            __atomic_load_n (&ci->tls_out_records_sent, __ATOMIC_RELAXED) > 32) {
+          unsigned int r = (unsigned int) lrand48_j ();
+          if ((r & 2047) == 0) { // ~1/2048
+            __atomic_store_n (&ci->tls_write_jitter_left, 1 + ((r >> 11) & 1), __ATOMIC_RELAXED); // 1..2 delays
         }
+      }
       }
 
       if (tls_noise_left > 0) {
         tls_noise_active = 1;
         tls_noise_chunk_left = __atomic_load_n (&ci->tls_write_noise_chunk_left, __ATOMIC_RELAXED);
         if (tls_noise_chunk_left <= 0) {
-          int chunk = 1100 + (lrand48_j () % 401); // 1100..1500 (near MSS)
+          unsigned int r = (unsigned int) lrand48_j ();
+          int chunk = 1100 + (int)(r % 401); // 1100..1500 (near MSS)
           // Occasionally use a smaller chunk to avoid rigid segmentation patterns.
-          if ((lrand48_j () & 7) == 0) { // ~12.5%
-            chunk = 600 + (lrand48_j () % 701); // 600..1300
+          if ((r & 7) == 0) { // ~12.5%
+            chunk = 600 + (int)((r >> 3) % 701); // 600..1300
           }
           if (chunk < 256) { chunk = 256; }
           if (chunk > tls_noise_left) { chunk = tls_noise_left; }
           tls_noise_chunk_left = chunk;
           __atomic_store_n (&ci->tls_write_noise_chunk_left, tls_noise_chunk_left, __ATOMIC_RELAXED);
         }
-        int lim = tls_noise_chunk_left;
-        if (lim > 0 && lim < s) {
-          clamp_iovec_bytes (iov, &iovcnt, lim);
-          s = lim;
+        if (tls_noise_chunk_left > 0 && tls_noise_chunk_left < write_limit) {
+          write_limit = tls_noise_chunk_left;
         }
       }
     }
+
+    int s = tcp_prepare_iovec_limited (iov, &iovcnt, (int)(sizeof (iov) / sizeof (iov[0])), out, write_limit);
+    assert (iovcnt > 0 && s > 0);
 
     __sync_fetch_and_or (&c->flags, C_NOWR);
     int r = writev (c->fd, iov, iovcnt);
