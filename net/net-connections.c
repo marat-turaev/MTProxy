@@ -1004,10 +1004,15 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
 
     // TCP segmentation shaping for TLS server flight: limit writev() chunk sizes for the first bytes.
     // This keeps TLS record structure intact while changing packetization.
-    // (ci) already initialized above.
     int tls_shape_left = ci ? __atomic_load_n (&ci->tls_write_shaping_left, __ATOMIC_ACQUIRE) : 0;
+    int tls_shape_chunk_left = 0;
+    int tls_shape_active = 0;
+    int tls_noise_left = 0;
+    int tls_noise_chunk_left = 0;
+    int tls_noise_active = 0;
     if (ci && tls_shape_left > 0) {
-      int tls_shape_chunk_left = __atomic_load_n (&ci->tls_write_shaping_chunk_left, __ATOMIC_RELAXED);
+      tls_shape_active = 1;
+      tls_shape_chunk_left = __atomic_load_n (&ci->tls_write_shaping_chunk_left, __ATOMIC_RELAXED);
       if (tls_shape_chunk_left <= 0) {
           int chunk = 0;
 
@@ -1038,7 +1043,7 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
       //
       // We also re-arm small variation windows occasionally to avoid a stable pattern
       // of "only the beginning is packetized oddly".
-      int tls_noise_left = __atomic_load_n (&ci->tls_write_noise_left, __ATOMIC_RELAXED);
+      tls_noise_left = __atomic_load_n (&ci->tls_write_noise_left, __ATOMIC_RELAXED);
       if (tls_noise_left <= 0) {
         // Low-probability re-arm when we have enough pending bytes to make it meaningful.
         // Out is a socket-level buffer (already encrypted for TLS transport here).
@@ -1050,7 +1055,8 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
         }
       }
       if (tls_noise_left > 0) {
-        int tls_noise_chunk_left = __atomic_load_n (&ci->tls_write_noise_chunk_left, __ATOMIC_RELAXED);
+        tls_noise_active = 1;
+        tls_noise_chunk_left = __atomic_load_n (&ci->tls_write_noise_chunk_left, __ATOMIC_RELAXED);
         if (tls_noise_chunk_left <= 0) {
           int chunk = 1100 + (lrand48_j () % 401); // 1100..1500 (near MSS)
           // Occasionally use a smaller chunk to avoid rigid segmentation patterns.
@@ -1106,7 +1112,7 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
 
     if (r > 0) {
       rwm_skip_data (out, r);
-      if (ci && tls_shape_left > 0) {
+      if (ci && tls_shape_active) {
         int new_left = tls_shape_left - r;
         if (new_left <= 0) {
           __atomic_store_n (&ci->tls_write_shaping_left, 0, __ATOMIC_RELEASE);
@@ -1115,26 +1121,23 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
           __atomic_store_n (&ci->tls_write_shaping_plan_pos, 0, __ATOMIC_RELAXED);
         } else {
           __atomic_store_n (&ci->tls_write_shaping_left, new_left, __ATOMIC_RELAXED);
-          int new_chunk_left = __atomic_load_n (&ci->tls_write_shaping_chunk_left, __ATOMIC_RELAXED) - r;
+          int new_chunk_left = tls_shape_chunk_left - r;
           if (new_chunk_left < 0) { new_chunk_left = 0; }
           __atomic_store_n (&ci->tls_write_shaping_chunk_left, new_chunk_left, __ATOMIC_RELAXED);
         }
       }
-      if (ci) {
-        int tls_noise_left = __atomic_load_n (&ci->tls_write_noise_left, __ATOMIC_RELAXED);
-        if (tls_noise_left > 0) {
+      if (ci && tls_noise_active) {
           int new_left = tls_noise_left - r;
           if (new_left <= 0) {
             __atomic_store_n (&ci->tls_write_noise_left, 0, __ATOMIC_RELAXED);
             __atomic_store_n (&ci->tls_write_noise_chunk_left, 0, __ATOMIC_RELAXED);
           } else {
             __atomic_store_n (&ci->tls_write_noise_left, new_left, __ATOMIC_RELAXED);
-            int new_chunk_left = __atomic_load_n (&ci->tls_write_noise_chunk_left, __ATOMIC_RELAXED) - r;
+          int new_chunk_left = tls_noise_chunk_left - r;
             if (new_chunk_left < 0) { new_chunk_left = 0; }
             __atomic_store_n (&ci->tls_write_noise_chunk_left, new_chunk_left, __ATOMIC_RELAXED);
           }
         }
-      }
       if (c->type->data_sent) {
         c->type->data_sent (C, r);
       }
