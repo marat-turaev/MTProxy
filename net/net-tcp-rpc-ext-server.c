@@ -1724,10 +1724,48 @@ int tcp_rpcs_ext_alarm (connection_job_t C) {
     }
   }
   if (D->in_packet_num == -3 && default_domain_info != NULL) {
-    return proxy_connection (C, default_domain_info);  
-  } else {
-    return 0;
+    // Upstream behavior was to proxy unknown connections to the -D domain after the initial timeout.
+    // That makes the proxy usable as a weird forwarder and leaks cover-domain behavior to unexpected clients.
+    // If an operator really wants a "real site" behavior, they should configure --fallback-backend.
+    if (fallback_backend_enabled) {
+    return proxy_connection (C, default_domain_info);    }
+
+    struct connection_info *c = CONN_INFO (C);
+
+    // If this looks like plain HTTP on :443, reply with our redirect helper.
+    if (!(c->flags & C_IS_TLS) && c->in.total_bytes >= 4) {
+      unsigned char pfx[4];
+      if (rwm_fetch_lookup (&c->in, pfx, 4) == 4) {
+        if (!memcmp (pfx, "GET ", 4) ||
+            !memcmp (pfx, "HEAD", 4) ||
+            !memcmp (pfx, "POST", 4) ||
+            !memcmp (pfx, "OPTI", 4) ||  // OPTIONS
+            !memcmp (pfx, "PUT ", 4) ||
+            !memcmp (pfx, "DELE", 4) ||  // DELETE
+            !memcmp (pfx, "PATC", 4) ||  // PATCH
+            !memcmp (pfx, "TRAC", 4) ||  // TRACE
+            !memcmp (pfx, "CONN", 4) ||  // CONNECT
+            !memcmp (pfx, "PRI ", 4)) {  // HTTP/2 preface
+          return http_send_301_and_close (C);
+}
+      }
+    }
+
+    // If this looks like a real TLS ClientHello , fail like an HTTPS endpoint.
+    if (!(c->flags & C_IS_TLS) && c->in.total_bytes >= 3) {
+      unsigned char hdr3[3];
+      if (rwm_fetch_lookup (&c->in, hdr3, 3) == 3) {
+        if (hdr3[0] == 0x16 && hdr3[1] == 0x03 && hdr3[2] >= 0x01 && hdr3[2] <= 0x03) {
+          return tls_send_alert_and_close (C, 40 /* handshake_failure */);
+        }
+      }
+    }
+
+    // Otherwise: just close quietly.
+    connection_write_close (C);
+    return NEED_MORE_BYTES;
   }
+  return 0;
 }
 
 int tcp_rpcs_ext_init_accepted (connection_job_t C) {
