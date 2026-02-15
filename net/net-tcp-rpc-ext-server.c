@@ -71,6 +71,9 @@
 int tcp_rpcs_compact_parse_execute (connection_job_t c);
 int tcp_rpcs_ext_alarm (connection_job_t c);
 int tcp_rpcs_ext_init_accepted (connection_job_t c);
+int tcp_rpcs_ext_close_connection (connection_job_t C, int who);
+
+extern int tcp_rpcs_close_connection (connection_job_t C, int who);
 
 conn_type_t ct_tcp_rpc_ext_server = {
   .magic = CONN_FUNC_MAGIC,
@@ -78,7 +81,7 @@ conn_type_t ct_tcp_rpc_ext_server = {
   .title = "rpc_ext_server",
   .init_accepted = tcp_rpcs_ext_init_accepted,
   .parse_execute = tcp_rpcs_compact_parse_execute,
-  .close = tcp_rpcs_close_connection,
+  .close = tcp_rpcs_ext_close_connection,
   .flush = tcp_rpc_flush,
   .write_packet = tcp_rpc_write_packet_compact,
   .connected = server_failed,
@@ -166,6 +169,32 @@ static unsigned char fallback_backend_target_ipv6[16];
 static int fallback_backend_is_ipv6;
 static int fallback_backend_port;
 static char fallback_backend_printable[256];
+
+// Limit concurrent "undetermined" connections (D->in_packet_num == -3) per worker thread.
+// This reduces cheap socket-hold DoS attempts (slowloris/automated clients) on busy deployments.
+#define MAX_UNDETERMINED_CONNS 1024
+static __thread int undetermined_conn_count;
+
+// D->extra_int bit used by this file to track whether the connection is counted above.
+#define EXT_TCPRPC_F_UNDET_COUNTED 1
+
+static void undetermined_conn_enter (connection_job_t C) {
+  struct tcp_rpc_data *D = TCP_RPC_DATA (C);
+  if (D->in_packet_num == -3 && !(D->extra_int & EXT_TCPRPC_F_UNDET_COUNTED)) {
+    D->extra_int |= EXT_TCPRPC_F_UNDET_COUNTED;
+    undetermined_conn_count++;
+  }
+}
+
+static void undetermined_conn_leave (connection_job_t C) {
+  struct tcp_rpc_data *D = TCP_RPC_DATA (C);
+  if ((D->extra_int & EXT_TCPRPC_F_UNDET_COUNTED)) {
+    D->extra_int &= ~EXT_TCPRPC_F_UNDET_COUNTED;
+    if (undetermined_conn_count > 0) {
+      undetermined_conn_count--;
+    }
+  }
+}
 
 struct domain_info {
   const char *domain;
@@ -1681,6 +1710,9 @@ static int proxy_connection_fallback (connection_job_t C) {
   assert (fallback_backend_enabled);
   assert (check_conn_functions (&ct_proxy_pass, 0) >= 0);
 
+  // This connection is no longer "undetermined" once we decide to proxy it.
+  undetermined_conn_leave (C);
+
   // Avoid obvious self-proxy loops (common footgun: 127.0.0.1:443 while listening on :443).
   if (fallback_backend_port == (int)c->our_port) {
     if ((!fallback_backend_is_ipv6 && is_ipv4_loopback (fallback_backend_target)) ||
@@ -1736,6 +1768,9 @@ static int proxy_connection (connection_job_t C, const struct domain_info *info)
 
   struct connection_info *c = CONN_INFO(C);
   assert (check_conn_functions (&ct_proxy_pass, 0) >= 0);
+
+  // This connection is no longer "undetermined" once we decide to proxy it.
+  undetermined_conn_leave (C);
 
   const char zero[16] = {};
   if (info->target.s_addr == 0 && !memcmp (info->target_ipv6, zero, 16)) {
@@ -1854,7 +1889,19 @@ int tcp_rpcs_ext_init_accepted (connection_job_t C) {
   // Timeout while the connection type is still undetermined (before we see enough bytes).
   // Keep it short to reduce slowloris/automated socket hold times.
   job_timer_insert (C, precise_now + 3);
-  return tcp_rpcs_init_accepted_nohs (C);
+  int r = tcp_rpcs_init_accepted_nohs (C);
+  undetermined_conn_enter (C);
+  if (undetermined_conn_count > MAX_UNDETERMINED_CONNS) {
+    // Hard cap: too many undetermined sockets. Close immediately to keep resources bounded.
+    connection_write_close (C);
+  }
+  return r;
+}
+
+int tcp_rpcs_ext_close_connection (connection_job_t C, int who) {
+  // Keep undetermined connection accounting correct on all close paths.
+  undetermined_conn_leave (C);
+  return tcp_rpcs_close_connection (C, who);
 }
 
 int tcp_rpcs_compact_parse_execute (connection_job_t C) {
@@ -1904,6 +1951,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         D->flags |= RPC_F_COMPACT;
         assert (rwm_skip_data (&c->in, 1) == 1);
         D->in_packet_num = 0;
+        undetermined_conn_leave (C);
         vkprintf (1, "Short type\n");
         continue;
       } 
@@ -1911,6 +1959,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         D->flags |= RPC_F_MEDIUM;
         assert (rwm_skip_data (&c->in, 4) == 4);
         D->in_packet_num = 0;
+        undetermined_conn_leave (C);
         vkprintf (1, "Medium type\n");
         continue;
       }
@@ -1918,6 +1967,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         D->flags |= RPC_F_MEDIUM | RPC_F_PAD;
         assert (rwm_skip_data (&c->in, 4) == 4);
         D->in_packet_num = 0;
+        undetermined_conn_leave (C);
         vkprintf (1, "Medium type\n");
         continue;
       }
@@ -2298,6 +2348,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
           rwm_init (&c->in, 0);
           // T->read_pos = 64;
           D->in_packet_num = 0;
+          undetermined_conn_leave (C);
           switch (tag) {
             case 0xeeeeeeee:
               D->flags |= RPC_F_MEDIUM | RPC_F_EXTMODE2;
@@ -2343,6 +2394,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
       vkprintf (1, "short type with 64-byte header: first 0x%08x 0x%08x\n", tmp[0], tmp[1]);
       D->flags |= RPC_F_COMPACT | RPC_F_EXTMODE1;
       D->in_packet_num = 0;
+      undetermined_conn_leave (C);
 
       assert (len >= 64);
       assert (rwm_skip_data (&c->in, 64) == 64);
@@ -2419,6 +2471,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
     if (D->in_packet_num < 0) {
       assert (D->in_packet_num == -3);
       D->in_packet_num = 0;
+      undetermined_conn_leave (C);
     }
 
     if (verbosity > 2) {
