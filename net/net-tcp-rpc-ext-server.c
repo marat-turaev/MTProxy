@@ -2245,8 +2245,11 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
       }
 
       if (ext_secret_cnt > 0) {
-        vkprintf (1, "invalid \"random\" 64-byte header, entering global skip mode\n");
-        return (-1 << 28);
+        // Previously we entered "global skip mode" (skip a huge amount of bytes without parsing).
+        // That keeps the socket open and is easy to abuse for resource holding / easy identification.
+        vkprintf (1, "invalid \"random\" 64-byte header, closing\n");
+        connection_write_close (C);
+        return NEED_MORE_BYTES;
       }
 
 #if __ALLOW_UNOBFS__
@@ -2258,8 +2261,9 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
       assert (rwm_skip_data (&c->in, 64) == 64);
       continue;
 #else
-      vkprintf (1, "invalid \"random\" 64-byte header, entering global skip mode\n");
-      return (-1 << 28);
+      vkprintf (1, "invalid \"random\" 64-byte header, closing\n");
+      connection_write_close (C);
+      return NEED_MORE_BYTES;
 #endif
     }
 
