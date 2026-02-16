@@ -3042,8 +3042,16 @@ static void best_effort_send_plain (connection_job_t C, const void *buf, int len
 static int tls_send_alert_and_close (connection_job_t C, unsigned char description) {
   // Pre-auth reject path must not allocate.
   static const unsigned char alert_tpl[7] = {0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28}; // fatal handshake_failure
+  static const unsigned char alert_versions[][2] = {
+    {0x03, 0x01},
+    {0x03, 0x02},
+    {0x03, 0x03}
+  };
   unsigned char alert[7];
   memcpy (alert, alert_tpl, sizeof (alert));
+  unsigned int vi = (unsigned int) lrand48_j () % (sizeof (alert_versions) / sizeof (alert_versions[0]));
+  alert[1] = alert_versions[vi][0];
+  alert[2] = alert_versions[vi][1];
   alert[6] = description;
   best_effort_send_plain (C, alert, (int)sizeof (alert));
   connection_write_close (C);
