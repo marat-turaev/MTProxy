@@ -2804,25 +2804,32 @@ static int probe_note_failure (connection_job_t C, int weight, int *blocked) {
   return d;
 }
 
+static void best_effort_send_plain (connection_job_t C, const void *buf, int len) {
+  if (len <= 0 || buf == NULL) {
+    return;
+  }
+  struct connection_info *c = CONN_INFO (C);
+  int fd = c->fd;
+  if (fd < 0 && c->io_conn) {
+    fd = SOCKET_CONN_INFO (c->io_conn)->fd;
+  }
+  if (fd < 0) {
+    return;
+  }
+  int flags = MSG_DONTWAIT;
+#ifdef MSG_NOSIGNAL
+  flags |= MSG_NOSIGNAL;
+#endif
+  (void)send (fd, buf, (size_t)len, flags);
+}
+
 static int tls_send_alert_and_close (connection_job_t C, unsigned char description) {
-  // Send a minimal TLS alert record and then close the connection.
+  // Pre-auth reject path must not allocate.
   static const unsigned char alert_tpl[7] = {0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28}; // fatal handshake_failure
   unsigned char alert[7];
   memcpy (alert, alert_tpl, sizeof (alert));
   alert[6] = description;
-
-  struct connection_info *c = CONN_INFO (C);
-  struct raw_message *m = rwm_alloc_raw_message ();
-  rwm_create (m, alert, (int)sizeof (alert));
-  socket_connection_job_t S = c->io_conn;
-  if (S) {
-    // Bypass MTProto framing/encryption: send a raw TLS alert record.
-    mpq_push_w (SOCKET_CONN_INFO (S)->out_packet_queue, m, 0);
-    job_signal (JOB_REF_CREATE_PASS (S), JS_RUN);
-  } else {
-    mpq_push_w (c->out_queue, m, 0);
-    job_signal (JOB_REF_CREATE_PASS (C), JS_RUN);
-  }
+  best_effort_send_plain (C, alert, (int)sizeof (alert));
   connection_write_close (C);
   return NEED_MORE_BYTES;
 }
@@ -2886,18 +2893,7 @@ static int http_send_301_and_close (connection_job_t C) {
     rlen = (int)sizeof (resp);
   }
 
-  struct raw_message *m = rwm_alloc_raw_message ();
-  rwm_create (m, resp, rlen);
-  socket_connection_job_t S = c->io_conn;
-  if (S) {
-    // Bypass MTProto framing/encryption: write directly to the socket job output queue.
-    mpq_push_w (SOCKET_CONN_INFO (S)->out_packet_queue, m, 0);
-    job_signal (JOB_REF_CREATE_PASS (S), JS_RUN);
-  } else {
-    // Should not normally happen for inbound connections, but keep a fallback.
-    mpq_push_w (c->out_queue, m, 0);
-    job_signal (JOB_REF_CREATE_PASS (C), JS_RUN);
-  }
+  best_effort_send_plain (C, resp, rlen);
   connection_write_close (C);
   return NEED_MORE_BYTES;
 }
