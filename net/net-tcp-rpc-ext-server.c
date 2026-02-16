@@ -1389,6 +1389,7 @@ struct probe_entry {
   int blocked_until;
 };
 static __thread struct probe_entry probe_table[PROBE_TABLE_SIZE];
+static __thread struct probe_entry probe_net_table[PROBE_TABLE_SIZE];
 
 static unsigned probe_hash4 (unsigned ip4) {
   // Knuth multiplicative hash.
@@ -1403,6 +1404,18 @@ static unsigned probe_hash6 (const unsigned char ip6[16]) {
   return (h * 2654435761u) >> (32 - 11);
 }
 
+static unsigned probe_ipv4_prefix24 (unsigned ip4_host) {
+  // Normalize to /24 in a byte-order independent way.
+  unsigned ip4_net = htonl (ip4_host);
+  ip4_net &= 0xffffff00U;
+  return ntohl (ip4_net);
+}
+
+static void probe_ipv6_prefix64 (unsigned char out[16], const unsigned char in[16]) {
+  memcpy (out, in, 16);
+  memset (out + 8, 0, 8);
+}
+
 static int probe_match (const struct probe_entry *e, const struct connection_info *c) {
   if (!e->last_time) {
     return 0;
@@ -1411,6 +1424,16 @@ static int probe_match (const struct probe_entry *e, const struct connection_inf
     return !e->is_ipv6 && e->ip4 == c->remote_ip;
   }
   return e->is_ipv6 && !memcmp (e->ip6, c->remote_ipv6, 16);
+}
+
+static int probe_match_key (const struct probe_entry *e, unsigned ip4, const unsigned char ip6[16], int is_ipv6) {
+  if (!e->last_time) {
+    return 0;
+  }
+  if (!is_ipv6) {
+    return !e->is_ipv6 && e->ip4 == ip4;
+  }
+  return e->is_ipv6 && !memcmp (e->ip6, ip6, 16);
 }
 
 static void probe_set_key (struct probe_entry *e, const struct connection_info *c) {
@@ -1425,11 +1448,22 @@ static void probe_set_key (struct probe_entry *e, const struct connection_info *
   }
 }
 
-static struct probe_entry *probe_get_entry (const struct connection_info *c) {
+static void probe_set_key_key (struct probe_entry *e, unsigned ip4, const unsigned char ip6[16], int is_ipv6) {
+  e->is_ipv6 = is_ipv6;
+  if (!is_ipv6) {
+    e->ip4 = ip4;
+    memset (e->ip6, 0, 16);
+  } else {
+    e->ip4 = 0;
+    memcpy (e->ip6, ip6, 16);
+  }
+}
+
+static struct probe_entry *probe_get_entry_tbl (struct probe_entry *tbl, const struct connection_info *c) {
   unsigned idx = c->remote_ip ? probe_hash4 (c->remote_ip) : probe_hash6 (c->remote_ipv6);
   unsigned i;
   for (i = 0; i < 16; i++) {
-    struct probe_entry *e = &probe_table[(idx + i) & (PROBE_TABLE_SIZE - 1)];
+    struct probe_entry *e = &tbl[(idx + i) & (PROBE_TABLE_SIZE - 1)];
     if (!e->last_time) {
       probe_set_key (e, c);
       return e;
@@ -1439,7 +1473,7 @@ static struct probe_entry *probe_get_entry (const struct connection_info *c) {
     }
   }
   // Table is saturated in this window; fall back to an arbitrary slot.
-  struct probe_entry *e = &probe_table[idx & (PROBE_TABLE_SIZE - 1)];
+  struct probe_entry *e = &tbl[idx & (PROBE_TABLE_SIZE - 1)];
   probe_set_key (e, c);
   e->score = 0;
   e->blocked_until = 0;
@@ -1447,11 +1481,40 @@ static struct probe_entry *probe_get_entry (const struct connection_info *c) {
   return e;
 }
 
-// Returns delay in ms (0..200). Sets *blocked=1 if we should hard-drop this attempt.
-static int probe_note_failure (connection_job_t C, int weight, int *blocked) {
-  struct connection_info *c = CONN_INFO (C);
-  struct probe_entry *e = probe_get_entry (c);
+static struct probe_entry *probe_get_entry_net (const struct connection_info *c) {
+  unsigned ip4 = 0;
+  unsigned char ip6[16];
+  int is_ipv6 = 0;
+  memset (ip6, 0, 16);
+  if (c->remote_ip) {
+    ip4 = probe_ipv4_prefix24 (c->remote_ip);
+    is_ipv6 = 0;
+  } else {
+    probe_ipv6_prefix64 (ip6, c->remote_ipv6);
+    is_ipv6 = 1;
+  }
 
+  unsigned idx = !is_ipv6 ? probe_hash4 (ip4) : probe_hash6 (ip6);
+  unsigned i;
+  for (i = 0; i < 16; i++) {
+    struct probe_entry *e = &probe_net_table[(idx + i) & (PROBE_TABLE_SIZE - 1)];
+    if (!e->last_time) {
+      probe_set_key_key (e, ip4, ip6, is_ipv6);
+      return e;
+    }
+    if (probe_match_key (e, ip4, ip6, is_ipv6)) {
+      return e;
+    }
+  }
+  struct probe_entry *e = &probe_net_table[idx & (PROBE_TABLE_SIZE - 1)];
+  probe_set_key_key (e, ip4, ip6, is_ipv6);
+  e->score = 0;
+  e->blocked_until = 0;
+  e->last_time = 0;
+  return e;
+}
+
+static int probe_entry_note_failure (struct probe_entry *e, int weight, int *blocked) {
   const int t = now;
   int dt = t - e->last_time;
   if (dt < 0) { dt = 0; }
@@ -1489,6 +1552,21 @@ static int probe_note_failure (connection_job_t C, int weight, int *blocked) {
   d += (lrand48_j () % 31); // small jitter
   if (d > 200) { d = 200; }
   return d;
+}
+
+// Returns delay in ms (0..200). Sets *blocked=1 if we should hard-drop this attempt.
+static int probe_note_failure (connection_job_t C, int weight, int *blocked) {
+  struct connection_info *c = CONN_INFO (C);
+  struct probe_entry *e_ip = probe_get_entry_tbl (probe_table, c);
+  struct probe_entry *e_net = probe_get_entry_net (c);
+
+  int blocked_ip = 0, blocked_net = 0;
+  int d_ip = probe_entry_note_failure (e_ip, weight, &blocked_ip);
+  // Be conservative at subnet level to reduce false positives (NAT): always weight 1.
+  int d_net = probe_entry_note_failure (e_net, 1, &blocked_net);
+
+  *blocked = blocked_ip || blocked_net;
+  return d_ip > d_net ? d_ip : d_net;
 }
 
 static int tls_send_alert_and_close (connection_job_t C, unsigned char description) {
