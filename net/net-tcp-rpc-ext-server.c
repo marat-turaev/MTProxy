@@ -158,9 +158,18 @@ int tcp_rpcs_default_execute (connection_job_t c, int op, struct raw_message *ms
 static unsigned char ext_secret[16][16];
 static int ext_secret_cnt = 0;
 
-void tcp_rpcs_set_ext_secret (unsigned char secret[16]) {
-  assert (ext_secret_cnt < 16);
+int tcp_rpcs_set_ext_secret (unsigned char secret[16]) {
+  int i;
+  for (i = 0; i < ext_secret_cnt; i++) {
+    if (!memcmp (ext_secret[i], secret, 16)) {
+      return 1;
+    }
+  }
+  if (ext_secret_cnt >= 16) {
+    return -1;
+  }
   memcpy (ext_secret[ext_secret_cnt ++], secret, 16);
+  return 0;
 }
 
 static int allow_only_tls;
@@ -1584,6 +1593,10 @@ int tcp_rpc_set_fallback_backend (const char *backend) {
 
   fallback_backend_enabled = 1;
   return 0;
+}
+
+int tcp_rpc_fallback_backend_enabled (void) {
+  return fallback_backend_enabled;
 }
 
 struct client_random {

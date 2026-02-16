@@ -31,7 +31,9 @@ extern conn_type_t ct_tcp_rpc_ext_server;
 
 int tcp_rpcs_compact_parse_execute (connection_job_t c);
 
-void tcp_rpcs_set_ext_secret(unsigned char secret[16]);
+// Adds an MTProto secret.
+// Returns 0 on success, 1 if duplicate, -1 if capacity is exhausted.
+int tcp_rpcs_set_ext_secret(unsigned char secret[16]);
 
 void tcp_rpc_add_proxy_domain (const char *domain);
 
@@ -41,6 +43,7 @@ void tcp_rpc_init_proxy_domains();
 // instead of proxying to the requested SNI domain. Format: "host:port" or "[ipv6]:port".
 // Returns 0 on success, <0 on error.
 int tcp_rpc_set_fallback_backend (const char *backend);
+int tcp_rpc_fallback_backend_enabled (void);
 
 // Exposes TLS-transport domain sizing results and fallback config via /stats.
 int tcp_rpc_proxy_domains_prepare_stat (stats_buffer_t *sb);

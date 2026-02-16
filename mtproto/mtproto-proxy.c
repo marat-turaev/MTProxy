@@ -2183,8 +2183,21 @@ int f_parse_option (int val) {
       return 2;
     }
     while (*ptr >= '1' && *ptr <= '9' && http_ports_num < MAX_HTTP_LISTEN_PORTS) {
-      int i = http_port[http_ports_num++] = strtol (ptr, &colon, 10);
-      assert (colon > ptr && i > 0 && i < 65536);
+      int i = strtol (ptr, &colon, 10);
+      if (colon <= ptr || i <= 0 || i >= 65536) {
+        kprintf ("invalid --http-ports value '%s'\n", optarg);
+        usage ();
+        return 2;
+      }
+      int j;
+      for (j = 0; j < http_ports_num; j++) {
+        if (http_port[j] == i) {
+          kprintf ("duplicate port %d in --http-ports\n", i);
+          usage ();
+          return 2;
+        }
+      }
+      http_port[http_ports_num++] = i;
       ptr = colon;
       if (*ptr != ',') {
 	break;
@@ -2251,8 +2264,17 @@ int f_parse_option (int val) {
         }
       }
       if (val == 'S') {
-	tcp_rpcs_set_ext_secret (secret);
-	secret_count++;
+	int r = tcp_rpcs_set_ext_secret (secret);
+	if (r < 0) {
+          kprintf ("too many mtproto-secret values (maximum 16)\n");
+          usage ();
+          return 2;
+        }
+	if (r > 0) {
+          vkprintf (0, "duplicate mtproto-secret ignored\n");
+        } else {
+	  secret_count++;
+        }
       } else {
 	memcpy (proxy_tag, secret, sizeof (proxy_tag));
 	proxy_tag_set = 1;
@@ -2318,6 +2340,10 @@ void mtfront_pre_init (void) {
       kprintf ("You must specify at least one mtproto-secret to use when using TLS-transport");
       exit (2);
     }
+  }
+  if (tcp_rpc_fallback_backend_enabled () && !domain_count) {
+    kprintf ("--fallback-backend requires TLS-transport mode. Add at least one -D <domain>.\n");
+    exit (2);
   }
 
   int i, enable_ipv6 = engine_check_ipv6_enabled () ? SM_IPV6 : 0;
