@@ -177,6 +177,8 @@ static unsigned long long probe_stat_calls;
 static unsigned long long probe_stat_blocked;
 static unsigned long long probe_stat_delayed;
 static unsigned long long probe_stat_delay_ms_sum;
+static unsigned long long dos_stat_undetermined_conns_closed;
+static unsigned long long dos_stat_undetermined_bytes_closed;
 
 static void probe_stat_note (int blocked, int delay_ms) {
   __atomic_fetch_add (&probe_stat_calls, 1, __ATOMIC_RELAXED);
@@ -322,6 +324,10 @@ int tcp_rpc_proxy_domains_prepare_stat (stats_buffer_t *sb) {
   sb_printf (sb, "tls_probe_throttle_blocked\t%llu\n", __atomic_load_n (&probe_stat_blocked, __ATOMIC_RELAXED));
   sb_printf (sb, "tls_probe_throttle_delayed\t%llu\n", __atomic_load_n (&probe_stat_delayed, __ATOMIC_RELAXED));
   sb_printf (sb, "tls_probe_throttle_delay_ms_sum\t%llu\n", __atomic_load_n (&probe_stat_delay_ms_sum, __ATOMIC_RELAXED));
+  sb_printf (sb, "tls_dos_undetermined_conns_limit\t%d\n", (int)MAX_UNDETERMINED_CONNS);
+  sb_printf (sb, "tls_dos_undetermined_bytes_limit\t%d\n", (int)MAX_UNDETERMINED_BUFFER_BYTES);
+  sb_printf (sb, "tls_dos_undetermined_conns_closed\t%llu\n", __atomic_load_n (&dos_stat_undetermined_conns_closed, __ATOMIC_RELAXED));
+  sb_printf (sb, "tls_dos_undetermined_bytes_closed\t%llu\n", __atomic_load_n (&dos_stat_undetermined_bytes_closed, __ATOMIC_RELAXED));
 
   int idx = 0;
   int i;
@@ -2026,6 +2032,7 @@ int tcp_rpcs_ext_init_accepted (connection_job_t C) {
   undetermined_conn_enter (C);
   if (undetermined_conn_count > MAX_UNDETERMINED_CONNS) {
     // Hard cap: too many undetermined sockets. Close immediately to keep resources bounded.
+    __atomic_fetch_add (&dos_stat_undetermined_conns_closed, 1, __ATOMIC_RELAXED);
     connection_write_close (C);
   }
   return r;
@@ -2072,6 +2079,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
     if (D->in_packet_num == -3 && len > MAX_UNDETERMINED_BUFFER_BYTES) {
       vkprintf (1, "too much data while undetermined (%d bytes) from %s:%d, closing\n",
                 len, show_remote_ip (C), c->remote_port);
+      __atomic_fetch_add (&dos_stat_undetermined_bytes_closed, 1, __ATOMIC_RELAXED);
       int blocked = 0;
       int delay_ms = probe_note_failure (C, 2, &blocked);
       if (blocked) {
