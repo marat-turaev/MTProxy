@@ -31,6 +31,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -170,6 +171,24 @@ static int fallback_backend_is_ipv6;
 static int fallback_backend_port;
 static char fallback_backend_printable[256];
 
+// Aggregate throttling stats (no per-IP data, safe for /stats).
+static unsigned long long probe_stat_calls;
+static unsigned long long probe_stat_blocked;
+static unsigned long long probe_stat_delayed;
+static unsigned long long probe_stat_delay_ms_sum;
+
+static void probe_stat_note (int blocked, int delay_ms) {
+  __atomic_fetch_add (&probe_stat_calls, 1, __ATOMIC_RELAXED);
+  if (blocked) {
+    __atomic_fetch_add (&probe_stat_blocked, 1, __ATOMIC_RELAXED);
+    return;
+  }
+  if (delay_ms > 0) {
+    __atomic_fetch_add (&probe_stat_delayed, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add (&probe_stat_delay_ms_sum, (unsigned long long)delay_ms, __ATOMIC_RELAXED);
+  }
+}
+
 // Limit concurrent "undetermined" connections (D->in_packet_num == -3) per worker thread.
 // This reduces cheap socket-hold DoS attempts (slowloris/automated clients) on busy deployments.
 #define MAX_UNDETERMINED_CONNS 1024
@@ -297,6 +316,11 @@ int tcp_rpc_proxy_domains_prepare_stat (stats_buffer_t *sb) {
     sb_printf (sb, "tls_fallback_backend_is_ipv6\t%d\n", fallback_backend_is_ipv6 ? 1 : 0);
     sb_printf (sb, "tls_fallback_backend_port\t%d\n", fallback_backend_port);
   }
+
+  sb_printf (sb, "tls_probe_throttle_calls\t%llu\n", __atomic_load_n (&probe_stat_calls, __ATOMIC_RELAXED));
+  sb_printf (sb, "tls_probe_throttle_blocked\t%llu\n", __atomic_load_n (&probe_stat_blocked, __ATOMIC_RELAXED));
+  sb_printf (sb, "tls_probe_throttle_delayed\t%llu\n", __atomic_load_n (&probe_stat_delayed, __ATOMIC_RELAXED));
+  sb_printf (sb, "tls_probe_throttle_delay_ms_sum\t%llu\n", __atomic_load_n (&probe_stat_delay_ms_sum, __ATOMIC_RELAXED));
 
   int idx = 0;
   int i;
@@ -1566,7 +1590,9 @@ static int probe_note_failure (connection_job_t C, int weight, int *blocked) {
   int d_net = probe_entry_note_failure (e_net, 1, &blocked_net);
 
   *blocked = blocked_ip || blocked_net;
-  return d_ip > d_net ? d_ip : d_net;
+  int d = d_ip > d_net ? d_ip : d_net;
+  probe_stat_note (*blocked, d);
+  return d;
 }
 
 static int tls_send_alert_and_close (connection_job_t C, unsigned char description) {
