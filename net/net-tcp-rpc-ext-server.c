@@ -2200,9 +2200,11 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
           return min_len - len;
         }
 
-        int read_len = len <= 4096 ? len : 4096;
-        unsigned char client_hello[read_len + 1]; // VLA
+        enum { MAX_CLIENT_HELLO_READ = 4096 };
+        int read_len = len <= MAX_CLIENT_HELLO_READ ? len : MAX_CLIENT_HELLO_READ;
+        unsigned char client_hello[MAX_CLIENT_HELLO_READ + 1];
         assert (rwm_fetch_lookup (&c->in, client_hello, read_len) == read_len);
+        client_hello[read_len] = 0;
 
         const struct domain_info *info = get_sni_domain_info (client_hello, read_len);
         if (info == NULL) {
