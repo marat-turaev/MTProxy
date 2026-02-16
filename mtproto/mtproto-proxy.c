@@ -274,9 +274,15 @@ struct ext_connection *get_ext_connection_by_in_conn_id (int in_fd, int in_gen, 
   if (mode != 2 && mode != 3) {
     return 0;
   }
-  assert (ext_connections < EXT_CONN_TABLE_SIZE / 2);
+  if (ext_connections >= EXT_CONN_TABLE_SIZE / 2) {
+    vkprintf (1, "ext connection table is full, dropping new mapping\n");
+    return 0;
+  }
   cur = calloc (sizeof (struct ext_connection), 1);
-  assert (cur);
+  if (!cur) {
+    vkprintf (0, "calloc failed while creating ext connection mapping\n");
+    return 0;
+  }
   cur->h_next = InExtConnectionHash[h];
   InExtConnectionHash[h] = cur;
   cur->in_fd = in_fd;
@@ -324,8 +330,13 @@ struct ext_connection *find_ext_connection_by_out_conn_id (long long out_conn_id
 struct ext_connection *create_ext_connection (connection_job_t CI, long long in_conn_id, connection_job_t CO, long long auth_key_id) {
   check_engine_class ();
   struct ext_connection *Ex = get_ext_connection_by_in_conn_id (CONN_INFO(CI)->fd, CONN_INFO(CI)->generation, in_conn_id, 2, 0);
-  assert (Ex && "ext_connection already exists");
-  assert (!Ex->out_fd && !Ex->o_next && !Ex->auth_key_id);
+  if (!Ex) {
+    return 0;
+  }
+  if (Ex->out_fd || Ex->o_next || Ex->auth_key_id) {
+    vkprintf (1, "unexpected ext connection state while creating mapping\n");
+    return 0;
+  }
   assert (!CO || (unsigned) CONN_INFO(CO)->fd < MAX_CONNECTIONS);
   assert (CO != CI);
   if (CO) {
@@ -1315,6 +1326,9 @@ int process_http_query (struct tl_in_state *tlio_in, job_t HQJ) {
       int len = snprintf (response_buffer, 511, "HTTP/1.1 200 OK\r\nConnection: %s\r\nContent-type: text/plain\r\nPragma: no-cache\r\nCache-control: no-store\r\n%sContent-length: 0\r\n\r\n", (HTS_DATA(c)->query_flags & QF_KEEPALIVE) ? "keep-alive" : "close", HTS_DATA(c)->query_flags & QF_EXTRA_HEADERS ? mtproto_cors_http_headers : "");
       assert (len < 511);
       struct raw_message *m = calloc (sizeof (struct raw_message), 1);
+      if (!m) {
+        return -500;
+      }
       rwm_create (m, response_buffer, len);
       http_flush (c, m);
       return 0;
@@ -1443,6 +1457,10 @@ int hts_stats_execute (connection_job_t c, struct raw_message *msg, int op) {
   mtfront_prepare_stats(&sb);
 
   struct raw_message *raw = calloc (sizeof (*raw), 1);
+  if (!raw) {
+    sb_release (&sb);
+    return -500;
+  }
   rwm_init (raw, 0);
   write_basic_http_header_raw (c, raw, 200, 0, sb.pos, 0, "text/plain");
   assert (rwm_push_data (raw, sb.buff, sb.pos) == sb.pos);
@@ -2025,9 +2043,20 @@ int forward_tcp_query (struct tl_in_state *tlio_in, connection_job_t c, conn_tar
     if (flags & RPC_F_DROPPED) {
       // there was at least one dropped inbound packet on this connection, have to close it now instead of forwarding next queries
       fail_connection (c, -35);
+      job_decref (JOB_REF_PASS (d));
       return 0;
     }
     Ex = create_ext_connection (c, 0, d, auth_key_id);
+    if (!Ex) {
+      vkprintf (1, "failed to create ext connection mapping, dropping query\n");
+      target_route_note_failure (S);
+      dropped_queries++;
+      if (CONN_INFO(c)->type == &ct_tcp_rpc_ext_server_mtfront) {
+        __sync_fetch_and_or (&TCP_RPC_DATA(c)->flags, RPC_F_DROPPED);
+      }
+      job_decref (JOB_REF_PASS (d));
+      return 0;
+    }
   }
 
   tot_forwarded_queries++;
