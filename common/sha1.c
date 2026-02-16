@@ -36,19 +36,27 @@ void sha1_finish (sha1_context *ctx, unsigned char output[20]) {
   assert (olen == 20);
 }
 
-void sha1 (const unsigned char *input, int ilen, unsigned char output[20]) {
+int sha1 (const unsigned char *input, int ilen, unsigned char output[20]) {
   sha1_context *ctx = EVP_MD_CTX_new();
+  if (ctx == NULL) {
+    return -1;
+  }
   sha1_starts (ctx);
   sha1_update (ctx, input, ilen);
   sha1_finish (ctx, output);
   EVP_MD_CTX_free (ctx);
+  return 0;
 }
 
-void sha1_two_chunks (const unsigned char *input1, int ilen1, const unsigned char *input2, int ilen2, unsigned char output[20]) {
+int sha1_two_chunks (const unsigned char *input1, int ilen1, const unsigned char *input2, int ilen2, unsigned char output[20]) {
   sha1_context *ctx = EVP_MD_CTX_new();
+  if (ctx == NULL) {
+    return -1;
+  }
   sha1_starts (ctx);
   sha1_update (ctx, input1, ilen1);
   sha1_update (ctx, input2, ilen2);
   sha1_finish (ctx, output);
   EVP_MD_CTX_free (ctx);
+  return 0;
 }

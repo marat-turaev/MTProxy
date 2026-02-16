@@ -2606,7 +2606,11 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         if (ext_secret_cnt > 0) {
           memcpy (k, random_header + 8, 32);
           memcpy (k + 32, ext_secret[secret_id], 16);
-          sha256 (k, 48, key_data.read_key);
+          if (sha256 (k, 48, key_data.read_key) < 0) {
+            vkprintf (0, "sha256 failed while deriving read key\n");
+            connection_write_close (C);
+            return NEED_MORE_BYTES;
+          }
         } else {
           memcpy (key_data.read_key, random_header + 8, 32);
         }
@@ -2622,7 +2626,11 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
 
         if (ext_secret_cnt > 0) {
           memcpy (k, key_data.write_key, 32);
-          sha256 (k, 48, key_data.write_key);
+          if (sha256 (k, 48, key_data.write_key) < 0) {
+            vkprintf (0, "sha256 failed while deriving write key\n");
+            connection_write_close (C);
+            return NEED_MORE_BYTES;
+          }
         }
 
         aes_crypto_ctr128_init (C, &key_data, sizeof (key_data));

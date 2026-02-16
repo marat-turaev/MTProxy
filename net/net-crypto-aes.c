@@ -301,7 +301,10 @@ int aes_create_keys (struct aes_key_data *R, int am_client, const char nonce_ser
   }
 
   md5 (str + 1, str_len - 1, R->write_key);
-  sha1 (str, str_len, R->write_key + 12);
+  if (sha1 (str, str_len, R->write_key + 12) < 0) {
+    memset (str, 0, str_len);
+    return -1;
+  }
   md5 (str + 2, str_len - 2, R->write_iv);
 
   //memcpy (str + 42, !am_client ? "CLIENT" : "SERVER", 6);
@@ -313,7 +316,10 @@ int aes_create_keys (struct aes_key_data *R, int am_client, const char nonce_ser
   str[47] ^= 'T' ^ 'R';
 
   md5 (str + 1, str_len - 1, R->read_key);
-  sha1 (str, str_len, R->read_key + 12);
+  if (sha1 (str, str_len, R->read_key + 12) < 0) {
+    memset (str, 0, str_len);
+    return -1;
+  }
   md5 (str + 2, str_len - 2, R->read_iv);
 
   memset (str, 0, str_len);

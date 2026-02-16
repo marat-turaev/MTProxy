@@ -39,21 +39,29 @@ void sha256_finish (sha256_context *ctx, unsigned char output[32]) {
   assert (olen == 32);
 }
 
-void sha256 (const unsigned char *input, int ilen, unsigned char output[32]) {
+int sha256 (const unsigned char *input, int ilen, unsigned char output[32]) {
   sha256_context *ctx = EVP_MD_CTX_new();
+  if (ctx == NULL) {
+    return -1;
+  }
   sha256_starts (ctx);
   sha256_update (ctx, input, ilen);
   sha256_finish (ctx, output);
   EVP_MD_CTX_free (ctx);
+  return 0;
 }
 
-void sha256_two_chunks (const unsigned char *input1, int ilen1, const unsigned char *input2, int ilen2, unsigned char output[32]) {
+int sha256_two_chunks (const unsigned char *input1, int ilen1, const unsigned char *input2, int ilen2, unsigned char output[32]) {
   sha256_context *ctx = EVP_MD_CTX_new();
+  if (ctx == NULL) {
+    return -1;
+  }
   sha256_starts (ctx);
   sha256_update (ctx, input1, ilen1);
   sha256_update (ctx, input2, ilen2);
   sha256_finish (ctx, output);
   EVP_MD_CTX_free (ctx);
+  return 0;
 }
 
 int sha256_hmac (unsigned char *key, int keylen, unsigned char *input, int ilen, unsigned char output[32]) {
