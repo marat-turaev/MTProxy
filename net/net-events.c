@@ -367,10 +367,10 @@ int epoll_fetch_events (int timeout) {
   int fd, i;
   main_thread_interrupt_status = 1;
   if (epoll_sleep_ns > 0) {
-  struct timespec ts;
-  ts.tv_sec = 0;
-  ts.tv_nsec = epoll_sleep_ns;
-  nanosleep (&ts, NULL);
+    struct timespec ts;
+    ts.tv_sec = 0;
+    ts.tv_nsec = epoll_sleep_ns;
+    nanosleep (&ts, NULL);
   }
   int res = epoll_wait (epoll_fd, new_ev_list, MAX_EVENTS, timeout);
   main_thread_interrupt_status = 0;

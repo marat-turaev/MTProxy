@@ -1943,8 +1943,8 @@ static int tls_send_alert_and_close (connection_job_t C, unsigned char descripti
     mpq_push_w (SOCKET_CONN_INFO (S)->out_packet_queue, m, 0);
     job_signal (JOB_REF_CREATE_PASS (S), JS_RUN);
   } else {
-  mpq_push_w (c->out_queue, m, 0);
-  job_signal (JOB_REF_CREATE_PASS (C), JS_RUN);
+    mpq_push_w (c->out_queue, m, 0);
+    job_signal (JOB_REF_CREATE_PASS (C), JS_RUN);
   }
   connection_write_close (C);
   return NEED_MORE_BYTES;
@@ -2018,8 +2018,8 @@ static int http_send_301_and_close (connection_job_t C) {
     job_signal (JOB_REF_CREATE_PASS (S), JS_RUN);
   } else {
     // Should not normally happen for inbound connections, but keep a fallback.
-  mpq_push_w (c->out_queue, m, 0);
-  job_signal (JOB_REF_CREATE_PASS (C), JS_RUN);
+    mpq_push_w (c->out_queue, m, 0);
+    job_signal (JOB_REF_CREATE_PASS (C), JS_RUN);
   }
   connection_write_close (C);
   return NEED_MORE_BYTES;
@@ -2327,7 +2327,8 @@ int tcp_rpcs_ext_alarm (connection_job_t C) {
     // Do not proxy unknown timed-out connections to the -D domain.
     // If an operator wants website-like behavior, configure --fallback-backend.
     if (fallback_backend_enabled) {
-    return proxy_connection (C, default_domain_info);    }
+      return proxy_connection (C, default_domain_info);
+    }
 
     struct connection_info *c = CONN_INFO (C);
 
@@ -2346,7 +2347,7 @@ int tcp_rpcs_ext_alarm (connection_job_t C) {
             !memcmp (pfx, "CONN", 4) ||  // CONNECT
             !memcmp (pfx, "PRI ", 4)) {  // HTTP/2 preface
           return http_send_301_and_close (C);
-}
+        }
       }
     }
 
@@ -2791,7 +2792,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         if (jitter_ms > 0) {
           tls_schedule_delayed_run (C, jitter_ms);
         } else {
-        job_signal (JOB_REF_CREATE_PASS (C), JS_RUN);
+          job_signal (JOB_REF_CREATE_PASS (C), JS_RUN);
         }
 
         // Shape TCP segmentation of the first server flight for TLS transport.
