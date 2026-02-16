@@ -2137,9 +2137,16 @@ static int tls_reject_authenticated (connection_job_t C, unsigned char alert_des
 }
 
 static int tls_reject_or_fallback (connection_job_t C, unsigned char alert_description) {
-  // For TLS-looking inputs: either forward to local fallback HTTPS (if configured),
-  // or send a standard TLS alert and close (avoid proxying to the -D domain).
+  // For invalid TLS transport input: reject by default, or use fallback when enabled.
   if (fallback_backend_enabled) {
+    int blocked = 0;
+    int delay_ms = probe_note_failure (C, 1, &blocked);
+    if (blocked) {
+      return tls_schedule_blocked_reject (C, alert_description);
+    }
+    if (delay_ms > 0) {
+      return tls_schedule_delayed_alert (C, alert_description, delay_ms);
+    }
     return proxy_connection_fallback (C);
   }
   int blocked = 0;
@@ -2151,9 +2158,17 @@ static int tls_reject_or_fallback (connection_job_t C, unsigned char alert_descr
 }
 
 static int reject_or_fallback_close (connection_job_t C) {
-  // For non-TLS inputs on a TLS-only listener: forward to fallback backend if present,
-  // otherwise just close without sending protocol-specific bytes.
+  // For non-TLS input on a TLS-only listener: close/reject by default,
+  // with optional fallback routing when explicitly enabled.
   if (fallback_backend_enabled) {
+    int blocked = 0;
+    int delay_ms = probe_note_failure (C, 1, &blocked);
+    if (blocked) {
+      return tls_schedule_blocked_reject (C, 50 /* decode_error */);
+    }
+    if (delay_ms > 0) {
+      return tls_schedule_delayed_reject (C, delay_ms, 50 /* decode_error */);
+    }
     return proxy_connection_fallback (C);
   }
   __atomic_fetch_add (&tls_reject_non_tls, 1, __ATOMIC_RELAXED);
@@ -2324,9 +2339,16 @@ int tcp_rpcs_ext_alarm (connection_job_t C) {
     }
   }
   if (D->in_packet_num == -3 && default_domain_info != NULL) {
-    // Do not proxy unknown timed-out connections to the -D domain.
-    // If an operator wants website-like behavior, configure --fallback-backend.
+    // Timed-out undetermined connections route to fallback only when enabled.
     if (fallback_backend_enabled) {
+      int blocked = 0;
+      int delay_ms = probe_note_failure (C, 1, &blocked);
+      if (blocked) {
+        return tls_schedule_blocked_reject (C, 50 /* decode_error */);
+      }
+      if (delay_ms > 0) {
+        return tls_schedule_delayed_reject (C, delay_ms, 50 /* decode_error */);
+      }
       return proxy_connection (C, default_domain_info);
     }
 
