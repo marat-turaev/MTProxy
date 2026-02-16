@@ -2021,6 +2021,10 @@ static int tls_schedule_delayed_alert (connection_job_t C, unsigned char alert_d
   if (D->extra_int2 != TLS_DELAY_ACTION_NONE) {
     return NEED_MORE_BYTES;
   }
+  if (D->in_packet_num == -3) {
+    // Once we decided to reject this connection, it is no longer "undetermined".
+    undetermined_conn_leave (C);
+  }
   if (delay_ms <= 0) {
     return tls_send_alert_and_close (C, alert_description);
   }
@@ -2035,6 +2039,10 @@ static int tls_schedule_delayed_close (connection_job_t C, int delay_ms) {
   struct tcp_rpc_data *D = TCP_RPC_DATA (C);
   if (D->extra_int2 != TLS_DELAY_ACTION_NONE) {
     return NEED_MORE_BYTES;
+  }
+  if (D->in_packet_num == -3) {
+    // Once we decided to reject this connection, it is no longer "undetermined".
+    undetermined_conn_leave (C);
   }
   if (delay_ms <= 0) {
     connection_write_close (C);
