@@ -2261,7 +2261,12 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
           return tls_send_alert_and_close (C, 10 /* unexpected_message */);
         }
 
-        min_len = 11 + 256 * header[9] + header[10];
+        int tls_packet_len = 256 * header[9] + header[10];
+        if (tls_packet_len < 64 || tls_packet_len > 16384) {
+          vkprintf (1, "error while parsing packet: unreasonable first TLS packet length: %d\n", tls_packet_len);
+          return tls_send_alert_and_close (C, 50 /* decode_error */);
+        }
+        min_len = 11 + tls_packet_len;
         if (len < min_len) {
           vkprintf (2, "Need %d bytes, but have only %d\n", min_len, len);
           return NEED_MORE_BYTES;
@@ -2269,7 +2274,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
 
         assert (rwm_skip_data (&c->in, 11) == 11);
         len -= 11;
-        c->left_tls_packet_length = 256 * header[9] + header[10]; // store left length of current TLS packet in extra_int3
+        c->left_tls_packet_length = tls_packet_len; // store left length of current TLS packet in extra_int3
         vkprintf (2, "Receive first TLS packet of length %d\n", c->left_tls_packet_length);
 
         // Enable a small amount of post-handshake TCP packetization variation for this TLS connection.
@@ -2288,10 +2293,6 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
           }
         }
 
-        if (c->left_tls_packet_length < 64) {
-          vkprintf (1, "error while parsing packet: too short first TLS packet: %d\n", c->left_tls_packet_length);
-          return tls_send_alert_and_close (C, 50 /* decode_error */);
-        }
         // now len >= c->left_tls_packet_length >= 64
 
         assert (rwm_fetch_lookup (&c->in, &packet_len, 4) == 4);
@@ -2306,12 +2307,17 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
           // Not TLS-looking input on a TLS-only listener: treat as non-TLS (HTTP redirect or close).
           return reject_or_fallback_close (C);
         }
-        min_len = 5 + 256 * header[3] + header[4];
+        enum { MAX_CLIENT_HELLO_READ = 4096 };
+        int client_hello_len = 256 * header[3] + header[4];
+        if (client_hello_len < 64 || client_hello_len > MAX_CLIENT_HELLO_READ - 5) {
+          vkprintf (1, "unreasonable ClientHello length: %d\n", client_hello_len);
+          return tls_reject_or_fallback (C, 50 /* decode_error */);
+        }
+        min_len = 5 + client_hello_len;
         if (len < min_len) {
           return NEED_MORE_BYTES;
         }
 
-        enum { MAX_CLIENT_HELLO_READ = 4096 };
         int read_len = len <= MAX_CLIENT_HELLO_READ ? len : MAX_CLIENT_HELLO_READ;
         unsigned char client_hello[MAX_CLIENT_HELLO_READ + 1];
         assert (rwm_fetch_lookup (&c->in, client_hello, read_len) == read_len);
