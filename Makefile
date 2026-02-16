@@ -25,14 +25,18 @@ endif
 LTO_CFLAGS =
 LTO_LDFLAGS =
 GC_SECTIONS_LDFLAGS =
+HARDEN_CFLAGS =
+HARDEN_LDFLAGS =
 ifeq ($(HOST_OS),Linux)
 LTO_CFLAGS += -flto=auto
 LTO_LDFLAGS += -flto=auto
 GC_SECTIONS_LDFLAGS += -Wl,--gc-sections
+HARDEN_CFLAGS += -fstack-protector-strong -D_FORTIFY_SOURCE=2
+HARDEN_LDFLAGS += -pie -Wl,-z,relro,-z,now
 endif
 
-CFLAGS = $(ARCH) -O3 -std=gnu11 -Wall -Wno-array-bounds -march=native -ffunction-sections -fdata-sections $(SIMD_CFLAGS) $(LTO_CFLAGS) -fno-strict-aliasing -fno-strict-overflow -fwrapv -DAES=1 -DCOMMIT=\"${COMMIT}\" -D_GNU_SOURCE=1 -D_FILE_OFFSET_BITS=64
-LDFLAGS = $(ARCH) -ggdb $(LTO_LDFLAGS) $(GC_SECTIONS_LDFLAGS) -lm -lrt -lcrypto -lz -lpthread
+CFLAGS = $(ARCH) -O3 -std=gnu11 -Wall -Wno-array-bounds -march=native -ffunction-sections -fdata-sections $(SIMD_CFLAGS) $(LTO_CFLAGS) $(HARDEN_CFLAGS) -fno-strict-aliasing -fno-strict-overflow -fwrapv -DAES=1 -DCOMMIT=\"${COMMIT}\" -D_GNU_SOURCE=1 -D_FILE_OFFSET_BITS=64
+LDFLAGS = $(ARCH) -ggdb $(LTO_LDFLAGS) $(GC_SECTIONS_LDFLAGS) $(HARDEN_LDFLAGS) -lm -lrt -lcrypto -lz -lpthread
 
 LIB = ${OBJ}/lib
 CINCLUDE = -iquote common -iquote .
