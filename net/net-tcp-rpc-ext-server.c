@@ -2432,7 +2432,10 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         }
         int response_size = server_hello_rec_len + 6 + 5 + encrypted_payload_size;
         unsigned char *buffer = malloc (32 + response_size);
-        assert (buffer != NULL);
+        if (buffer == NULL) {
+          vkprintf (0, "failed to allocate TLS response buffer of %d bytes\n", 32 + response_size);
+          return tls_send_alert_and_close (C, 80 /* internal_error */);
+        }
         memcpy (buffer, client_random, 32);
         unsigned char *response_buffer = buffer + 32;
         if (info->server_hello_template && info->server_hello_template_len > 0) {
