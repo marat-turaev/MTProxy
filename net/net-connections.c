@@ -53,6 +53,7 @@
 #include "kprintf.h"
 #include "precise-time.h"
 #include "server-functions.h"
+#include "engine/engine.h"
 #include "net/net-connections.h"
 #include "net/net-config.h"
 #include "vv/vv-io.h"
@@ -281,6 +282,25 @@ static inline int tcp_prepare_iovec_limited (struct iovec *iov, int *iovcnt, int
     *iovcnt = t;
     return bytes;
   }
+}
+
+static inline int tls_shape_single_thread_fastpath (void) {
+  return engine_check_multithread_disabled ();
+}
+
+static inline int tls_shape_load_i32 (const int *p, int memory_order, int fastpath) {
+  if (fastpath) {
+    return *p;
+  }
+  return __atomic_load_n (p, memory_order);
+}
+
+static inline void tls_shape_store_i32 (int *p, int value, int memory_order, int fastpath) {
+  if (fastpath) {
+    *p = value;
+    return;
+  }
+  __atomic_store_n (p, value, memory_order);
 }
 
 void assert_main_thread (void) {}
@@ -1006,6 +1026,7 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
   int t = 0;
 
   int stop = c->flags & C_STOPWRITE;
+  const int tls_fastpath = tls_shape_single_thread_fastpath ();
 
   while ((c->flags & (C_WANTWR | C_NOWR | C_ERROR | C_NET_FAILED)) == C_WANTWR) {
     if (!out->total_bytes) {
@@ -1018,10 +1039,10 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
     connection_job_t CC = c->conn;
     struct connection_info *ci = CC ? CONN_INFO (CC) : NULL;
     if (ci && (ci->flags & C_IS_TLS)) {
-      int left = __atomic_load_n (&ci->tls_write_jitter_left, __ATOMIC_RELAXED);
+      int left = tls_shape_load_i32 (&ci->tls_write_jitter_left, __ATOMIC_RELAXED, tls_fastpath);
       if (left > 0 && !job_timer_active (C)) {
         int ms = 1 + (lrand48_j () % 12); // 1..12ms
-        __atomic_store_n (&ci->tls_write_jitter_left, left - 1, __ATOMIC_RELAXED);
+        tls_shape_store_i32 (&ci->tls_write_jitter_left, left - 1, __ATOMIC_RELAXED, tls_fastpath);
         __sync_fetch_and_or (&c->flags, C_NOWR);
         job_timer_insert (C, precise_now + 0.001 * ms);
         return out->total_bytes;
@@ -1032,9 +1053,9 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
     // to give the connection a chance to coalesce bursts into a single TCP write.
     // This is probabilistic and should not affect steady-state throughput.
     if (ci && (ci->flags & C_IS_TLS) && !job_timer_active (C)) {
-      int shape_left = __atomic_load_n (&ci->tls_write_shaping_left, __ATOMIC_RELAXED);
+      int shape_left = tls_shape_load_i32 (&ci->tls_write_shaping_left, __ATOMIC_RELAXED, tls_fastpath);
       if (shape_left <= 0 && out->total_bytes > 0 && out->total_bytes < 1200 &&
-          __atomic_load_n (&ci->tls_out_records_sent, __ATOMIC_RELAXED) > 3) {
+          tls_shape_load_i32 (&ci->tls_out_records_sent, __ATOMIC_RELAXED, tls_fastpath) > 3) {
         unsigned int r = (unsigned int) lrand48_j ();
         if ((r & 15) == 0) { // ~1/16
           int ms = 1 + ((r >> 4) & 3); // 1..4ms
@@ -1051,25 +1072,25 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
     // TCP segmentation shaping for TLS server flight: limit writev() chunk sizes for the first bytes.
     // This keeps TLS record structure intact while changing packetization.
     int write_limit = out->total_bytes;
-    int tls_shape_left = ci ? __atomic_load_n (&ci->tls_write_shaping_left, __ATOMIC_ACQUIRE) : 0;
+    int tls_shape_left = 0;
     int tls_shape_chunk_left = 0;
     int tls_shape_active = 0;
     int tls_noise_left = 0;
     int tls_noise_chunk_left = 0;
     int tls_noise_active = 0;
 
-    if (ci && tls_shape_left > 0) {
+    if (ci && (tls_shape_left = tls_shape_load_i32 (&ci->tls_write_shaping_left, __ATOMIC_ACQUIRE, tls_fastpath)) > 0) {
       tls_shape_active = 1;
-      tls_shape_chunk_left = __atomic_load_n (&ci->tls_write_shaping_chunk_left, __ATOMIC_RELAXED);
+      tls_shape_chunk_left = tls_shape_load_i32 (&ci->tls_write_shaping_chunk_left, __ATOMIC_RELAXED, tls_fastpath);
       if (tls_shape_chunk_left <= 0) {
           int chunk = 0;
 
           // If a domain-shaped plan was installed for this connection, follow it first.
-          int plan_pos = __atomic_load_n (&ci->tls_write_shaping_plan_pos, __ATOMIC_RELAXED);
-          int plan_len = __atomic_load_n (&ci->tls_write_shaping_plan_len, __ATOMIC_RELAXED);
+          int plan_pos = tls_shape_load_i32 (&ci->tls_write_shaping_plan_pos, __ATOMIC_RELAXED, tls_fastpath);
+          int plan_len = tls_shape_load_i32 (&ci->tls_write_shaping_plan_len, __ATOMIC_RELAXED, tls_fastpath);
           if (plan_pos < plan_len) {
             chunk = ci->tls_write_shaping_plan[plan_pos];
-            __atomic_store_n (&ci->tls_write_shaping_plan_pos, plan_pos + 1, __ATOMIC_RELAXED);
+            tls_shape_store_i32 (&ci->tls_write_shaping_plan_pos, plan_pos + 1, __ATOMIC_RELAXED, tls_fastpath);
           } else {
             // Otherwise, pick a chunk size close to MSS but slightly jittered.
             chunk = 1200 + (lrand48_j () % 241); // 1200..1440
@@ -1078,7 +1099,7 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
           if (chunk < 256) { chunk = 256; }
           if (chunk > tls_shape_left) { chunk = tls_shape_left; }
           tls_shape_chunk_left = chunk;
-          __atomic_store_n (&ci->tls_write_shaping_chunk_left, tls_shape_chunk_left, __ATOMIC_RELAXED);
+          tls_shape_store_i32 (&ci->tls_write_shaping_chunk_left, tls_shape_chunk_left, __ATOMIC_RELAXED, tls_fastpath);
       }
       if (tls_shape_chunk_left > 0 && tls_shape_chunk_left < write_limit) {
         write_limit = tls_shape_chunk_left;
@@ -1089,7 +1110,7 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
       //
       // We also re-arm small variation windows occasionally to avoid a stable pattern
       // of "only the beginning is packetized oddly".
-      tls_noise_left = __atomic_load_n (&ci->tls_write_noise_left, __ATOMIC_RELAXED);
+      tls_noise_left = tls_shape_load_i32 (&ci->tls_write_noise_left, __ATOMIC_RELAXED, tls_fastpath);
       if (tls_noise_left <= 0) {
         // Low-probability re-arm when we have enough pending bytes to make it meaningful.
         // Out is a socket-level buffer (already encrypted for TLS transport here).
@@ -1097,28 +1118,28 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
           unsigned int r = (unsigned int) lrand48_j ();
           if ((r & 511) == 0) { // ~1/512
             int budget = 1024 + (int)((r >> 9) % 4097); // 1024..5120 bytes
-          __atomic_store_n (&ci->tls_write_noise_left, budget, __ATOMIC_RELAXED);
-          __atomic_store_n (&ci->tls_write_noise_chunk_left, 0, __ATOMIC_RELAXED);
-          tls_noise_left = budget;
+            tls_shape_store_i32 (&ci->tls_write_noise_left, budget, __ATOMIC_RELAXED, tls_fastpath);
+            tls_shape_store_i32 (&ci->tls_write_noise_chunk_left, 0, __ATOMIC_RELAXED, tls_fastpath);
+            tls_noise_left = budget;
+          }
         }
-      }
       }
 
       // Similarly, re-arm a tiny amount of timing jitter occasionally later in the connection,
       // to avoid a stable pattern of "only the first writes were jittered".
-      if (__atomic_load_n (&ci->tls_write_jitter_left, __ATOMIC_RELAXED) <= 0) {
+      if (tls_shape_load_i32 (&ci->tls_write_jitter_left, __ATOMIC_RELAXED, tls_fastpath) <= 0) {
         if (out->total_bytes >= 4096 &&
-            __atomic_load_n (&ci->tls_out_records_sent, __ATOMIC_RELAXED) > 32) {
+            tls_shape_load_i32 (&ci->tls_out_records_sent, __ATOMIC_RELAXED, tls_fastpath) > 32) {
           unsigned int r = (unsigned int) lrand48_j ();
           if ((r & 2047) == 0) { // ~1/2048
-            __atomic_store_n (&ci->tls_write_jitter_left, 1 + ((r >> 11) & 1), __ATOMIC_RELAXED); // 1..2 delays
+            tls_shape_store_i32 (&ci->tls_write_jitter_left, 1 + ((r >> 11) & 1), __ATOMIC_RELAXED, tls_fastpath); // 1..2 delays
+          }
         }
-      }
       }
 
       if (tls_noise_left > 0) {
         tls_noise_active = 1;
-        tls_noise_chunk_left = __atomic_load_n (&ci->tls_write_noise_chunk_left, __ATOMIC_RELAXED);
+        tls_noise_chunk_left = tls_shape_load_i32 (&ci->tls_write_noise_chunk_left, __ATOMIC_RELAXED, tls_fastpath);
         if (tls_noise_chunk_left <= 0) {
           unsigned int r = (unsigned int) lrand48_j ();
           int chunk = 1100 + (int)(r % 401); // 1100..1500 (near MSS)
@@ -1129,7 +1150,7 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
           if (chunk < 256) { chunk = 256; }
           if (chunk > tls_noise_left) { chunk = tls_noise_left; }
           tls_noise_chunk_left = chunk;
-          __atomic_store_n (&ci->tls_write_noise_chunk_left, tls_noise_chunk_left, __ATOMIC_RELAXED);
+          tls_shape_store_i32 (&ci->tls_write_noise_chunk_left, tls_noise_chunk_left, __ATOMIC_RELAXED, tls_fastpath);
         }
         if (tls_noise_chunk_left > 0 && tls_noise_chunk_left < write_limit) {
           write_limit = tls_noise_chunk_left;
@@ -1179,29 +1200,29 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
       if (ci && tls_shape_active) {
         int new_left = tls_shape_left - r;
         if (new_left <= 0) {
-          __atomic_store_n (&ci->tls_write_shaping_left, 0, __ATOMIC_RELEASE);
-          __atomic_store_n (&ci->tls_write_shaping_chunk_left, 0, __ATOMIC_RELAXED);
-          __atomic_store_n (&ci->tls_write_shaping_plan_len, 0, __ATOMIC_RELAXED);
-          __atomic_store_n (&ci->tls_write_shaping_plan_pos, 0, __ATOMIC_RELAXED);
+          tls_shape_store_i32 (&ci->tls_write_shaping_left, 0, __ATOMIC_RELEASE, tls_fastpath);
+          tls_shape_store_i32 (&ci->tls_write_shaping_chunk_left, 0, __ATOMIC_RELAXED, tls_fastpath);
+          tls_shape_store_i32 (&ci->tls_write_shaping_plan_len, 0, __ATOMIC_RELAXED, tls_fastpath);
+          tls_shape_store_i32 (&ci->tls_write_shaping_plan_pos, 0, __ATOMIC_RELAXED, tls_fastpath);
         } else {
-          __atomic_store_n (&ci->tls_write_shaping_left, new_left, __ATOMIC_RELAXED);
+          tls_shape_store_i32 (&ci->tls_write_shaping_left, new_left, __ATOMIC_RELAXED, tls_fastpath);
           int new_chunk_left = tls_shape_chunk_left - r;
           if (new_chunk_left < 0) { new_chunk_left = 0; }
-          __atomic_store_n (&ci->tls_write_shaping_chunk_left, new_chunk_left, __ATOMIC_RELAXED);
+          tls_shape_store_i32 (&ci->tls_write_shaping_chunk_left, new_chunk_left, __ATOMIC_RELAXED, tls_fastpath);
         }
       }
       if (ci && tls_noise_active) {
-          int new_left = tls_noise_left - r;
-          if (new_left <= 0) {
-            __atomic_store_n (&ci->tls_write_noise_left, 0, __ATOMIC_RELAXED);
-            __atomic_store_n (&ci->tls_write_noise_chunk_left, 0, __ATOMIC_RELAXED);
-          } else {
-            __atomic_store_n (&ci->tls_write_noise_left, new_left, __ATOMIC_RELAXED);
+        int new_left = tls_noise_left - r;
+        if (new_left <= 0) {
+          tls_shape_store_i32 (&ci->tls_write_noise_left, 0, __ATOMIC_RELAXED, tls_fastpath);
+          tls_shape_store_i32 (&ci->tls_write_noise_chunk_left, 0, __ATOMIC_RELAXED, tls_fastpath);
+        } else {
+          tls_shape_store_i32 (&ci->tls_write_noise_left, new_left, __ATOMIC_RELAXED, tls_fastpath);
           int new_chunk_left = tls_noise_chunk_left - r;
-            if (new_chunk_left < 0) { new_chunk_left = 0; }
-            __atomic_store_n (&ci->tls_write_noise_chunk_left, new_chunk_left, __ATOMIC_RELAXED);
-          }
+          if (new_chunk_left < 0) { new_chunk_left = 0; }
+          tls_shape_store_i32 (&ci->tls_write_noise_chunk_left, new_chunk_left, __ATOMIC_RELAXED, tls_fastpath);
         }
+      }
       if (c->type->data_sent) {
         c->type->data_sent (C, r);
       }
