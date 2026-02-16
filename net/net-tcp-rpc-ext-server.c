@@ -188,6 +188,10 @@ static unsigned long long tls_handshake_fail_replay;
 static unsigned long long tls_delayed_reject_alert;
 static unsigned long long tls_delayed_reject_close;
 static unsigned long long tls_reject_non_tls;
+static unsigned long long tls_replay_cache_entries;
+static unsigned long long tls_replay_cache_evictions;
+static unsigned long long tls_probe_table_ip_used;
+static unsigned long long tls_probe_table_net_used;
 
 #ifndef MT_TLS_PROBE_TABLE_BITS
 #define MT_TLS_PROBE_TABLE_BITS 13
@@ -504,6 +508,10 @@ int tcp_rpc_proxy_domains_prepare_stat (stats_buffer_t *sb) {
   sb_printf (sb, "tls_probe_throttle_delay_ms_sum\t%llu\n", __atomic_load_n (&probe_stat_delay_ms_sum, __ATOMIC_RELAXED));
   sb_printf (sb, "tls_probe_table_size\t%u\n", (unsigned)PROBE_TABLE_SIZE);
   sb_printf (sb, "tls_probe_table_bits\t%d\n", (int)MT_TLS_PROBE_TABLE_BITS);
+  sb_printf (sb, "tls_probe_table_ip_used\t%llu\n", __atomic_load_n (&tls_probe_table_ip_used, __ATOMIC_RELAXED));
+  sb_printf (sb, "tls_probe_table_net_used\t%llu\n", __atomic_load_n (&tls_probe_table_net_used, __ATOMIC_RELAXED));
+  sb_printf (sb, "tls_replay_cache_entries\t%llu\n", __atomic_load_n (&tls_replay_cache_entries, __ATOMIC_RELAXED));
+  sb_printf (sb, "tls_replay_cache_evictions\t%llu\n", __atomic_load_n (&tls_replay_cache_evictions, __ATOMIC_RELAXED));
   sb_printf (sb, "tls_dos_undetermined_conns_limit\t%d\n", (int)MAX_UNDETERMINED_CONNS);
   sb_printf (sb, "tls_dos_undetermined_conns_global_limit\t%d\n", (int)MAX_UNDETERMINED_CONNS_GLOBAL);
   sb_printf (sb, "tls_dos_undetermined_conns_global_now\t%d\n", (int)__atomic_load_n (&undetermined_conn_count_global, __ATOMIC_RELAXED));
@@ -1631,6 +1639,7 @@ static int add_client_random (unsigned char random[16]) {
   *bucket = entry;
 
   client_random_count++;
+  __atomic_fetch_add (&tls_replay_cache_entries, 1, __ATOMIC_RELAXED);
   trim_client_randoms_limit ();
   return 0;
 }
@@ -1659,6 +1668,8 @@ static void delete_client_random_head (void) {
     free (entry);
   if (client_random_count > 0) {
     client_random_count--;
+    __atomic_fetch_sub (&tls_replay_cache_entries, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add (&tls_replay_cache_evictions, 1, __ATOMIC_RELAXED);
   }
 }
 
@@ -1799,6 +1810,7 @@ static struct probe_entry *probe_get_entry_tbl (struct probe_entry *tbl, const s
     struct probe_entry *e = &tbl[(idx + i) & (PROBE_TABLE_SIZE - 1)];
     if (!e->last_time) {
       probe_set_key (e, c);
+      __atomic_fetch_add (&tls_probe_table_ip_used, 1, __ATOMIC_RELAXED);
       return e;
     }
     if (probe_match (e, c)) {
@@ -1841,6 +1853,7 @@ static struct probe_entry *probe_get_entry_net (const struct connection_info *c)
     struct probe_entry *e = &probe_net_table[(idx + i) & (PROBE_TABLE_SIZE - 1)];
     if (!e->last_time) {
       probe_set_key_key (e, ip4, ip6, is_ipv6);
+      __atomic_fetch_add (&tls_probe_table_net_used, 1, __ATOMIC_RELAXED);
       return e;
     }
     if (probe_match_key (e, ip4, ip6, is_ipv6)) {
