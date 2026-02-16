@@ -182,6 +182,14 @@ static unsigned long long dos_stat_undetermined_bytes_closed;
 static unsigned long long dos_stat_undetermined_global_conns_closed;
 static unsigned long long dos_stat_undetermined_global_bytes_closed;
 
+#ifndef MT_TLS_PROBE_TABLE_BITS
+#define MT_TLS_PROBE_TABLE_BITS 13
+#endif
+#if MT_TLS_PROBE_TABLE_BITS < 8 || MT_TLS_PROBE_TABLE_BITS > 20
+#error "MT_TLS_PROBE_TABLE_BITS must be in range [8, 20]"
+#endif
+#define PROBE_TABLE_SIZE (1u << MT_TLS_PROBE_TABLE_BITS)
+
 static void probe_stat_note (int blocked, int delay_ms) {
   __atomic_fetch_add (&probe_stat_calls, 1, __ATOMIC_RELAXED);
   if (blocked) {
@@ -1513,13 +1521,6 @@ static int is_allowed_timestamp (int timestamp) {
 
 // Per-thread invalid-traffic throttling (cheap, lock-free, best-effort).
 // This aims to make repeated invalid TLS handshakes expensive without affecting real clients.
-#ifndef MT_TLS_PROBE_TABLE_BITS
-#define MT_TLS_PROBE_TABLE_BITS 13
-#endif
-#if MT_TLS_PROBE_TABLE_BITS < 8 || MT_TLS_PROBE_TABLE_BITS > 20
-#error "MT_TLS_PROBE_TABLE_BITS must be in range [8, 20]"
-#endif
-#define PROBE_TABLE_SIZE (1u << MT_TLS_PROBE_TABLE_BITS)
 struct probe_entry {
   unsigned ip4;
   unsigned char ip6[16];
