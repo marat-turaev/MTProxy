@@ -181,6 +181,13 @@ static unsigned long long dos_stat_undetermined_conns_closed;
 static unsigned long long dos_stat_undetermined_bytes_closed;
 static unsigned long long dos_stat_undetermined_global_conns_closed;
 static unsigned long long dos_stat_undetermined_global_bytes_closed;
+static unsigned long long tls_handshake_success;
+static unsigned long long tls_handshake_fail_hmac;
+static unsigned long long tls_handshake_fail_timestamp;
+static unsigned long long tls_handshake_fail_replay;
+static unsigned long long tls_delayed_reject_alert;
+static unsigned long long tls_delayed_reject_close;
+static unsigned long long tls_reject_non_tls;
 
 #ifndef MT_TLS_PROBE_TABLE_BITS
 #define MT_TLS_PROBE_TABLE_BITS 13
@@ -203,7 +210,7 @@ static void probe_stat_note (int blocked, int delay_ms) {
 }
 
 // Limit concurrent "undetermined" connections (D->in_packet_num == -3) per worker thread.
-// This reduces cheap socket-hold DoS attempts (slowloris/automated clients) on busy deployments.
+// This reduces idle socket pressure from connections that do not complete transport selection.
 #define MAX_UNDETERMINED_CONNS 1024
 static __thread int undetermined_conn_count;
 static volatile int undetermined_conn_count_global;
@@ -507,6 +514,13 @@ int tcp_rpc_proxy_domains_prepare_stat (stats_buffer_t *sb) {
   sb_printf (sb, "tls_dos_undetermined_global_conns_closed\t%llu\n", __atomic_load_n (&dos_stat_undetermined_global_conns_closed, __ATOMIC_RELAXED));
   sb_printf (sb, "tls_dos_undetermined_bytes_closed\t%llu\n", __atomic_load_n (&dos_stat_undetermined_bytes_closed, __ATOMIC_RELAXED));
   sb_printf (sb, "tls_dos_undetermined_global_bytes_closed\t%llu\n", __atomic_load_n (&dos_stat_undetermined_global_bytes_closed, __ATOMIC_RELAXED));
+  sb_printf (sb, "tls_handshake_success\t%llu\n", __atomic_load_n (&tls_handshake_success, __ATOMIC_RELAXED));
+  sb_printf (sb, "tls_handshake_fail_hmac\t%llu\n", __atomic_load_n (&tls_handshake_fail_hmac, __ATOMIC_RELAXED));
+  sb_printf (sb, "tls_handshake_fail_timestamp\t%llu\n", __atomic_load_n (&tls_handshake_fail_timestamp, __ATOMIC_RELAXED));
+  sb_printf (sb, "tls_handshake_fail_replay\t%llu\n", __atomic_load_n (&tls_handshake_fail_replay, __ATOMIC_RELAXED));
+  sb_printf (sb, "tls_delayed_reject_alert\t%llu\n", __atomic_load_n (&tls_delayed_reject_alert, __ATOMIC_RELAXED));
+  sb_printf (sb, "tls_delayed_reject_close\t%llu\n", __atomic_load_n (&tls_delayed_reject_close, __ATOMIC_RELAXED));
+  sb_printf (sb, "tls_reject_non_tls\t%llu\n", __atomic_load_n (&tls_reject_non_tls, __ATOMIC_RELAXED));
 
   int idx = 0;
   int i;
@@ -639,8 +653,7 @@ static int generate_public_key_slow_bn (unsigned char key[32]) {
 }
 
 static int generate_public_key (unsigned char key[32]) {
-  // Generate a valid-looking X25519 keyshare for TLS 1.3.
-  // This is only used for compatibility (synthetic TLS); it is not used for any real key agreement.
+  // Generate an X25519 public key for the ServerHello key_share extension.
   EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_id (EVP_PKEY_X25519, NULL);
   EVP_PKEY *pkey = NULL;
   size_t len = 32;
@@ -658,7 +671,7 @@ static int generate_public_key (unsigned char key[32]) {
   EVP_PKEY_free (pkey);
   EVP_PKEY_CTX_free (pctx);
 
-  // Fallback for unusual OpenSSL builds: keep old slow generator.
+  // Fallback for unusual OpenSSL builds.
   return generate_public_key_slow_bn (key);
 }
 
@@ -1881,8 +1894,7 @@ static int probe_entry_note_failure (struct probe_entry *e, int weight, int *blo
     return 0;
   }
   if (e->score <= 6) {
-    // Keep low-score failures mostly cheap, but occasionally add a tiny delay
-    // so active probes don't see a perfectly sharp "zero-delay" threshold.
+    // Keep low-score failures mostly cheap, with occasional small delay.
     unsigned int r = (unsigned int) lrand48_j ();
     if ((r & 3) != 0) { // ~75% immediate close
       return 0;
@@ -1916,8 +1928,7 @@ static int probe_note_failure (connection_job_t C, int weight, int *blocked) {
 }
 
 static int tls_send_alert_and_close (connection_job_t C, unsigned char description) {
-  // Send a minimal TLS alert record and then close the connection gracefully.
-  // This makes failures look more like a normal HTTPS endpoint to generic clients.
+  // Send a minimal TLS alert record and then close the connection.
   static const unsigned char alert_tpl[7] = {0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28}; // fatal handshake_failure
   unsigned char alert[7];
   memcpy (alert, alert_tpl, sizeof (alert));
@@ -1940,8 +1951,8 @@ static int tls_send_alert_and_close (connection_job_t C, unsigned char descripti
 }
 
 static int http_send_301_and_close (connection_job_t C) {
-  // Plain HTTP request on a TLS-only port is common for automated clients. Reply with a simple redirect
-  // to the configured default -D domain to look more like a regular HTTPS endpoint.
+  // For plain HTTP on a TLS-only port, reply with a simple redirect
+  // to the configured default -D domain.
   struct connection_info *c = CONN_INFO (C);
 
   const char *host = (default_domain_info && default_domain_info->domain) ? default_domain_info->domain : "example.com";
@@ -2044,6 +2055,7 @@ static int tls_schedule_delayed_alert (connection_job_t C, unsigned char alert_d
   if (delay_ms <= 0) {
     return tls_send_alert_and_close (C, alert_description);
   }
+  __atomic_fetch_add (&tls_delayed_reject_alert, 1, __ATOMIC_RELAXED);
   D->extra_int2 = TLS_DELAY_ACTION_ALERT;
   D->extra_int3 = (int)alert_description;
   stop_reading_temporarily (C);
@@ -2064,6 +2076,7 @@ static int tls_schedule_delayed_close (connection_job_t C, int delay_ms) {
     connection_write_close (C);
     return NEED_MORE_BYTES;
   }
+  __atomic_fetch_add (&tls_delayed_reject_close, 1, __ATOMIC_RELAXED);
   D->extra_int2 = TLS_DELAY_ACTION_CLOSE;
   D->extra_int3 = 0;
   stop_reading_temporarily (C);
@@ -2095,7 +2108,7 @@ static int tls_schedule_delayed_reject (connection_job_t C, int delay_ms, unsign
 }
 
 static int tls_schedule_blocked_reject (connection_job_t C, unsigned char alert_description) {
-  // Keep blocked-probe rejects cheap, but avoid perfectly deterministic zero-delay closes.
+  // Keep blocked rejects cheap, but avoid perfectly deterministic zero-delay closes.
   int delay_ms = 1 + ((unsigned int) lrand48_j () % 6); // 1..6ms
   return tls_schedule_delayed_reject (C, delay_ms, alert_description);
 }
@@ -2118,8 +2131,8 @@ static int tls_schedule_delayed_run (connection_job_t C, int delay_ms) {
 }
 
 static int tls_reject_authenticated (connection_job_t C, unsigned char alert_description) {
-  // HMAC-matched failures (replay/stale timestamp/internal) are not probing attempts.
-  // Reject with a normal TLS alert, but do not update probe-throttle state.
+  // HMAC-matched failures (replay/stale timestamp/internal) use direct reject path
+  // and do not update reject-rate state.
   return tls_schedule_delayed_alert (C, alert_description, 0);
 }
 
@@ -2143,6 +2156,7 @@ static int reject_or_fallback_close (connection_job_t C) {
   if (fallback_backend_enabled) {
     return proxy_connection_fallback (C);
   }
+  __atomic_fetch_add (&tls_reject_non_tls, 1, __ATOMIC_RELAXED);
 
   // If this looks like plain HTTP, reply with a redirect instead of a silent close.
   {
@@ -2310,9 +2324,8 @@ int tcp_rpcs_ext_alarm (connection_job_t C) {
     }
   }
   if (D->in_packet_num == -3 && default_domain_info != NULL) {
-    // Upstream behavior was to proxy unknown connections to the -D domain after the initial timeout.
-    // That makes the proxy usable as a weird forwarder and leaks cover-domain behavior to unexpected clients.
-    // If an operator really wants a "real site" behavior, they should configure --fallback-backend.
+    // Do not proxy unknown timed-out connections to the -D domain.
+    // If an operator wants website-like behavior, configure --fallback-backend.
     if (fallback_backend_enabled) {
     return proxy_connection (C, default_domain_info);    }
 
@@ -2356,7 +2369,7 @@ int tcp_rpcs_ext_alarm (connection_job_t C) {
 
 int tcp_rpcs_ext_init_accepted (connection_job_t C) {
   // Timeout while the connection type is still undetermined (before we see enough bytes).
-  // Keep it short to reduce slowloris/automated socket hold times.
+  // Keep it short to reduce idle accepted-connection hold time.
   job_timer_insert (C, precise_now + 3);
   int r = tcp_rpcs_init_accepted_nohs (C);
   undetermined_conn_enter (C);
@@ -2488,7 +2501,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
       }
 #endif
 
-      // fake tls
+      // TLS-transport path
       if (c->flags & C_IS_TLS) {
         if (len < 11) {
           return NEED_MORE_BYTES;
@@ -2499,7 +2512,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         assert (rwm_fetch_lookup (&c->in, header, 11) == 11);
         if (memcmp (header, "\x14\x03\x03\x00\x01\x01\x17\x03\x03", 9) != 0) {
           vkprintf (1, "error while parsing packet: bad client dummy ChangeCipherSpec\n");
-          // Don't abort with a hard error (too distinctive). Reply like a normal TLS endpoint.
+          // Reply with a TLS alert and close.
           return tls_send_alert_and_close (C, 10 /* unexpected_message */);
         }
 
@@ -2546,7 +2559,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         unsigned char header[5];
         assert (rwm_fetch_lookup (&c->in, header, 5) == 5);
         if (header[0] != 0x16 || header[1] != 0x03 || header[2] < 0x01 || header[2] > 0x03) {
-          // Not TLS-looking input on a TLS-only listener: treat as non-TLS (HTTP redirect or close).
+          // Input is not TLS on a TLS-only listener: use non-TLS handling (HTTP redirect or close).
           return reject_or_fallback_close (C);
         }
         enum { MAX_CLIENT_HELLO_READ = 4096 };
@@ -2602,17 +2615,19 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
           }
         }
         if (secret_id == ext_secret_cnt) {
+          __atomic_fetch_add (&tls_handshake_fail_hmac, 1, __ATOMIC_RELAXED);
           vkprintf (1, "Receive request with unmatched client random\n");
           return tls_reject_or_fallback (C, 40 /* handshake_failure */);
         }
         int timestamp = *(int *)(expected_random + 28) ^ *(int *)(client_random + 28);
         if (!is_allowed_timestamp (timestamp)) {
+          __atomic_fetch_add (&tls_handshake_fail_timestamp, 1, __ATOMIC_RELAXED);
           return tls_reject_authenticated (C, 40 /* handshake_failure */);
         }
 
-        // Track replay only for authenticated attempts: unauthenticated probes
-        // should not consume replay-cache entries or eviction budget.
+        // Track replay only for authenticated attempts.
         if (have_client_random (client_random)) {
+          __atomic_fetch_add (&tls_handshake_fail_replay, 1, __ATOMIC_RELAXED);
           vkprintf (1, "Receive again request with the same client random\n");
           return tls_reject_authenticated (C, 40 /* handshake_failure */);
         }
@@ -2641,12 +2656,12 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
 
         assert (rwm_skip_data (&c->in, len) == len);
         c->flags |= C_IS_TLS;
+        __atomic_fetch_add (&tls_handshake_success, 1, __ATOMIC_RELAXED);
         c->left_tls_packet_length = -1;
 
         // TLS-transport clients expect exactly one ApplicationData record in the server flight.
         // Emitting multiple records here makes some clients disconnect immediately.
-        // However, to better mimic real servers that may use multiple encrypted records, we can fold the
-        // total wire size of the "encrypted" part into a single record payload (same total bytes, fewer records).
+        // Keep a single record while preserving total encrypted-flight size.
         int records_real = get_profile_server_hello_encrypted_records (info, profile);
         int encrypted_sizes[3] = {0, 0, 0};
         int ri;
@@ -2766,8 +2781,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         struct raw_message *m = rwm_alloc_raw_message ();
         rwm_create (m, response_buffer, response_size);
         mpq_push_w (c->out_queue, m, 0);
-        // Add tiny jitter before sending the first server flight. This makes timing patterns
-        // less rigid for generic clients, without blocking a worker thread.
+        // Add a small delay for a subset of connections before sending the first server flight.
         // (Most connections send immediately; a minority are delayed by a few ms.)
         int jitter_ms = 0;
         unsigned int jitter_r = (unsigned int) lrand48_j ();
@@ -2783,11 +2797,10 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         // Shape TCP segmentation of the first server flight for TLS transport.
         // This does not change bytes on the wire, only how many bytes we attempt to write per syscall.
         //
-        // To better resemble the chosen -D domain, we use the measured TLS ApplicationData record sizes
-        // and split the first flight into TCP chunks matching the domain's typical record boundaries:
+        // Use measured startup record sizes and split the first flight into matching TCP chunks:
         //   [Handshake+CCS+AppData(0)] [AppData(1)] [AppData(2)]
-        // Even though we emit only one TLS ApplicationData record for client compatibility, chunking
-        // still makes packet sizes closer to a real server for classifiers that rely on packet lengths.
+        // Even though we emit one TLS ApplicationData record for client compatibility,
+        // chunking still follows the startup profile layout.
         int plan_len = 0;
         if (records_real > 1 && encrypted_wire_total - 5 <= 16384) {
           int chunk0 = server_hello_rec_len + 6 + 5 + encrypted_sizes[0]; // handshake + CCS + (hdr+payload of first AppData)
@@ -2979,8 +2992,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
       }
 
       if (ext_secret_cnt > 0) {
-        // Previously we entered "global skip mode" (skip a huge amount of bytes without parsing).
-        // That keeps the socket open and is easy to abuse for resource holding / easy identification.
+        // Close promptly on invalid 64-byte headers.
         vkprintf (1, "invalid \"random\" 64-byte header, closing\n");
         int blocked = 0;
         int delay_ms = probe_note_failure (C, 2, &blocked);

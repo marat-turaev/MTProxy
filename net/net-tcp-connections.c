@@ -242,8 +242,7 @@ int cpu_tcp_aes_crypto_ctr128_encrypt_output (connection_job_t C) /* {{{ */ {
     int len = c->out.total_bytes;
     if (c->flags & C_IS_TLS) {
       assert (c->left_tls_packet_length >= 0);
-      // TLS transport historically used a fixed max record size (~1425).
-      // Keep record sizes variable for the whole connection (not only during the first few records).
+      // Keep record sizes variable for the whole connection.
       //
       // Cap sizes at the maximum TLS record fragment size (16KB) to keep buffering bounded;
       // TCP packetization shaping is handled elsewhere (socket writer shaping).
@@ -266,8 +265,7 @@ int cpu_tcp_aes_crypto_ctr128_encrypt_output (connection_job_t C) /* {{{ */ {
         unsigned int r = (unsigned int) lrand48_j ();
         int bucket = r & 255;
         if (max_len >= 8192) {
-          // If we have lots of buffered plaintext, behave more like a typical TLS stack:
-          // mostly large records (but not always), to avoid "always MSS-ish" signatures.
+          // If we have lots of buffered plaintext, bias towards larger records.
           if (bucket >= 160 && bucket < 208) {  // ~18.75%
             bucket = 200; // map into "small" range [192..239]
           } else if (bucket < 208) {

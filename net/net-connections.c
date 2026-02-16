@@ -1128,7 +1128,7 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
       }
     }
 
-    // TLS transport: occasionally delay very small writes for a couple of milliseconds
+    // Occasionally delay very small writes for a couple of milliseconds
     // to give the connection a chance to coalesce bursts into a single TCP write.
     // This is probabilistic and should not affect steady-state throughput.
     if (ci && (ci->flags & C_IS_TLS) && !job_timer_active (C)) {
@@ -1187,8 +1187,7 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
       // Post-handshake write variation for TLS transport: shape TCP chunk sizes for a small amount of bytes.
       // This is separate from TLS record sizing and can split records across packets.
       //
-      // We also re-arm small variation windows occasionally to avoid a stable pattern
-      // of "only the beginning is packetized oddly".
+      // Re-arm small variation windows occasionally later in the connection.
       tls_noise_left = tls_shape_load_i32 (&ci->tls_write_noise_left, __ATOMIC_RELAXED, tls_fastpath);
       if (tls_noise_left <= 0) {
         // Low-probability re-arm when we have enough pending bytes to make it meaningful.
@@ -1204,8 +1203,7 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
         }
       }
 
-      // Similarly, re-arm a tiny amount of timing jitter occasionally later in the connection,
-      // to avoid a stable pattern of "only the first writes were jittered".
+      // Re-arm a small amount of timing jitter occasionally later in the connection.
       if (tls_shape_load_i32 (&ci->tls_write_jitter_left, __ATOMIC_RELAXED, tls_fastpath) <= 0) {
         if (out->total_bytes >= 4096 &&
             tls_shape_load_i32 (&ci->tls_out_records_sent, __ATOMIC_RELAXED, tls_fastpath) > 32) {

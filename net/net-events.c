@@ -585,8 +585,8 @@ int server_socket (int port, struct in_addr in_addr, int backlog, int mode) {
     // setsockopt (socket_fd, SOL_SOCKET, SO_LINGER, &ling, sizeof (ling));
     setsockopt (socket_fd, IPPROTO_TCP, TCP_NODELAY, &flags, sizeof (flags));
 
-    // Linux-only: don't wake userspace/accept until data arrives.
-    // Helps reduce connect-hold/slowloris style scanning.
+    // Linux-only: defer accept wakeups until payload arrives.
+    // Reduces idle accepted sockets under connect-only traffic.
 #ifdef TCP_DEFER_ACCEPT
     {
       int defer_s = 3;
