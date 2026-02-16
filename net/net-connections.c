@@ -220,6 +220,9 @@ static int tcp_recv_buffers_num;
 static int tcp_recv_buffers_total_size;
 static struct iovec tcp_recv_iovec[MAX_TCP_RECV_BUFFERS + 1];
 static struct msg_buffer *tcp_recv_buffers[MAX_TCP_RECV_BUFFERS];
+#ifdef __linux__
+static int tcp_recvmmsg_supported = 1;
+#endif
 
 int prealloc_tcp_buffers (void) /* {{{ */ {
   assert (!tcp_recv_buffers_num);   
@@ -281,6 +284,63 @@ static inline int tcp_prepare_iovec_limited (struct iovec *iov, int *iovcnt, int
   } else {
     *iovcnt = t;
     return bytes;
+  }
+}
+
+static inline int tcp_rotate_recv_buffers (int used) {
+  int i;
+  for (i = 0; i < used; i++) {
+    struct msg_buffer *X = alloc_msg_buffer (tcp_recv_buffers[i], TCP_RECV_BUFFER_SIZE);
+    if (!X) {
+      vkprintf (0, "**FATAL**: cannot allocate tcp receive buffer\n");
+      assert (0);
+    }
+    tcp_recv_buffers[i] = X;
+    tcp_recv_iovec[i + 1].iov_base = X->data;
+    tcp_recv_iovec[i + 1].iov_len = X->chunk->buffer_size;
+  }
+  return used;
+}
+
+static inline void tcp_append_recv_to_batch (struct raw_message *batch, int used, const int *recv_lens) {
+  struct msg_part *first_mp = NULL;
+  struct msg_part *last_mp = NULL;
+  int total_bytes = 0;
+
+  int i;
+  for (i = 0; i < used; i++) {
+    int l = recv_lens[i];
+    if (l <= 0) {
+      continue;
+    }
+    struct msg_part *mp = new_msg_part (0, tcp_recv_buffers[i]);
+    mp->offset = 0;
+    mp->data_end = l;
+    if (!first_mp) {
+      first_mp = last_mp = mp;
+    } else {
+      last_mp->next = mp;
+      last_mp = mp;
+    }
+    total_bytes += l;
+  }
+
+  if (!first_mp) {
+    return;
+  }
+
+  if (!batch->first) {
+    batch->first = first_mp;
+    batch->last = last_mp;
+    batch->first_offset = 0;
+    batch->last_offset = last_mp->data_end;
+    batch->total_bytes = total_bytes;
+    batch->magic = RM_INIT_MAGIC;
+  } else {
+    batch->last->next = first_mp;
+    batch->last = last_mp;
+    batch->last_offset = last_mp->data_end;
+    batch->total_bytes += total_bytes;
   }
 }
 
@@ -889,7 +949,7 @@ int net_server_socket_reader (socket_connection_job_t C) /* {{{ */ {
   assert_net_net_thread ();
   struct socket_connection_info *c = SOCKET_CONN_INFO (C);
 
-  // Batch multiple readv() results into fewer queue nodes to reduce cross-thread churn.
+  // Batch socket reads into fewer queue nodes to reduce cross-thread churn.
   struct raw_message *batch = NULL;
   const int BATCH_LIMIT = 65536;
 
@@ -901,11 +961,81 @@ int net_server_socket_reader (socket_connection_job_t C) /* {{{ */ {
     int s = tcp_recv_buffers_total_size;
     assert (s > 0);
 
-    int p = 1;
+    int recv_lens[MAX_TCP_RECV_BUFFERS];
+    int used = 0;
+    int r = -1;
+    int syscall_done = 0;
 
-    __sync_fetch_and_or (&c->flags, C_NORD);
-    int r = readv (c->fd, tcp_recv_iovec + p, MAX_TCP_RECV_BUFFERS + 1 - p);
-    MODULE_STAT->tcp_readv_calls ++;
+#ifdef __linux__
+    if (tcp_recvmmsg_supported) {
+      // For stream sockets, recvmmsg() can reduce syscall count by reading several chunks at once.
+      enum { TCP_RECVMMSG_BATCH = 8 };
+      struct mmsghdr msgs[TCP_RECVMMSG_BATCH];
+      struct iovec msg_iov[TCP_RECVMMSG_BATCH];
+      int vlen = TCP_RECVMMSG_BATCH;
+      if (vlen > MAX_TCP_RECV_BUFFERS) {
+        vlen = MAX_TCP_RECV_BUFFERS;
+      }
+      memset (msgs, 0, sizeof (msgs));
+      int i;
+      for (i = 0; i < vlen; i++) {
+        msg_iov[i].iov_base = tcp_recv_iovec[i + 1].iov_base;
+        msg_iov[i].iov_len = tcp_recv_iovec[i + 1].iov_len;
+        msgs[i].msg_hdr.msg_iov = &msg_iov[i];
+        msgs[i].msg_hdr.msg_iovlen = 1;
+      }
+
+      __sync_fetch_and_or (&c->flags, C_NORD);
+      int mr = recvmmsg (c->fd, msgs, vlen, MSG_DONTWAIT, NULL);
+      MODULE_STAT->tcp_readv_calls ++;
+      if (mr > 0) {
+        __sync_fetch_and_and (&c->flags, ~C_NORD);
+        r = 0;
+        for (i = 0; i < mr && used < MAX_TCP_RECV_BUFFERS; i++) {
+          int l = (int)msgs[i].msg_len;
+          if (l <= 0) {
+            continue;
+          }
+          recv_lens[used++] = l;
+          r += l;
+        }
+        syscall_done = 1;
+      } else if (mr < 0 && errno == EINTR) {
+        __sync_fetch_and_and (&c->flags, ~C_NORD);
+        MODULE_STAT->tcp_readv_intr ++;
+        continue;
+      } else if (mr < 0 && (errno == ENOSYS || errno == EINVAL)) {
+        __sync_fetch_and_and (&c->flags, ~C_NORD);
+        tcp_recvmmsg_supported = 0;
+      } else {
+        r = mr;
+        syscall_done = 1;
+      }
+    }
+#endif
+
+    if (!syscall_done) {
+      int p = 1;
+      __sync_fetch_and_or (&c->flags, C_NORD);
+      r = readv (c->fd, tcp_recv_iovec + p, MAX_TCP_RECV_BUFFERS + 1 - p);
+      MODULE_STAT->tcp_readv_calls ++;
+
+      if (r > 0) {
+        __sync_fetch_and_and (&c->flags, ~C_NORD);
+        int rs = r;
+        while (rs > 0 && used < MAX_TCP_RECV_BUFFERS) {
+          int l = rs > (int)tcp_recv_iovec[p].iov_len ? (int)tcp_recv_iovec[p].iov_len : rs;
+          recv_lens[used++] = l;
+          rs -= l;
+          p++;
+        }
+        assert (!rs);
+      } else if (r < 0 && errno == EINTR) {
+        __sync_fetch_and_and (&c->flags, ~C_NORD);
+        MODULE_STAT->tcp_readv_intr ++;
+        continue;
+      }
+    }
 
     if (r <= 0) {
       if (r < 0 && errno == EAGAIN) {
@@ -919,14 +1049,14 @@ int net_server_socket_reader (socket_connection_job_t C) /* {{{ */ {
         __sync_fetch_and_or (&c->flags, C_NET_FAILED);
         return 0;
       }
-    } else {
+    } else if (!syscall_done || used > 0) {
       __sync_fetch_and_and (&c->flags, ~C_NORD);
     }
       
     if (verbosity > 0 && r < 0 && errno != EAGAIN) {
       perror ("recv()");
     }
-    vkprintf (2, "readv from %d: %d read out of %d\n", c->fd, r, s);
+    vkprintf (2, "recv from %d: %d read out of %d\n", c->fd, r, s);
 
     if (r <= 0) {
       break;
@@ -938,69 +1068,18 @@ int net_server_socket_reader (socket_connection_job_t C) /* {{{ */ {
     }
 
     MODULE_STAT->tcp_readv_bytes += r;
-    const int bytes_read = r;
-    struct msg_part *mp = 0;
-    struct msg_part *first_mp = NULL;
-    struct msg_part *last_mp = NULL;
-    int total_bytes = 0;
-    assert (p == 1);
-    mp = new_msg_part (0, tcp_recv_buffers[p - 1]);
-    assert (tcp_recv_buffers[p - 1]->data == tcp_recv_iovec[p].iov_base);
-    mp->offset = 0;
-    mp->data_end = r > (int)tcp_recv_iovec[p].iov_len ? (int)tcp_recv_iovec[p].iov_len : r;
-    r -= mp->data_end;
-    first_mp = last_mp = mp;
-    total_bytes = mp->data_end;
-    p ++;
+    assert (used > 0);
 
-    int rs = r;
-    while (rs > 0) {
-      mp = new_msg_part (0, tcp_recv_buffers[p - 1]);
-      mp->offset = 0;
-      mp->data_end = rs > (int)tcp_recv_iovec[p].iov_len ? (int)tcp_recv_iovec[p].iov_len : rs;
-      rs -= mp->data_end;
-      last_mp->next = mp;
-      last_mp = mp;
-      total_bytes += mp->data_end;
-      p ++;
-    }
-    assert (!rs);
-    assert (total_bytes == bytes_read);
-
-    int i;
-    for (i = 0; i < p - 1; i++) {
-      struct msg_buffer *X = alloc_msg_buffer (tcp_recv_buffers[i], TCP_RECV_BUFFER_SIZE);
-      if (!X) {
-        vkprintf (0, "**FATAL**: cannot allocate tcp receive buffer\n");
-        assert (0);
-      }
-      tcp_recv_buffers[i] = X;
-      tcp_recv_iovec[i + 1].iov_base = X->data;
-      tcp_recv_iovec[i + 1].iov_len = X->chunk->buffer_size;
-    }
+    tcp_append_recv_to_batch (batch, used, recv_lens);
+    tcp_rotate_recv_buffers (used);
 
     assert (c->conn);
 
-    // Append to batch.
-    if (!batch->first) {
-      batch->first = first_mp;
-      batch->last = last_mp;
-      batch->first_offset = 0;
-      batch->last_offset = last_mp->data_end;
-      batch->total_bytes = total_bytes;
-      batch->magic = RM_INIT_MAGIC;
-    } else {
-      batch->last->next = first_mp;
-      batch->last = last_mp;
-      batch->last_offset = last_mp->data_end;
-      batch->total_bytes += total_bytes;
-    }
-
     if (batch->total_bytes >= BATCH_LIMIT) {
       mpq_push_w (CONN_INFO(c->conn)->in_queue, batch, 0);
-    job_signal (JOB_REF_CREATE_PASS (c->conn), JS_RUN);
+      job_signal (JOB_REF_CREATE_PASS (c->conn), JS_RUN);
       batch = NULL;
-  }
+    }
   }
 
   if (batch) {
