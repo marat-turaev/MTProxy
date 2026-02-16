@@ -405,6 +405,75 @@ static int get_domain_server_hello_encrypted_size_n (const struct domain_info *i
   }
 }
 
+static int get_profile_server_hello_encrypted_records (const struct domain_info *info, const struct domain_profile *profile) {
+  if (profile != NULL) {
+    int n = profile->encrypted_records;
+    return (n >= 1 && n <= 3) ? n : 1;
+  }
+  return get_domain_server_hello_encrypted_records (info);
+}
+
+static int get_profile_server_hello_encrypted_size_n (const struct domain_info *info, const struct domain_profile *profile, int idx) {
+  if (profile != NULL) {
+    if (idx < 0 || idx > 2) {
+      return 0;
+    }
+    return profile->encrypted_size[idx];
+  }
+  return get_domain_server_hello_encrypted_size_n (info, idx);
+}
+
+static int jitter_profile_encrypted_size (const struct domain_info *info, const struct domain_profile *profile, int idx, int base) {
+  if (base <= 1 || idx < 0 || idx > 2) {
+    return base;
+  }
+
+  int minv = base;
+  int maxv = base;
+  if (info && info->profiles_num > 1) {
+    int i;
+    for (i = 0; i < info->profiles_num; i++) {
+      const struct domain_profile *p = &info->profiles[i];
+      if (p == profile) {
+        continue;
+      }
+      if (p->encrypted_records <= idx) {
+        continue;
+      }
+      int v = p->encrypted_size[idx];
+      if (v <= 0) {
+        continue;
+      }
+      if (v < minv) { minv = v; }
+      if (v > maxv) { maxv = v; }
+    }
+  }
+
+  int spread = maxv - minv;
+  int rel = base >> 6; // ~1.5% of baseline
+  int max_delta = spread / 2;
+  if (rel > max_delta) {
+    max_delta = rel;
+  }
+  if (max_delta > 96) {
+    max_delta = 96;
+  }
+  if (max_delta > base - 1) {
+    max_delta = base - 1;
+  }
+  if (max_delta <= 0) {
+    return base;
+  }
+
+  unsigned int r = (unsigned int) lrand48_j ();
+  int delta = (int)(r % (unsigned int)(2 * max_delta + 1)) - max_delta;
+  int out = base + delta;
+  if (out < 1) {
+    out = 1;
+  }
+  return out;
+}
+
 int tcp_rpc_proxy_domains_prepare_stat (stats_buffer_t *sb) {
   sb_printf (sb, ">>>>>>tls_transport>>>>>>\tstart\n");
   sb_printf (sb, "tls_transport_only\t%d\n", allow_only_tls ? 1 : 0);
@@ -2536,6 +2605,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
           return tls_reject_or_fallback (C, 40 /* handshake_failure */);
         }
         unsigned char cipher_suite_id = client_hello[pos + 1];
+        const struct domain_profile *profile = choose_domain_profile (info);
 
         assert (rwm_skip_data (&c->in, len) == len);
         c->flags |= C_IS_TLS;
@@ -2545,15 +2615,17 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         // Emitting multiple records here makes some clients disconnect immediately.
         // However, to better mimic real servers that may use multiple encrypted records, we can fold the
         // total wire size of the "encrypted" part into a single record payload (same total bytes, fewer records).
-        int records_real = get_domain_server_hello_encrypted_records (info);
+        int records_real = get_profile_server_hello_encrypted_records (info, profile);
         int encrypted_sizes[3] = {0, 0, 0};
         int ri;
         int encrypted_wire_total = 0; // includes per-record 5-byte TLS record headers
         for (ri = 0; ri < records_real; ri++) {
-          encrypted_sizes[ri] = get_domain_server_hello_encrypted_size_n (info, ri);
-          if (encrypted_sizes[ri] <= 0) {
-            encrypted_sizes[ri] = 1;
+          int sz = get_profile_server_hello_encrypted_size_n (info, profile, ri);
+          if (sz <= 0) {
+            sz = 1;
           }
+          sz = jitter_profile_encrypted_size (info, profile, ri, sz);
+          encrypted_sizes[ri] = sz;
           encrypted_wire_total += 5 + encrypted_sizes[ri];
         }
         // single ApplicationData record payload length; preserve total bytes on wire:
@@ -2568,7 +2640,9 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         }
 
         int server_hello_rec_len = 127;
-        if (info->server_hello_template && info->server_hello_template_len > 0) {
+        if (profile && profile->server_hello_template && profile->server_hello_template_len > 0) {
+          server_hello_rec_len = profile->server_hello_template_len;
+        } else if (info->server_hello_template && info->server_hello_template_len > 0) {
           server_hello_rec_len = info->server_hello_template_len;
         }
         int response_size = server_hello_rec_len + 6 + 5 + encrypted_payload_size;
@@ -2579,28 +2653,28 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         }
         memcpy (buffer, client_random, 32);
         unsigned char *response_buffer = buffer + 32;
-        if (info->server_hello_template && info->server_hello_template_len > 0) {
-          memcpy (response_buffer, info->server_hello_template, (size_t)info->server_hello_template_len);
+        if (profile && profile->server_hello_template && profile->server_hello_template_len > 0) {
+          memcpy (response_buffer, profile->server_hello_template, (size_t)profile->server_hello_template_len);
           // Zero server_random before computing our HMAC-based server_random.
-          if (info->server_hello_template_len >= 11 + 32) {
+          if (profile->server_hello_template_len >= 11 + 32) {
             memset (response_buffer + 11, 0, 32);
           }
           // Always mirror the client's session_id (expected by some clients).
-          if (info->server_hello_template_len >= 44 + 32) {
+          if (profile->server_hello_template_len >= 44 + 32) {
             response_buffer[43] = '\x20';
             memcpy (response_buffer + 44, client_hello + 44, 32);
           }
           // Chosen cipher suite: keep compatible with the client's offered list.
-          if (info->server_hello_template_len >= 78) {
+          if (profile->server_hello_template_len >= 78) {
             response_buffer[76] = 0x13;
             response_buffer[77] = cipher_suite_id;
           }
           // Patch keyshare public key to fresh random.
-          if (info->server_hello_keyshare_offset >= 0 &&
-              info->server_hello_keyshare_offset + 32 <= info->server_hello_template_len) {
-            generate_public_key (response_buffer + info->server_hello_keyshare_offset);
+          if (profile->server_hello_keyshare_offset >= 0 &&
+              profile->server_hello_keyshare_offset + 32 <= profile->server_hello_template_len) {
+            generate_public_key (response_buffer + profile->server_hello_keyshare_offset);
           }
-          pos = info->server_hello_template_len;
+          pos = profile->server_hello_template_len;
         } else {
         memcpy (response_buffer, "\x16\x03\x03\x00\x7a\x02\x00\x00\x76\x03\x03", 11);
         memset (response_buffer + 11, '\0', 32);
@@ -2611,7 +2685,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
 
         pos = 81;
         int tls_server_extensions[3] = {0x33, 0x2b, -1};
-        if (info->is_reversed_extension_order) {
+        if ((profile && profile->is_reversed_extension_order) || (!profile && info->is_reversed_extension_order)) {
           int t = tls_server_extensions[0];
           tls_server_extensions[0] = tls_server_extensions[1];
           tls_server_extensions[1] = t;
