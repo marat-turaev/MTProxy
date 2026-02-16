@@ -190,6 +190,9 @@ static unsigned long long tls_delayed_reject_close;
 static unsigned long long tls_reject_non_tls;
 static unsigned long long tls_replay_cache_entries;
 static unsigned long long tls_replay_cache_evictions;
+static unsigned long long tls_replay_cache_checks;
+static unsigned long long tls_replay_cache_hits;
+static unsigned long long tls_replay_cache_additions;
 static unsigned long long tls_probe_table_ip_used;
 static unsigned long long tls_probe_table_net_used;
 
@@ -512,6 +515,12 @@ int tcp_rpc_proxy_domains_prepare_stat (stats_buffer_t *sb) {
   sb_printf (sb, "tls_probe_table_net_used\t%llu\n", __atomic_load_n (&tls_probe_table_net_used, __ATOMIC_RELAXED));
   sb_printf (sb, "tls_replay_cache_entries\t%llu\n", __atomic_load_n (&tls_replay_cache_entries, __ATOMIC_RELAXED));
   sb_printf (sb, "tls_replay_cache_evictions\t%llu\n", __atomic_load_n (&tls_replay_cache_evictions, __ATOMIC_RELAXED));
+  unsigned long long replay_checks = __atomic_load_n (&tls_replay_cache_checks, __ATOMIC_RELAXED);
+  unsigned long long replay_hits = __atomic_load_n (&tls_replay_cache_hits, __ATOMIC_RELAXED);
+  sb_printf (sb, "tls_replay_cache_checks\t%llu\n", replay_checks);
+  sb_printf (sb, "tls_replay_cache_hits\t%llu\n", replay_hits);
+  sb_printf (sb, "tls_replay_cache_additions\t%llu\n", __atomic_load_n (&tls_replay_cache_additions, __ATOMIC_RELAXED));
+  sb_printf (sb, "tls_replay_cache_hit_rate_ppm\t%llu\n", replay_checks ? (replay_hits * 1000000ULL) / replay_checks : 0ULL);
   sb_printf (sb, "tls_dos_undetermined_conns_limit\t%d\n", (int)MAX_UNDETERMINED_CONNS);
   sb_printf (sb, "tls_dos_undetermined_conns_global_limit\t%d\n", (int)MAX_UNDETERMINED_CONNS_GLOBAL);
   sb_printf (sb, "tls_dos_undetermined_conns_global_now\t%d\n", (int)__atomic_load_n (&undetermined_conn_count_global, __ATOMIC_RELAXED));
@@ -1605,9 +1614,11 @@ static struct client_random **get_client_random_bucket (unsigned char random[16]
 }
 
 static int have_client_random (unsigned char random[16]) {
+  __atomic_fetch_add (&tls_replay_cache_checks, 1, __ATOMIC_RELAXED);
   struct client_random *cur = *get_client_random_bucket (random);
   while (cur != NULL) {
     if (memcmp (random, cur->random, 16) == 0) {
+      __atomic_fetch_add (&tls_replay_cache_hits, 1, __ATOMIC_RELAXED);
       return 1;
     }
     cur = cur->next_by_hash;
@@ -1640,6 +1651,7 @@ static int add_client_random (unsigned char random[16]) {
 
   client_random_count++;
   __atomic_fetch_add (&tls_replay_cache_entries, 1, __ATOMIC_RELAXED);
+  __atomic_fetch_add (&tls_replay_cache_additions, 1, __ATOMIC_RELAXED);
   trim_client_randoms_limit ();
   return 0;
 }
