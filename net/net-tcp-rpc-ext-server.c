@@ -2070,6 +2070,12 @@ static int tls_schedule_delayed_reject (connection_job_t C, int delay_ms, unsign
   return tls_schedule_delayed_close (C, delay_ms);
 }
 
+static int tls_schedule_blocked_reject (connection_job_t C, unsigned char alert_description) {
+  // Keep blocked-probe rejects cheap, but avoid perfectly deterministic zero-delay closes.
+  int delay_ms = 1 + ((unsigned int) lrand48_j () % 6); // 1..6ms
+  return tls_schedule_delayed_reject (C, delay_ms, alert_description);
+}
+
 static int tls_schedule_delayed_run (connection_job_t C, int delay_ms) {
   struct tcp_rpc_data *D = TCP_RPC_DATA (C);
   if (D->extra_int2 != TLS_DELAY_ACTION_NONE) {
@@ -2096,8 +2102,7 @@ static int tls_reject_or_fallback (connection_job_t C, unsigned char alert_descr
   int blocked = 0;
   int delay_ms = probe_note_failure (C, 1, &blocked);
   if (blocked) {
-    connection_write_close (C);
-    return NEED_MORE_BYTES;
+    return tls_schedule_blocked_reject (C, alert_description);
   }
   return tls_schedule_delayed_alert (C, alert_description, delay_ms);
 }
@@ -2134,8 +2139,7 @@ static int reject_or_fallback_close (connection_job_t C) {
   int blocked = 0;
   int delay_ms = probe_note_failure (C, 1, &blocked);
   if (blocked) {
-  connection_write_close (C);
-  return NEED_MORE_BYTES;
+    return tls_schedule_blocked_reject (C, 50 /* decode_error */);
   }
   return tls_schedule_delayed_reject (C, delay_ms, 50 /* decode_error */);
 }
@@ -2387,8 +2391,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         int blocked = 0;
         int delay_ms = probe_note_failure (C, 2, &blocked);
         if (blocked) {
-          connection_write_close (C);
-          return NEED_MORE_BYTES;
+          return tls_schedule_blocked_reject (C, 50 /* decode_error */);
         }
         return tls_schedule_delayed_reject (C, delay_ms, 50 /* decode_error */);
       }
@@ -2401,8 +2404,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
       int blocked = 0;
       int delay_ms = probe_note_failure (C, 2, &blocked);
       if (blocked) {
-        connection_write_close (C);
-        return NEED_MORE_BYTES;
+        return tls_schedule_blocked_reject (C, 50 /* decode_error */);
       }
       return tls_schedule_delayed_reject (C, delay_ms, 50 /* decode_error */);
     }
@@ -2952,9 +2954,8 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         int blocked = 0;
         int delay_ms = probe_note_failure (C, 2, &blocked);
         if (blocked) {
-        connection_write_close (C);
-        return NEED_MORE_BYTES;
-      }
+          return tls_schedule_blocked_reject (C, 50 /* decode_error */);
+        }
         return tls_schedule_delayed_reject (C, delay_ms, 50 /* decode_error */);
       }
 
@@ -2972,8 +2973,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
       int blocked = 0;
       int delay_ms = probe_note_failure (C, 2, &blocked);
       if (blocked) {
-      connection_write_close (C);
-      return NEED_MORE_BYTES;
+        return tls_schedule_blocked_reject (C, 50 /* decode_error */);
       }
       return tls_schedule_delayed_reject (C, delay_ms, 50 /* decode_error */);
 #endif
