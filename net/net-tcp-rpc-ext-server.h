@@ -55,6 +55,11 @@ void tcp_rpc_set_client_handshake_timeout (int timeout_seconds);
 void tcp_rpc_set_replay_cache_max_entries (int limit);
 void tcp_rpc_set_replay_cache_max_age (int seconds);
 void tcp_rpc_set_replay_cache_max_bytes (unsigned long long bytes_limit);
+void tcp_rpc_set_undetermined_conns_limit (int limit);
+void tcp_rpc_set_undetermined_conns_global_limit (int limit);
+void tcp_rpc_set_undetermined_buffer_bytes_limit (int limit);
+void tcp_rpc_set_undetermined_bytes_global_limit (long long limit);
+void tcp_rpc_set_undetermined_conns_per_ip_limit (int limit);
 void tcp_rpc_secret_note_data_received (connection_job_t C, int bytes_received);
 void tcp_rpc_secret_note_data_sent (connection_job_t C, int bytes_sent);
 

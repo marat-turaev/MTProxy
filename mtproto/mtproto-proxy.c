@@ -2625,6 +2625,58 @@ int f_parse_option (int val) {
     tcp_rpc_set_replay_cache_max_bytes (x);
     break;
   }
+  case 2013: {
+    int x = atoi (optarg);
+    if (x < 1 || x > 1000000) {
+      kprintf ("'--undetermined-conns-limit' must be in range [1, 1000000], got '%s'\n", optarg);
+      usage ();
+      return 2;
+    }
+    tcp_rpc_set_undetermined_conns_limit (x);
+    break;
+  }
+  case 2014: {
+    int x = atoi (optarg);
+    if (x < 1 || x > 10000000) {
+      kprintf ("'--undetermined-conns-global-limit' must be in range [1, 10000000], got '%s'\n", optarg);
+      usage ();
+      return 2;
+    }
+    tcp_rpc_set_undetermined_conns_global_limit (x);
+    break;
+  }
+  case 2015: {
+    int x = atoi (optarg);
+    if (x < 256 || x > (1 << 20)) {
+      kprintf ("'--undetermined-buffer-bytes-limit' must be in range [256, 1048576], got '%s'\n", optarg);
+      usage ();
+      return 2;
+    }
+    tcp_rpc_set_undetermined_buffer_bytes_limit (x);
+    break;
+  }
+  case 2016: {
+    char *end = 0;
+    errno = 0;
+    long long x = strtoll (optarg, &end, 10);
+    if (optarg[0] == '-' || errno || !end || *end || x < (1 << 20) || x > (1LL << 36)) {
+      kprintf ("'--undetermined-bytes-global-limit' must be in range [1048576, 68719476736], got '%s'\n", optarg);
+      usage ();
+      return 2;
+    }
+    tcp_rpc_set_undetermined_bytes_global_limit (x);
+    break;
+  }
+  case 2017: {
+    int x = atoi (optarg);
+    if (x < 0 || x > 65535) {
+      kprintf ("'--undetermined-conns-per-ip-limit' must be in range [0, 65535], got '%s'\n", optarg);
+      usage ();
+      return 2;
+    }
+    tcp_rpc_set_undetermined_conns_per_ip_limit (x);
+    break;
+  }
   default:
     return -1;
   }
@@ -2644,6 +2696,11 @@ void mtfront_prepare_parse_options (void) {
   parse_option ("replay-cache-max-entries", required_argument, 0, 2010, "hard cap for replay cache entries");
   parse_option ("replay-cache-max-age", required_argument, 0, 2011, "hard cap for replay cache entry age in seconds");
   parse_option ("replay-cache-max-bytes", required_argument, 0, 2012, "optional replay cache memory budget in bytes (0 disables)");
+  parse_option ("undetermined-conns-limit", required_argument, 0, 2013, "max undetermined connections per worker");
+  parse_option ("undetermined-conns-global-limit", required_argument, 0, 2014, "max undetermined connections across process");
+  parse_option ("undetermined-buffer-bytes-limit", required_argument, 0, 2015, "max buffered bytes per undetermined connection");
+  parse_option ("undetermined-bytes-global-limit", required_argument, 0, 2016, "max buffered bytes across all undetermined connections");
+  parse_option ("undetermined-conns-per-ip-limit", required_argument, 0, 2017, "max undetermined connections per source IP (0 disables)");
   parse_option ("mtproto-secret", required_argument, 0, 'S', "16-byte secret in hex mode");
   parse_option ("proxy-tag", required_argument, 0, 'P', "16-byte proxy tag in hex mode to be passed along with all forwarded queries");
   parse_option ("domain", required_argument, 0, 'D', "adds allowed domain for TLS-transport mode, disables other transports; can be specified more than once");
