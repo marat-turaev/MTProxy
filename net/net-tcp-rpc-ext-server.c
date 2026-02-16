@@ -268,6 +268,21 @@ static void undetermined_conn_leave (connection_job_t C) {
   }
 }
 
+#define DOMAIN_PROFILE_MAX 8
+#define MAX_PROBE_SERVER_HELLO_PAYLOAD 8192
+#define MAX_PROBE_ENCRYPTED_RECORD_PAYLOAD 16384
+#define MAX_SERVER_HELLO_TEMPLATE_LEN 2048
+
+struct domain_profile {
+  short encrypted_size[3];
+  char encrypted_records; // 1..3
+  char is_reversed_extension_order;
+  unsigned short weight;  // number of matching probe samples
+  unsigned char *server_hello_template;
+  int server_hello_template_len;
+  int server_hello_keyshare_offset;
+};
+
 struct domain_info {
   const char *domain;
   struct in_addr target;
@@ -286,6 +301,8 @@ struct domain_info {
   unsigned char *server_hello_template;
   int server_hello_template_len;
   int server_hello_keyshare_offset; // where 32-byte keyshare starts inside template, or -1
+  struct domain_profile profiles[DOMAIN_PROFILE_MAX];
+  int profiles_num;
   struct domain_info *next;
 };
 
@@ -312,6 +329,45 @@ static const struct domain_info *get_domain_info (const char *domain, size_t len
     info = info->next;
   }
   return NULL;
+}
+
+static void free_domain_profiles (struct domain_info *info) {
+  int i;
+  for (i = 0; i < info->profiles_num; i++) {
+    free (info->profiles[i].server_hello_template);
+    info->profiles[i].server_hello_template = NULL;
+    info->profiles[i].server_hello_template_len = 0;
+    info->profiles[i].server_hello_keyshare_offset = -1;
+    info->profiles[i].weight = 0;
+  }
+  info->profiles_num = 0;
+}
+
+static const struct domain_profile *choose_domain_profile (const struct domain_info *info) {
+  if (info == NULL || info->profiles_num <= 0) {
+    return NULL;
+  }
+
+  int total = 0;
+  int i;
+  for (i = 0; i < info->profiles_num; i++) {
+    int w = info->profiles[i].weight > 0 ? info->profiles[i].weight : 1;
+    total += w;
+  }
+  if (total <= 0) {
+    return &info->profiles[0];
+  }
+
+  unsigned int r = (unsigned int) lrand48_j ();
+  int pick = (int)(r % (unsigned int)total);
+  for (i = 0; i < info->profiles_num; i++) {
+    int w = info->profiles[i].weight > 0 ? info->profiles[i].weight : 1;
+    if (pick < w) {
+      return &info->profiles[i];
+    }
+    pick -= w;
+  }
+  return &info->profiles[info->profiles_num - 1];
 }
 
 static int get_domain_server_hello_encrypted_size (const struct domain_info *info) {
@@ -390,6 +446,7 @@ int tcp_rpc_proxy_domains_prepare_stat (stats_buffer_t *sb) {
     while (info != NULL) {
       const char *d = info->domain ? info->domain : "-";
       sb_printf (sb, "tls_domain_%d\t%s\n", idx, d);
+      sb_printf (sb, "tls_domain_%d_profiles\t%d\n", idx, info->profiles_num);
       sb_printf (sb, "tls_domain_%d_is_reversed_extension_order\t%d\n", idx, (int)info->is_reversed_extension_order);
       sb_printf (sb, "tls_domain_%d_records\t%d\n", idx, (int)get_domain_server_hello_encrypted_records (info));
 
@@ -768,6 +825,54 @@ static int check_response (const unsigned char *response, int len, const unsigne
   return 1;
 }
 
+static int extract_server_hello_template (const unsigned char *resp, int rlen,
+                                          unsigned char **out_tpl, int *out_tpl_len, int *out_keyshare_offset) {
+  if (resp == NULL || rlen < 64 || memcmp (resp, "\x16\x03\x03", 3) != 0) {
+    return 0;
+  }
+  int sh_len = resp[3] * 256 + resp[4];
+  int tpl_len = 5 + sh_len;
+  if (sh_len <= 0 || tpl_len > rlen || tpl_len > MAX_SERVER_HELLO_TEMPLATE_LEN) {
+    return 0;
+  }
+
+  unsigned char *tpl = malloc ((size_t)tpl_len);
+  if (tpl == NULL) {
+    return 0;
+  }
+  memcpy (tpl, resp, (size_t)tpl_len);
+
+  int keyshare_off = -1;
+  static const unsigned char ks_hdr[] = {0x00, 0x33, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20};
+  int j;
+  for (j = 0; j + (int)sizeof (ks_hdr) + 32 <= tpl_len; j++) {
+    if (!memcmp (tpl + j, ks_hdr, sizeof (ks_hdr))) {
+      keyshare_off = j + (int)sizeof (ks_hdr);
+      break;
+    }
+  }
+
+  *out_tpl = tpl;
+  *out_tpl_len = tpl_len;
+  *out_keyshare_offset = keyshare_off;
+  return 1;
+}
+
+static int domain_profile_equals (const struct domain_profile *a, const struct domain_profile *b) {
+  if (a->encrypted_records != b->encrypted_records ||
+      a->is_reversed_extension_order != b->is_reversed_extension_order ||
+      a->encrypted_size[0] != b->encrypted_size[0] ||
+      a->encrypted_size[1] != b->encrypted_size[1] ||
+      a->encrypted_size[2] != b->encrypted_size[2] ||
+      a->server_hello_template_len != b->server_hello_template_len) {
+    return 0;
+  }
+  if (a->server_hello_template_len <= 0) {
+    return 1;
+  }
+  return !memcmp (a->server_hello_template, b->server_hello_template, (size_t)a->server_hello_template_len);
+}
+
 static int update_domain_info (struct domain_info *info) {
   const char *domain = info->domain;
   struct hostent *host = kdb_gethostbyname (domain);
@@ -785,9 +890,6 @@ static int update_domain_info (struct domain_info *info) {
   FD_ZERO(&except_fd);
 
 #define TRIES 20
-#define MAX_PROBE_SERVER_HELLO_PAYLOAD 8192
-#define MAX_PROBE_ENCRYPTED_RECORD_PAYLOAD 16384
-#define MAX_SERVER_HELLO_TEMPLATE_LEN 2048
   int sockets[TRIES];
   int i;
   for (i = 0; i < TRIES; i++) {
@@ -1030,138 +1132,131 @@ static int update_domain_info (struct domain_info *info) {
     return 0;
   }
 
-  // Compute extension-order bounds and the most common record count.
-  is_reversed_extension_order_min = try_is_reversed_extension_order[0];
-  is_reversed_extension_order_max = try_is_reversed_extension_order[0];
-  int records_cnt_hist[8] = {};
-  for (i = 0; i < TRIES; i++) {
-    int rev = try_is_reversed_extension_order[i];
-    if (rev < is_reversed_extension_order_min) { is_reversed_extension_order_min = rev; }
-    if (rev > is_reversed_extension_order_max) { is_reversed_extension_order_max = rev; }
+  // Build per-domain startup profiles and pick one per connection.
+  free_domain_profiles (info);
+  if (info->server_hello_template) {
+    free (info->server_hello_template);
+    info->server_hello_template = NULL;
+  }
+  info->server_hello_template_len = 0;
+  info->server_hello_keyshare_offset = -1;
+  info->server_hello_encrypted_size = 0;
+  info->server_hello_encrypted_size2 = 0;
+  info->server_hello_encrypted_size3 = 0;
+  info->use_random_encrypted_size = 0;
+  info->use_random_encrypted_size2 = 0;
+  info->use_random_encrypted_size3 = 0;
+  info->server_hello_encrypted_records = 1;
+  info->is_reversed_extension_order = 0;
 
+  int records_cnt_hist[8] = {};
+  int rev_first = 0;
+  int have_rev = 0;
+  for (i = 0; i < TRIES; i++) {
     int rc = try_encrypted_application_data_records[i];
     if (rc < 0) { rc = 0; }
     if (rc > 7) { rc = 7; }
     records_cnt_hist[rc]++;
+
+    if (try_encrypted_application_data_records[i] > 0) {
+      struct domain_profile cand;
+      memset (&cand, 0, sizeof (cand));
+      cand.encrypted_records = (char)try_encrypted_application_data_records[i];
+      if (cand.encrypted_records < 1) { cand.encrypted_records = 1; }
+      if (cand.encrypted_records > 3) { cand.encrypted_records = 3; }
+      cand.is_reversed_extension_order = (char)try_is_reversed_extension_order[i];
+      cand.encrypted_size[0] = (short)try_encrypted_application_data_lengths[i][0];
+      cand.encrypted_size[1] = (short)try_encrypted_application_data_lengths[i][1];
+      cand.encrypted_size[2] = (short)try_encrypted_application_data_lengths[i][2];
+      cand.weight = 1;
+      cand.server_hello_keyshare_offset = -1;
+
+      if (extract_server_hello_template (responses[i], response_len[i], &cand.server_hello_template,
+                                         &cand.server_hello_template_len, &cand.server_hello_keyshare_offset)) {
+        int merged = 0;
+        int p;
+        for (p = 0; p < info->profiles_num; p++) {
+          if (domain_profile_equals (&cand, &info->profiles[p])) {
+            if (info->profiles[p].weight < 65535) {
+              info->profiles[p].weight++;
+            }
+            free (cand.server_hello_template);
+            cand.server_hello_template = NULL;
+            merged = 1;
+            break;
+          }
+        }
+        if (!merged && info->profiles_num < DOMAIN_PROFILE_MAX) {
+          info->profiles[info->profiles_num++] = cand;
+          cand.server_hello_template = NULL;
+        }
+        free (cand.server_hello_template);
+      }
+    }
+
+    int rev = try_is_reversed_extension_order[i];
+    if (!have_rev) {
+      rev_first = rev;
+      have_rev = 1;
+      is_reversed_extension_order_min = rev;
+      is_reversed_extension_order_max = rev;
+    } else {
+      if (rev < is_reversed_extension_order_min) { is_reversed_extension_order_min = rev; }
+      if (rev > is_reversed_extension_order_max) { is_reversed_extension_order_max = rev; }
+    }
   }
 
-  if (is_reversed_extension_order_min != is_reversed_extension_order_max) {
+  if (have_rev && is_reversed_extension_order_min != is_reversed_extension_order_max) {
     kprintf ("Upstream server %s uses non-deterministic extension order\n", domain);
   }
 
-  info->is_reversed_extension_order = (char)is_reversed_extension_order_min;
-
-  int best_records = 1, best_cnt = records_cnt_hist[1];
-  int r;
-  for (r = 2; r < 8; r++) {
-    if (records_cnt_hist[r] > best_cnt) {
-      best_cnt = records_cnt_hist[r];
-      best_records = r;
-    }
-  }
-  if (best_records < 1) { best_records = 1; }
-  if (best_records > 3) { best_records = 3; }
-  info->server_hello_encrypted_records = (char)best_records;
-
-  // Capture a real ServerHello record as a template for this domain.
-  if (info->server_hello_template) {
-    free (info->server_hello_template);
-    info->server_hello_template = NULL;
-    info->server_hello_template_len = 0;
-    info->server_hello_keyshare_offset = -1;
-  }
-  int template_i;
-  for (template_i = 0; template_i < TRIES; template_i++) {
-    if (try_encrypted_application_data_records[template_i] != best_records) {
-      continue;
-    }
-    const unsigned char *resp = responses[template_i];
-    int rlen = response_len[template_i];
-    if (resp == NULL || rlen < 64) {
-      continue;
-    }
-    if (memcmp (resp, "\x16\x03\x03", 3) != 0) {
-      continue;
-    }
-    int sh_len = resp[3] * 256 + resp[4];
-    int tpl_len = 5 + sh_len;
-    if (sh_len <= 0 || tpl_len > rlen) {
-      continue;
-    }
-    if (tpl_len > MAX_SERVER_HELLO_TEMPLATE_LEN) {
-      // Keep templates bounded to avoid per-connection memory/bandwidth spikes.
-      continue;
-    }
-    unsigned char *tpl = malloc ((size_t)tpl_len);
-    if (tpl == NULL) {
-      continue;
-    }
-    memcpy (tpl, resp, (size_t)tpl_len);
-    info->server_hello_template = tpl;
-    info->server_hello_template_len = tpl_len;
-    info->server_hello_keyshare_offset = -1;
-
-    // Locate keyshare extension payload: 00 33 00 24 00 1d 00 20 <32 bytes>
-    static const unsigned char ks_hdr[] = {0x00, 0x33, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20};
-    int j;
-    for (j = 0; j + (int)sizeof (ks_hdr) + 32 <= tpl_len; j++) {
-      if (!memcmp (tpl + j, ks_hdr, sizeof (ks_hdr))) {
-        info->server_hello_keyshare_offset = j + (int)sizeof (ks_hdr);
-        break;
+  if (info->profiles_num > 0) {
+    int best = 0;
+    int p;
+    for (p = 1; p < info->profiles_num; p++) {
+      if (info->profiles[p].weight > info->profiles[best].weight) {
+        best = p;
       }
     }
-    break;
-  }
 
-  // Per-record stats over tries matching the selected record count.
-  {
+    const struct domain_profile *bp = &info->profiles[best];
+    info->is_reversed_extension_order = bp->is_reversed_extension_order;
+    info->server_hello_encrypted_records = bp->encrypted_records;
+    info->server_hello_encrypted_size = bp->encrypted_size[0];
+    info->server_hello_encrypted_size2 = bp->encrypted_size[1];
+    info->server_hello_encrypted_size3 = bp->encrypted_size[2];
+    info->server_hello_template_len = bp->server_hello_template_len;
+    info->server_hello_keyshare_offset = bp->server_hello_keyshare_offset;
+  } else {
+    // Fall back to aggregate sizes if we could not capture at least one template.
+    int best_records = 1, best_cnt = records_cnt_hist[1];
+    int r;
+    for (r = 2; r < 8; r++) {
+      if (records_cnt_hist[r] > best_cnt) {
+        best_cnt = records_cnt_hist[r];
+        best_records = r;
+      }
+    }
+    if (best_records < 1) { best_records = 1; }
+    if (best_records > 3) { best_records = 3; }
+    info->server_hello_encrypted_records = (char)best_records;
+    info->is_reversed_extension_order = (char)(have_rev ? rev_first : 0);
     int cnt = 0;
-    int mn[3] = {0, 0, 0};
-    int mx[3] = {0, 0, 0};
     long long sum[3] = {0, 0, 0};
-
     for (i = 0; i < TRIES; i++) {
       if (try_encrypted_application_data_records[i] != best_records) {
         continue;
       }
       int k;
       for (k = 0; k < best_records && k < 3; k++) {
-        int v = try_encrypted_application_data_lengths[i][k];
-        if (!cnt) {
-          mn[k] = mx[k] = v;
-        } else {
-          if (v < mn[k]) { mn[k] = v; }
-          if (v > mx[k]) { mx[k] = v; }
-        }
-        sum[k] += v;
+        sum[k] += try_encrypted_application_data_lengths[i][k];
       }
       cnt++;
     }
-
-    int idx;
-    for (idx = 0; idx < 3; idx++) {
-      short *dst_size = idx == 0 ? &info->server_hello_encrypted_size : (idx == 1 ? &info->server_hello_encrypted_size2 : &info->server_hello_encrypted_size3);
-      char *dst_rand = idx == 0 ? &info->use_random_encrypted_size : (idx == 1 ? &info->use_random_encrypted_size2 : &info->use_random_encrypted_size3);
-
-      if (idx >= best_records) {
-        *dst_size = 0;
-        *dst_rand = 0;
-        continue;
-      }
-
-      int mnv = mn[idx];
-      int mxv = mx[idx];
-      if (mnv == mxv) {
-        *dst_size = mnv;
-        *dst_rand = 0;
-      } else if (mxv - mnv <= 3) {
-        *dst_size = mxv - 1;
-        *dst_rand = 1;
-      } else {
-        *dst_size = (short)(sum[idx] * 1.0 / (cnt ? cnt : 1) + 0.5);
-        *dst_rand = 1;
-      }
-    }
+    info->server_hello_encrypted_size = (short)(cnt ? (sum[0] / cnt) : 2500);
+    info->server_hello_encrypted_size2 = (short)(best_records >= 2 && cnt ? (sum[1] / cnt) : 0);
+    info->server_hello_encrypted_size3 = (short)(best_records >= 3 && cnt ? (sum[2] / cnt) : 0);
+    info->use_random_encrypted_size = 1;
   }
 
   vkprintf (0, "Successfully checked domain %s in %.3lf seconds: is_reversed_extension_order = %d, records = %d, size = %d,%d,%d\n",
@@ -1250,6 +1345,13 @@ void tcp_rpc_init_proxy_domains() {
     while (info != NULL) {
       if (!update_domain_info (info)) {
         kprintf ("Failed to update response data about %s, so default response settings wiil be used\n", info->domain);
+        free_domain_profiles (info);
+        if (info->server_hello_template) {
+          free (info->server_hello_template);
+          info->server_hello_template = NULL;
+        }
+        info->server_hello_template_len = 0;
+        info->server_hello_keyshare_offset = -1;
         // keep target addresses as is
         info->is_reversed_extension_order = 0;
         info->server_hello_encrypted_records = 1;
