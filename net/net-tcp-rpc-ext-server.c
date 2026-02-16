@@ -3861,12 +3861,52 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
           }
         }
 
-        int server_hello_rec_len = 127;
-        if (profile && profile->server_hello_template && profile->server_hello_template_len > 0) {
-          server_hello_rec_len = profile->server_hello_template_len;
-        } else if (info->server_hello_template && info->server_hello_template_len > 0) {
-          server_hello_rec_len = info->server_hello_template_len;
+        int have_profile_tpl = profile && profile->server_hello_template && profile->server_hello_template_len > 0;
+        int have_info_tpl = info->server_hello_template && info->server_hello_template_len > 0;
+        int base_reversed_order = (profile && profile->is_reversed_extension_order) || (!profile && info->is_reversed_extension_order);
+        unsigned int sh_variant = (unsigned int) lrand48_j () & 3u;
+        // Four per-connection variants:
+        // 0: prefer profile template
+        // 1: prefer domain template
+        // 2: synthetic (base order)
+        // 3: synthetic (flipped order)
+        int use_synth = 0;
+        const unsigned char *selected_template = 0;
+        int selected_template_len = 0;
+        int selected_keyshare_offset = -1;
+        int effective_reversed_order = base_reversed_order;
+
+        if (sh_variant == 0u && have_profile_tpl) {
+          selected_template = profile->server_hello_template;
+          selected_template_len = profile->server_hello_template_len;
+          selected_keyshare_offset = profile->server_hello_keyshare_offset;
+        } else if (sh_variant == 1u && have_info_tpl) {
+          selected_template = info->server_hello_template;
+          selected_template_len = info->server_hello_template_len;
+          selected_keyshare_offset = info->server_hello_keyshare_offset;
+        } else if (sh_variant == 2u) {
+          use_synth = 1;
+          effective_reversed_order = base_reversed_order;
+        } else if (sh_variant == 3u) {
+          use_synth = 1;
+          effective_reversed_order = !base_reversed_order;
+        } else if (have_profile_tpl) {
+          selected_template = profile->server_hello_template;
+          selected_template_len = profile->server_hello_template_len;
+          selected_keyshare_offset = profile->server_hello_keyshare_offset;
+        } else if (have_info_tpl) {
+          selected_template = info->server_hello_template;
+          selected_template_len = info->server_hello_template_len;
+          selected_keyshare_offset = info->server_hello_keyshare_offset;
+        } else {
+          use_synth = 1;
         }
+
+        if (!selected_template && !use_synth) {
+          use_synth = 1;
+        }
+
+        int server_hello_rec_len = use_synth ? 127 : selected_template_len;
         int response_size = server_hello_rec_len + 6 + 5 + encrypted_payload_size;
         if (response_size <= 0 || response_size > MAX_TLS_RESPONSE_ALLOC - 32) {
           vkprintf (0, "invalid TLS response size: %d (limit %d)\n", response_size, MAX_TLS_RESPONSE_ALLOC - 32);
@@ -3880,28 +3920,28 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         }
         memcpy (buffer, client_random, 32);
         unsigned char *response_buffer = buffer + 32;
-        if (profile && profile->server_hello_template && profile->server_hello_template_len > 0) {
-          memcpy (response_buffer, profile->server_hello_template, (size_t)profile->server_hello_template_len);
+        if (!use_synth) {
+          memcpy (response_buffer, selected_template, (size_t)selected_template_len);
           // Zero server_random before computing our HMAC-based server_random.
-          if (profile->server_hello_template_len >= 11 + 32) {
+          if (selected_template_len >= 11 + 32) {
             memset (response_buffer + 11, 0, 32);
           }
           // Always mirror the client's session_id (expected by some clients).
-          if (profile->server_hello_template_len >= 44 + 32) {
+          if (selected_template_len >= 44 + 32) {
             response_buffer[43] = '\x20';
             memcpy (response_buffer + 44, client_hello + 44, 32);
           }
           // Chosen cipher suite: keep compatible with the client's offered list.
-          if (profile->server_hello_template_len >= 78) {
+          if (selected_template_len >= 78) {
             response_buffer[76] = 0x13;
             response_buffer[77] = cipher_suite_id;
           }
           // Patch keyshare public key to fresh random.
-          if (profile->server_hello_keyshare_offset >= 0 &&
-              profile->server_hello_keyshare_offset + 32 <= profile->server_hello_template_len) {
-            generate_public_key (response_buffer + profile->server_hello_keyshare_offset);
+          if (selected_keyshare_offset >= 0 &&
+              selected_keyshare_offset + 32 <= selected_template_len) {
+            generate_public_key (response_buffer + selected_keyshare_offset);
           }
-          pos = profile->server_hello_template_len;
+          pos = selected_template_len;
         } else {
         memcpy (response_buffer, "\x16\x03\x03\x00\x7a\x02\x00\x00\x76\x03\x03", 11);
         memset (response_buffer + 11, '\0', 32);
@@ -3912,7 +3952,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
 
         pos = 81;
         int tls_server_extensions[3] = {0x33, 0x2b, -1};
-        if ((profile && profile->is_reversed_extension_order) || (!profile && info->is_reversed_extension_order)) {
+        if (effective_reversed_order) {
           int t = tls_server_extensions[0];
           tls_server_extensions[0] = tls_server_extensions[1];
           tls_server_extensions[1] = t;
