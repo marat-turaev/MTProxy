@@ -212,6 +212,8 @@ static unsigned long long tls_probe_table_net_used;
 static unsigned long long tls_secret_unique_ip_rejects;
 static unsigned long long tls_secret_conn_limit_rejects;
 static unsigned long long tls_secret_total_octet_rejects;
+static __thread unsigned int secret_conn_count[16];
+static __thread unsigned long long secret_total_octets[16];
 
 #ifndef MT_TLS_PROBE_TABLE_BITS
 #define MT_TLS_PROBE_TABLE_BITS 13
@@ -1846,8 +1848,6 @@ struct secret_ip_entry {
 };
 static __thread struct secret_ip_entry secret_ip_table[SECRET_IP_TABLE_SIZE];
 static __thread int secret_unique_ip_count[16];
-static __thread unsigned int secret_conn_count[16];
-static __thread unsigned long long secret_total_octets[16];
 
 static int conn_get_secret_slot (connection_job_t C) {
   struct tcp_rpc_data *D = TCP_RPC_DATA (C);
