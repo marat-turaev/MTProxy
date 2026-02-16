@@ -2557,6 +2557,60 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
             }
           }
         }
+        if (plan_len > 1) {
+          // Add bounded per-connection variation to TCP chunk boundaries while preserving:
+          // - total bytes (sum of chunks)
+          // - number of chunks
+          // - sane minimum chunk sizes
+          enum { TLS_SHAPE_MIN_CHUNK = 64, TLS_SHAPE_MAX_DELTA = 256 };
+          int pi;
+          for (pi = 0; pi + 1 < plan_len; pi++) {
+            int a = c->tls_write_shaping_plan[pi];
+            int b = c->tls_write_shaping_plan[pi + 1];
+            int max_delta = (a < b ? a : b) >> 3; // up to 12.5%
+            if (max_delta > TLS_SHAPE_MAX_DELTA) {
+              max_delta = TLS_SHAPE_MAX_DELTA;
+            }
+            if (max_delta < 8) {
+              continue;
+            }
+
+            int from_a = a - TLS_SHAPE_MIN_CHUNK;
+            int from_b = b - TLS_SHAPE_MIN_CHUNK;
+            if (from_a < 0) { from_a = 0; }
+            if (from_b < 0) { from_b = 0; }
+            if (from_a == 0 && from_b == 0) {
+              continue;
+            }
+
+            unsigned int r = (unsigned int) lrand48_j ();
+            int move_a_to_b = (int)(r & 1);
+            int can_move = move_a_to_b ? from_a : from_b;
+            if (can_move <= 0) {
+              move_a_to_b ^= 1;
+              can_move = move_a_to_b ? from_a : from_b;
+              if (can_move <= 0) {
+                continue;
+              }
+            }
+
+            int delta = 1 + (int)((r >> 1) % (unsigned int)max_delta);
+            if (delta > can_move) {
+              delta = can_move;
+            }
+            if (delta <= 0) {
+              continue;
+            }
+
+            if (move_a_to_b) {
+              c->tls_write_shaping_plan[pi] -= delta;
+              c->tls_write_shaping_plan[pi + 1] += delta;
+            } else {
+              c->tls_write_shaping_plan[pi] += delta;
+              c->tls_write_shaping_plan[pi + 1] -= delta;
+            }
+          }
+        }
         __atomic_store_n (&c->tls_write_shaping_plan_len, plan_len, __ATOMIC_RELAXED);
         __atomic_store_n (&c->tls_write_shaping_plan_pos, 0, __ATOMIC_RELAXED);
         __atomic_store_n (&c->tls_write_shaping_chunk_left, 0, __ATOMIC_RELAXED);
