@@ -49,7 +49,7 @@ head -c 16 /dev/urandom | xxd -ps
 - `nobody` is the username. `mtproto-proxy` calls `setuid()` to drop privileges.
 - `443` is the port, used by clients to connect to the proxy.
 - `8888` is the local port (loopback-only). You can use it to get statistics from `mtproto-proxy` (enable with `--http-stats`). Like `wget localhost:8888/stats`.
-- `<secret>` is the secret generated at step 3. Also you can set multiple secrets: `-S <secret1> -S <secret2>`.
+- `<secret>` is the secret generated at step 3. Also you can set multiple secrets: `-S <secret1> -S <secret2>` (up to 256 secrets).
 - `proxy-secret` and `proxy-multi.conf` are obtained at steps 1 and 2.
 - `1` is the number of worker processes (`-M`). For TLS-transport mode (`-D`), a single worker is usually preferred.
 
@@ -148,6 +148,41 @@ Operational note:
 - Example cron line:
 ```text
 */30 * * * * root /usr/local/sbin/mtproxy-update-ip-blocklist.sh >>/var/log/mtproxy-ip-blocklist.log 2>&1
+```
+
+### Advanced hardening and capacity flags
+This fork includes additional runtime controls for per-secret limits, replay cache bounds, and pre-auth resource caps.
+
+Per-secret limits:
+- `--max-unique-ips-per-secret <n>`: cap concurrent unique client IPs per secret. `0` disables (default: `0`, range: `0..1000000`).
+- `--max-connections-per-secret <n>`: cap concurrent connections per secret. `0` disables (default: `0`, range: `0..1000000`).
+- `--max-total-octets-per-secret <n>`: cap cumulative bytes per secret since process start. `0` disables (default: `0`).
+
+Handshake and replay controls:
+- `--client-handshake-timeout <sec>`: timeout for undetermined handshake state (default: `3`, range: `1..60`).
+- `--replay-cache-max-entries <n>`: hard cap for replay cache entries (default: `200000`, range: `1..5000000`).
+- `--replay-cache-max-age <sec>`: maximum replay cache entry age (default: `172800`, range: `1..2592000`).
+- `--replay-cache-max-bytes <n>`: optional replay cache memory budget in bytes. `0` disables (default: `0`).
+
+Undetermined-connection DoS controls:
+- `--undetermined-conns-limit <n>`: per-worker undetermined-connection cap (default: `1024`, range: `1..1000000`).
+- `--undetermined-conns-global-limit <n>`: process-wide undetermined-connection cap (default: `8192`, range: `1..10000000`).
+- `--undetermined-conns-per-ip-limit <n>`: per-source-IP undetermined cap. `0` disables (default: `128`, range: `0..65535`).
+- `--undetermined-buffer-bytes-limit <n>`: max buffered bytes per undetermined connection (default: `8192`, range: `256..1048576`).
+- `--undetermined-bytes-global-limit <n>`: process-wide buffered bytes for undetermined connections (default: `67108864`, range: `1048576..68719476736`).
+
+Example:
+```bash
+./mtproto-proxy ... \
+  --max-unique-ips-per-secret 32 \
+  --max-connections-per-secret 256 \
+  --max-total-octets-per-secret 200000000000 \
+  --client-handshake-timeout 5 \
+  --replay-cache-max-entries 300000 \
+  --replay-cache-max-age 86400 \
+  --undetermined-conns-limit 2048 \
+  --undetermined-conns-global-limit 16384 \
+  --undetermined-conns-per-ip-limit 64
 ```
 
 Client secret format for TLS-transport is:
