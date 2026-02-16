@@ -181,6 +181,8 @@ static int fallback_backend_is_ipv6;
 static int fallback_backend_port;
 static char fallback_backend_printable[256];
 static int max_secret_unique_ips;
+static int max_secret_connections;
+static unsigned long long max_secret_total_octets;
 
 // Aggregate throttling stats (no per-IP data, safe for /stats).
 static unsigned long long probe_stat_calls;
@@ -206,6 +208,8 @@ static unsigned long long tls_replay_cache_additions;
 static unsigned long long tls_probe_table_ip_used;
 static unsigned long long tls_probe_table_net_used;
 static unsigned long long tls_secret_unique_ip_rejects;
+static unsigned long long tls_secret_conn_limit_rejects;
+static unsigned long long tls_secret_total_octet_rejects;
 
 #ifndef MT_TLS_PROBE_TABLE_BITS
 #define MT_TLS_PROBE_TABLE_BITS 13
@@ -246,6 +250,8 @@ static volatile long long undetermined_bytes_global;
 
 // D->extra_int bit used by this file to track whether the connection is counted above.
 #define EXT_TCPRPC_F_UNDET_COUNTED 1
+#define EXT_TCPRPC_F_SECRET_CONN_COUNTED 2
+#define EXT_TCPRPC_F_SECRET_QUOTA_HIT 4
 
 static void undetermined_conn_account_bytes (connection_job_t C, int cur_bytes) {
   struct tcp_rpc_data *D = TCP_RPC_DATA (C);
@@ -532,8 +538,21 @@ int tcp_rpc_proxy_domains_prepare_stat (stats_buffer_t *sb) {
   sb_printf (sb, "tls_replay_cache_hits\t%llu\n", replay_hits);
   sb_printf (sb, "tls_replay_cache_additions\t%llu\n", __atomic_load_n (&tls_replay_cache_additions, __ATOMIC_RELAXED));
   sb_printf (sb, "tls_replay_cache_hit_rate_ppm\t%llu\n", replay_checks ? (replay_hits * 1000000ULL) / replay_checks : 0ULL);
+  unsigned long long secret_active_connections = 0;
+  unsigned long long secret_total_octets_sum = 0;
+  int si;
+  for (si = 0; si < ext_secret_cnt && si < 16; si++) {
+    secret_active_connections += (unsigned long long) secret_conn_count[si];
+    secret_total_octets_sum += secret_total_octets[si];
+  }
   sb_printf (sb, "tls_secret_unique_ip_limit\t%d\n", max_secret_unique_ips);
   sb_printf (sb, "tls_secret_unique_ip_rejects\t%llu\n", __atomic_load_n (&tls_secret_unique_ip_rejects, __ATOMIC_RELAXED));
+  sb_printf (sb, "tls_secret_conn_limit\t%d\n", max_secret_connections);
+  sb_printf (sb, "tls_secret_conn_rejects\t%llu\n", __atomic_load_n (&tls_secret_conn_limit_rejects, __ATOMIC_RELAXED));
+  sb_printf (sb, "tls_secret_active_connections\t%llu\n", secret_active_connections);
+  sb_printf (sb, "tls_secret_total_octet_quota\t%llu\n", max_secret_total_octets);
+  sb_printf (sb, "tls_secret_total_octet_rejects\t%llu\n", __atomic_load_n (&tls_secret_total_octet_rejects, __ATOMIC_RELAXED));
+  sb_printf (sb, "tls_secret_total_octets\t%llu\n", secret_total_octets_sum);
   sb_printf (sb, "tls_dos_undetermined_conns_limit\t%d\n", (int)MAX_UNDETERMINED_CONNS);
   sb_printf (sb, "tls_dos_undetermined_conns_global_limit\t%d\n", (int)MAX_UNDETERMINED_CONNS_GLOBAL);
   sb_printf (sb, "tls_dos_undetermined_conns_global_now\t%d\n", (int)__atomic_load_n (&undetermined_conn_count_global, __ATOMIC_RELAXED));
@@ -1607,6 +1626,14 @@ void tcp_rpc_set_secret_max_unique_ips (int limit) {
   max_secret_unique_ips = limit > 0 ? limit : 0;
 }
 
+void tcp_rpc_set_secret_max_connections (int limit) {
+  max_secret_connections = limit > 0 ? limit : 0;
+}
+
+void tcp_rpc_set_secret_max_total_octets (unsigned long long limit) {
+  max_secret_total_octets = limit;
+}
+
 struct client_random {
   unsigned char random[16];
   struct client_random *next_by_time;
@@ -1806,6 +1833,8 @@ struct secret_ip_entry {
 };
 static __thread struct secret_ip_entry secret_ip_table[SECRET_IP_TABLE_SIZE];
 static __thread int secret_unique_ip_count[16];
+static __thread unsigned int secret_conn_count[16];
+static __thread unsigned long long secret_total_octets[16];
 
 static int conn_get_secret_slot (connection_job_t C) {
   struct tcp_rpc_data *D = TCP_RPC_DATA (C);
@@ -1930,6 +1959,67 @@ static void secret_ip_limit_leave (connection_job_t C) {
     }
   }
   conn_set_secret_slot (C, -1);
+}
+
+static int secret_conn_limit_enter (connection_job_t C) {
+  int secret_slot = conn_get_secret_slot (C);
+  if (secret_slot < 0 || secret_slot >= 16) {
+    return 0;
+  }
+  struct tcp_rpc_data *D = TCP_RPC_DATA (C);
+  if (D->extra_int & EXT_TCPRPC_F_SECRET_CONN_COUNTED) {
+    return 0;
+  }
+  if (max_secret_connections > 0 && secret_conn_count[secret_slot] >= (unsigned int)max_secret_connections) {
+    __atomic_fetch_add (&tls_secret_conn_limit_rejects, 1, __ATOMIC_RELAXED);
+    return -1;
+  }
+  if (max_secret_total_octets > 0 && secret_total_octets[secret_slot] >= max_secret_total_octets) {
+    __atomic_fetch_add (&tls_secret_total_octet_rejects, 1, __ATOMIC_RELAXED);
+    return -1;
+  }
+  secret_conn_count[secret_slot]++;
+  D->extra_int |= EXT_TCPRPC_F_SECRET_CONN_COUNTED;
+  return 0;
+}
+
+static void secret_conn_limit_leave (connection_job_t C) {
+  int secret_slot = conn_get_secret_slot (C);
+  struct tcp_rpc_data *D = TCP_RPC_DATA (C);
+  if (!(D->extra_int & EXT_TCPRPC_F_SECRET_CONN_COUNTED)) {
+    return;
+  }
+  D->extra_int &= ~(EXT_TCPRPC_F_SECRET_CONN_COUNTED | EXT_TCPRPC_F_SECRET_QUOTA_HIT);
+  if (secret_slot >= 0 && secret_slot < 16 && secret_conn_count[secret_slot] > 0) {
+    secret_conn_count[secret_slot]--;
+  }
+}
+
+static void secret_octet_quota_note (connection_job_t C, int bytes) {
+  if (bytes <= 0) {
+    return;
+  }
+  int secret_slot = conn_get_secret_slot (C);
+  if (secret_slot < 0 || secret_slot >= 16) {
+    return;
+  }
+  unsigned long long prev = __atomic_fetch_add (&secret_total_octets[secret_slot], (unsigned long long)bytes, __ATOMIC_RELAXED);
+  if (max_secret_total_octets > 0 && prev + (unsigned long long)bytes > max_secret_total_octets) {
+    struct tcp_rpc_data *D = TCP_RPC_DATA (C);
+    if (!(D->extra_int & EXT_TCPRPC_F_SECRET_QUOTA_HIT)) {
+      D->extra_int |= EXT_TCPRPC_F_SECRET_QUOTA_HIT;
+      __atomic_fetch_add (&tls_secret_total_octet_rejects, 1, __ATOMIC_RELAXED);
+    }
+    fail_connection (C, -1);
+  }
+}
+
+void tcp_rpc_secret_note_data_received (connection_job_t C, int bytes_received) {
+  secret_octet_quota_note (C, bytes_received);
+}
+
+void tcp_rpc_secret_note_data_sent (connection_job_t C, int bytes_sent) {
+  secret_octet_quota_note (C, bytes_sent);
 }
 
 static int probe_match (const struct probe_entry *e, const struct connection_info *c) {
@@ -2600,6 +2690,7 @@ int tcp_rpcs_ext_init_accepted (connection_job_t C) {
 int tcp_rpcs_ext_close_connection (connection_job_t C, int who) {
   // Keep undetermined connection accounting correct on all close paths.
   undetermined_conn_leave (C);
+  secret_conn_limit_leave (C);
   secret_ip_limit_leave (C);
   return tcp_rpcs_close_connection (C, who);
 }
@@ -2848,6 +2939,10 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         }
         delete_old_client_randoms();
         if (secret_ip_limit_enter (C, secret_id) < 0) {
+          return tls_reject_authenticated (C, 40 /* handshake_failure */);
+        }
+        if (secret_conn_limit_enter (C) < 0) {
+          secret_ip_limit_leave (C);
           return tls_reject_authenticated (C, 40 /* handshake_failure */);
         }
 
@@ -3193,6 +3288,11 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
 
           int target = *(short *)(random_header + 60);
           if (ext_secret_cnt > 0 && secret_ip_limit_enter (C, secret_id) < 0) {
+            connection_write_close (C);
+            return NEED_MORE_BYTES;
+          }
+          if (ext_secret_cnt > 0 && secret_conn_limit_enter (C) < 0) {
+            secret_ip_limit_leave (C);
             connection_write_close (C);
             return NEED_MORE_BYTES;
           }

@@ -2134,12 +2134,14 @@ int check_conn_buffers (connection_job_t c) {
 // invoked in NET-CPU context!
 int mtfront_data_received (connection_job_t c, int bytes_received) {
   // check_conn_buffers (c);
+  tcp_rpc_secret_note_data_received (c, bytes_received);
   return 0;
 }
 
 // invoked in NET-CPU context!
 int mtfront_data_sent (connection_job_t c, int bytes_sent) {
   // lru_insert_conn (c);
+  tcp_rpc_secret_note_data_sent (c, bytes_sent);
   return 0;
 }
 
@@ -2478,6 +2480,28 @@ int f_parse_option (int val) {
     tcp_rpc_set_secret_max_unique_ips (x);
     break;
   }
+  case 2003: {
+    int x = atoi (optarg);
+    if (x < 0 || x > 1000000) {
+      kprintf ("'--max-connections-per-secret' must be in range [0, 1000000], got '%s'\n", optarg);
+      usage ();
+      return 2;
+    }
+    tcp_rpc_set_secret_max_connections (x);
+    break;
+  }
+  case 2004: {
+    char *end = 0;
+    errno = 0;
+    unsigned long long x = strtoull (optarg, &end, 10);
+    if (optarg[0] == '-' || errno || !end || *end) {
+      kprintf ("'--max-total-octets-per-secret' expects a non-negative integer, got '%s'\n", optarg);
+      usage ();
+      return 2;
+    }
+    tcp_rpc_set_secret_max_total_octets (x);
+    break;
+  }
   default:
     return -1;
   }
@@ -2488,6 +2512,8 @@ void mtfront_prepare_parse_options (void) {
   parse_option ("http-stats", no_argument, 0, 2000, "allow http server to answer on stats queries");
   parse_option ("fallback-backend", required_argument, 0, 2001, "proxy non-MTProxy TLS connections to loopback <host:port> instead of SNI domain");
   parse_option ("max-unique-ips-per-secret", required_argument, 0, 2002, "limit concurrent unique client IPs per mtproto-secret (0 disables)");
+  parse_option ("max-connections-per-secret", required_argument, 0, 2003, "limit concurrent connections per mtproto-secret (0 disables)");
+  parse_option ("max-total-octets-per-secret", required_argument, 0, 2004, "limit cumulative octets per mtproto-secret since process start (0 disables)");
   parse_option ("mtproto-secret", required_argument, 0, 'S', "16-byte secret in hex mode");
   parse_option ("proxy-tag", required_argument, 0, 'P', "16-byte proxy tag in hex mode to be passed along with all forwarded queries");
   parse_option ("domain", required_argument, 0, 'D', "adds allowed domain for TLS-transport mode, disables other transports; can be specified more than once");

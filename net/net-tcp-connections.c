@@ -98,10 +98,12 @@ int cpu_tcp_server_writer (connection_job_t C) /* {{{ */ {
 int cpu_tcp_server_reader (connection_job_t C) /* {{{ */ {
   assert_net_cpu_thread ();
   struct connection_info *c = CONN_INFO(C);
+  int bytes_received = 0;
 
   while (1) {
     struct raw_message *raw = mpq_pop_nw (c->in_queue, 4);
     if (!raw) { break; }
+    bytes_received += raw->total_bytes;
 
     if (c->crypto) {
       rwm_union (&c->in_u, raw);
@@ -119,8 +121,8 @@ int cpu_tcp_server_reader (connection_job_t C) /* {{{ */ {
         
   int s = c->skip_bytes;
 
-  if (c->type->data_received) {
-    c->type->data_received (C, r);
+  if (c->type->data_received && bytes_received > 0) {
+    c->type->data_received (C, bytes_received);
   }
 
   if (c->flags & (C_FAILED | C_ERROR | C_NET_FAILED)) {
