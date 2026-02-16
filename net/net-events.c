@@ -585,6 +585,15 @@ int server_socket (int port, struct in_addr in_addr, int backlog, int mode) {
     // setsockopt (socket_fd, SOL_SOCKET, SO_LINGER, &ling, sizeof (ling));
     setsockopt (socket_fd, IPPROTO_TCP, TCP_NODELAY, &flags, sizeof (flags));
 
+    // Linux-only: don't wake userspace/accept until data arrives.
+    // Helps reduce connect-hold/slowloris style scanning.
+#ifdef TCP_DEFER_ACCEPT
+    {
+      int defer_s = 3;
+      setsockopt (socket_fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &defer_s, sizeof (defer_s));
+    }
+#endif
+
     assert (flags == 1);
     assert (setsockopt (socket_fd, SOL_SOCKET, SO_KEEPALIVE, &flags, sizeof (flags)) >= 0);
     if (enable_often_tcp_keep_alive) {
