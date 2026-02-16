@@ -179,6 +179,8 @@ static unsigned long long probe_stat_delayed;
 static unsigned long long probe_stat_delay_ms_sum;
 static unsigned long long dos_stat_undetermined_conns_closed;
 static unsigned long long dos_stat_undetermined_bytes_closed;
+static unsigned long long dos_stat_undetermined_global_conns_closed;
+static unsigned long long dos_stat_undetermined_global_bytes_closed;
 
 static void probe_stat_note (int blocked, int delay_ms) {
   __atomic_fetch_add (&probe_stat_calls, 1, __ATOMIC_RELAXED);
@@ -196,29 +198,65 @@ static void probe_stat_note (int blocked, int delay_ms) {
 // This reduces cheap socket-hold DoS attempts (slowloris/automated clients) on busy deployments.
 #define MAX_UNDETERMINED_CONNS 1024
 static __thread int undetermined_conn_count;
+static volatile int undetermined_conn_count_global;
+
+// Process-wide cap for undetermined connections.
+#define MAX_UNDETERMINED_CONNS_GLOBAL 8192
 
 // Upper bound on buffered bytes while the connection is still undetermined.
 // If a peer sends a lot of junk before we can classify the transport, close early.
 #define MAX_UNDETERMINED_BUFFER_BYTES 8192
+static volatile long long undetermined_bytes_global;
+
+// Process-wide cap for bytes buffered in undetermined connections.
+#define MAX_UNDETERMINED_BYTES_GLOBAL (64 << 20)
 
 // D->extra_int bit used by this file to track whether the connection is counted above.
 #define EXT_TCPRPC_F_UNDET_COUNTED 1
 
+static void undetermined_conn_account_bytes (connection_job_t C, int cur_bytes) {
+  struct tcp_rpc_data *D = TCP_RPC_DATA (C);
+  if (!(D->extra_int & EXT_TCPRPC_F_UNDET_COUNTED)) {
+    return;
+  }
+  if (cur_bytes < 0) {
+    cur_bytes = 0;
+  }
+  int prev = D->extra_int4;
+  if (cur_bytes > prev) {
+    __atomic_fetch_add (&undetermined_bytes_global, (long long)(cur_bytes - prev), __ATOMIC_RELAXED);
+  } else if (cur_bytes < prev) {
+    __atomic_fetch_sub (&undetermined_bytes_global, (long long)(prev - cur_bytes), __ATOMIC_RELAXED);
+  }
+  D->extra_int4 = cur_bytes;
+}
+
 static void undetermined_conn_enter (connection_job_t C) {
+  struct connection_info *c = CONN_INFO (C);
   struct tcp_rpc_data *D = TCP_RPC_DATA (C);
   if (D->in_packet_num == -3 && !(D->extra_int & EXT_TCPRPC_F_UNDET_COUNTED)) {
     D->extra_int |= EXT_TCPRPC_F_UNDET_COUNTED;
     undetermined_conn_count++;
+    __atomic_fetch_add (&undetermined_conn_count_global, 1, __ATOMIC_RELAXED);
+    D->extra_int4 = c->in.total_bytes > 0 ? c->in.total_bytes : 0;
+    if (D->extra_int4 > 0) {
+      __atomic_fetch_add (&undetermined_bytes_global, (long long) D->extra_int4, __ATOMIC_RELAXED);
+    }
   }
 }
 
 static void undetermined_conn_leave (connection_job_t C) {
   struct tcp_rpc_data *D = TCP_RPC_DATA (C);
   if ((D->extra_int & EXT_TCPRPC_F_UNDET_COUNTED)) {
+    if (D->extra_int4 > 0) {
+      __atomic_fetch_sub (&undetermined_bytes_global, (long long) D->extra_int4, __ATOMIC_RELAXED);
+      D->extra_int4 = 0;
+    }
     D->extra_int &= ~EXT_TCPRPC_F_UNDET_COUNTED;
     if (undetermined_conn_count > 0) {
       undetermined_conn_count--;
     }
+    __atomic_fetch_sub (&undetermined_conn_count_global, 1, __ATOMIC_RELAXED);
   }
 }
 
@@ -325,9 +363,15 @@ int tcp_rpc_proxy_domains_prepare_stat (stats_buffer_t *sb) {
   sb_printf (sb, "tls_probe_throttle_delayed\t%llu\n", __atomic_load_n (&probe_stat_delayed, __ATOMIC_RELAXED));
   sb_printf (sb, "tls_probe_throttle_delay_ms_sum\t%llu\n", __atomic_load_n (&probe_stat_delay_ms_sum, __ATOMIC_RELAXED));
   sb_printf (sb, "tls_dos_undetermined_conns_limit\t%d\n", (int)MAX_UNDETERMINED_CONNS);
+  sb_printf (sb, "tls_dos_undetermined_conns_global_limit\t%d\n", (int)MAX_UNDETERMINED_CONNS_GLOBAL);
+  sb_printf (sb, "tls_dos_undetermined_conns_global_now\t%d\n", (int)__atomic_load_n (&undetermined_conn_count_global, __ATOMIC_RELAXED));
   sb_printf (sb, "tls_dos_undetermined_bytes_limit\t%d\n", (int)MAX_UNDETERMINED_BUFFER_BYTES);
+  sb_printf (sb, "tls_dos_undetermined_bytes_global_limit\t%lld\n", (long long)MAX_UNDETERMINED_BYTES_GLOBAL);
+  sb_printf (sb, "tls_dos_undetermined_bytes_global_now\t%lld\n", (long long)__atomic_load_n (&undetermined_bytes_global, __ATOMIC_RELAXED));
   sb_printf (sb, "tls_dos_undetermined_conns_closed\t%llu\n", __atomic_load_n (&dos_stat_undetermined_conns_closed, __ATOMIC_RELAXED));
+  sb_printf (sb, "tls_dos_undetermined_global_conns_closed\t%llu\n", __atomic_load_n (&dos_stat_undetermined_global_conns_closed, __ATOMIC_RELAXED));
   sb_printf (sb, "tls_dos_undetermined_bytes_closed\t%llu\n", __atomic_load_n (&dos_stat_undetermined_bytes_closed, __ATOMIC_RELAXED));
+  sb_printf (sb, "tls_dos_undetermined_global_bytes_closed\t%llu\n", __atomic_load_n (&dos_stat_undetermined_global_bytes_closed, __ATOMIC_RELAXED));
 
   int idx = 0;
   int i;
@@ -2030,9 +2074,14 @@ int tcp_rpcs_ext_init_accepted (connection_job_t C) {
   job_timer_insert (C, precise_now + 3);
   int r = tcp_rpcs_init_accepted_nohs (C);
   undetermined_conn_enter (C);
-  if (undetermined_conn_count > MAX_UNDETERMINED_CONNS) {
-    // Hard cap: too many undetermined sockets. Close immediately to keep resources bounded.
+  int global_undetermined = __atomic_load_n (&undetermined_conn_count_global, __ATOMIC_RELAXED);
+  if (undetermined_conn_count > MAX_UNDETERMINED_CONNS ||
+      global_undetermined > MAX_UNDETERMINED_CONNS_GLOBAL) {
+    // Hard caps: too many undetermined sockets. Close immediately to keep resources bounded.
     __atomic_fetch_add (&dos_stat_undetermined_conns_closed, 1, __ATOMIC_RELAXED);
+    if (global_undetermined > MAX_UNDETERMINED_CONNS_GLOBAL) {
+      __atomic_fetch_add (&dos_stat_undetermined_global_conns_closed, 1, __ATOMIC_RELAXED);
+    }
     connection_write_close (C);
   }
   return r;
@@ -2074,6 +2123,23 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
     len = c->in.total_bytes; 
     if (len <= 0) {
       return NEED_MORE_BYTES;
+    }
+
+    if (D->in_packet_num == -3) {
+      undetermined_conn_account_bytes (C, len);
+      long long global_undetermined_bytes = __atomic_load_n (&undetermined_bytes_global, __ATOMIC_RELAXED);
+      if (global_undetermined_bytes > MAX_UNDETERMINED_BYTES_GLOBAL) {
+        vkprintf (1, "too much undetermined buffered data globally (%lld bytes), closing %s:%d\n",
+                  global_undetermined_bytes, show_remote_ip (C), c->remote_port);
+        __atomic_fetch_add (&dos_stat_undetermined_global_bytes_closed, 1, __ATOMIC_RELAXED);
+        int blocked = 0;
+        int delay_ms = probe_note_failure (C, 2, &blocked);
+        if (blocked) {
+          connection_write_close (C);
+          return NEED_MORE_BYTES;
+        }
+        return tls_schedule_delayed_close (C, delay_ms);
+      }
     }
 
     if (D->in_packet_num == -3 && len > MAX_UNDETERMINED_BUFFER_BYTES) {
