@@ -1120,7 +1120,7 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
     if (ci && (ci->flags & C_IS_TLS)) {
       int left = tls_shape_load_i32 (&ci->tls_write_jitter_left, __ATOMIC_RELAXED, tls_fastpath);
       if (left > 0 && !job_timer_active (C)) {
-        int ms = 1 + (lrand48_j () % 12); // 1..12ms
+        int ms = 1 + (lrand48_j () % 4); // 1..4ms
         tls_shape_store_i32 (&ci->tls_write_jitter_left, left - 1, __ATOMIC_RELAXED, tls_fastpath);
         __sync_fetch_and_or (&c->flags, C_NOWR);
         job_timer_insert (C, precise_now + 0.001 * ms);
