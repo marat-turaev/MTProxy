@@ -2593,6 +2593,38 @@ int f_parse_option (int val) {
     tcp_rpc_set_ip_acl_refresh_interval (x);
     break;
   }
+  case 2010: {
+    int x = atoi (optarg);
+    if (x < 1 || x > 5000000) {
+      kprintf ("'--replay-cache-max-entries' must be in range [1, 5000000], got '%s'\n", optarg);
+      usage ();
+      return 2;
+    }
+    tcp_rpc_set_replay_cache_max_entries (x);
+    break;
+  }
+  case 2011: {
+    int x = atoi (optarg);
+    if (x < 1 || x > 2592000) {
+      kprintf ("'--replay-cache-max-age' must be in range [1, 2592000] seconds, got '%s'\n", optarg);
+      usage ();
+      return 2;
+    }
+    tcp_rpc_set_replay_cache_max_age (x);
+    break;
+  }
+  case 2012: {
+    char *end = 0;
+    errno = 0;
+    unsigned long long x = strtoull (optarg, &end, 10);
+    if (optarg[0] == '-' || errno || !end || *end) {
+      kprintf ("'--replay-cache-max-bytes' expects a non-negative integer, got '%s'\n", optarg);
+      usage ();
+      return 2;
+    }
+    tcp_rpc_set_replay_cache_max_bytes (x);
+    break;
+  }
   default:
     return -1;
   }
@@ -2609,6 +2641,9 @@ void mtfront_prepare_parse_options (void) {
   parse_option ("ip-blocklist-file", required_argument, 0, 2006, "path to CIDR/IP deny-list file, refreshed periodically");
   parse_option ("ip-allowlist-file", required_argument, 0, 2007, "path to CIDR/IP allow-list file, refreshed periodically");
   parse_option ("ip-acl-refresh-interval", required_argument, 0, 2008, "IP ACL refresh period in seconds (0 disables periodic refresh)");
+  parse_option ("replay-cache-max-entries", required_argument, 0, 2010, "hard cap for replay cache entries");
+  parse_option ("replay-cache-max-age", required_argument, 0, 2011, "hard cap for replay cache entry age in seconds");
+  parse_option ("replay-cache-max-bytes", required_argument, 0, 2012, "optional replay cache memory budget in bytes (0 disables)");
   parse_option ("mtproto-secret", required_argument, 0, 'S', "16-byte secret in hex mode");
   parse_option ("proxy-tag", required_argument, 0, 'P', "16-byte proxy tag in hex mode to be passed along with all forwarded queries");
   parse_option ("domain", required_argument, 0, 'D', "adds allowed domain for TLS-transport mode, disables other transports; can be specified more than once");

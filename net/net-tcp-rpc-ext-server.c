@@ -187,6 +187,9 @@ static int max_secret_unique_ips;
 static int max_secret_connections;
 static unsigned long long max_secret_total_octets;
 static int client_handshake_timeout = 3;
+static int replay_cache_max_entries = 200000;
+static int replay_cache_max_age = 2 * 86400;
+static unsigned long long replay_cache_max_bytes;
 
 // Aggregate throttling stats (no per-IP data, safe for /stats).
 static unsigned long long probe_stat_calls;
@@ -1019,6 +1022,9 @@ int tcp_rpc_proxy_domains_prepare_stat (stats_buffer_t *sb) {
   sb_printf (sb, "tls_probe_table_net_used\t%llu\n", __atomic_load_n (&tls_probe_table_net_used, __ATOMIC_RELAXED));
   sb_printf (sb, "tls_replay_cache_entries\t%llu\n", __atomic_load_n (&tls_replay_cache_entries, __ATOMIC_RELAXED));
   sb_printf (sb, "tls_replay_cache_evictions\t%llu\n", __atomic_load_n (&tls_replay_cache_evictions, __ATOMIC_RELAXED));
+  sb_printf (sb, "tls_replay_cache_max_entries\t%d\n", replay_cache_max_entries);
+  sb_printf (sb, "tls_replay_cache_max_age_sec\t%d\n", replay_cache_max_age);
+  sb_printf (sb, "tls_replay_cache_max_bytes\t%llu\n", replay_cache_max_bytes);
   unsigned long long replay_checks = __atomic_load_n (&tls_replay_cache_checks, __ATOMIC_RELAXED);
   unsigned long long replay_hits = __atomic_load_n (&tls_replay_cache_hits, __ATOMIC_RELAXED);
   sb_printf (sb, "tls_replay_cache_checks\t%llu\n", replay_checks);
@@ -2200,6 +2206,30 @@ void tcp_rpc_set_client_handshake_timeout (int timeout_seconds) {
   client_handshake_timeout = timeout_seconds;
 }
 
+void tcp_rpc_set_replay_cache_max_entries (int limit) {
+  if (limit < 1) {
+    limit = 1;
+  } else if (limit > 5000000) {
+    limit = 5000000;
+  }
+  replay_cache_max_entries = limit;
+}
+
+void tcp_rpc_set_replay_cache_max_age (int seconds) {
+  if (seconds < 1) {
+    seconds = 1;
+  } else if (seconds > 30 * 86400) {
+    seconds = 30 * 86400;
+  }
+  replay_cache_max_age = seconds;
+}
+
+void tcp_rpc_set_replay_cache_max_bytes (unsigned long long bytes_limit) {
+  if (bytes_limit > 0 && bytes_limit < 64) {
+    bytes_limit = 64;
+  }
+  replay_cache_max_bytes = bytes_limit;
+}
 struct client_random {
   unsigned char random[16];
   struct client_random *next_by_time;
@@ -2213,6 +2243,10 @@ static struct client_random *client_randoms[1 << RANDOM_HASH_BITS];
 static struct client_random *first_client_random;
 static struct client_random *last_client_random;
 static int client_random_count;
+
+static unsigned long long replay_cache_estimated_bytes (void) {
+  return (unsigned long long)client_random_count * (unsigned long long)sizeof (struct client_random);
+}
 
 static struct client_random **get_client_random_bucket (unsigned char random[16]) {
   int i = RANDOM_HASH_BITS;
@@ -2270,8 +2304,6 @@ static int add_client_random (unsigned char random[16]) {
   return 0;
 }
 
-#define MAX_CLIENT_RANDOM_CACHE_TIME 2 * 86400
-
 static void delete_client_random_head (void) {
   struct client_random *entry = first_client_random;
   if (!entry) {
@@ -2299,16 +2331,19 @@ static void delete_client_random_head (void) {
   }
 }
 
-#define MAX_CLIENT_RANDOM_ENTRIES 200000
-
 static void trim_client_randoms_limit (void) {
-  while (client_random_count > MAX_CLIENT_RANDOM_ENTRIES && first_client_random) {
+  while (first_client_random) {
+    int over_entries = client_random_count > replay_cache_max_entries;
+    int over_bytes = replay_cache_max_bytes > 0 && replay_cache_estimated_bytes () > replay_cache_max_bytes;
+    if (!over_entries && !over_bytes) {
+      break;
+    }
     delete_client_random_head ();
   }
 }
 
 static void delete_old_client_randoms (void) {
-  while (first_client_random && first_client_random->time <= now - MAX_CLIENT_RANDOM_CACHE_TIME) {
+  while (first_client_random && first_client_random->time <= now - replay_cache_max_age) {
     delete_client_random_head ();
   }
 }
@@ -2329,7 +2364,7 @@ static int is_allowed_timestamp (int timestamp) {
   // first_client_random->time is an exact time when corresponding request was received
   // if the timestamp is bigger than (first_client_random->time + 3), then the current request could be accepted
   // only after the request with first_client_random, so the client random still must be cached
-  // if the request wasn't accepted, then the client_random still will be cached for MAX_CLIENT_RANDOM_CACHE_TIME seconds,
+  // if the request wasn't accepted, then the client_random still will be cached for replay_cache_max_age seconds,
   // so we can miss duplicate request only after a lot of time has passed
   if (first_client_random != NULL && timestamp > first_client_random->time + 3) {
     vkprintf (1, "Allow new request with timestamp %d\n", timestamp);
