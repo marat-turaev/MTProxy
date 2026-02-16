@@ -2199,6 +2199,9 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
 
     int min_len = (D->flags & RPC_F_MEDIUM) ? 4 : 1;
     if (len < min_len + 8) {
+      if (D->in_packet_num == -3) {
+        return NEED_MORE_BYTES;
+      }
       return min_len + 8 - len;
     }
 
@@ -2246,7 +2249,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
       // fake tls
       if (c->flags & C_IS_TLS) {
         if (len < 11) {
-          return 11 - len;
+          return NEED_MORE_BYTES;
         }
 
         vkprintf (1, "Established TLS connection from %s:%d\n", show_remote_ip (C), c->remote_port);
@@ -2261,7 +2264,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         min_len = 11 + 256 * header[9] + header[10];
         if (len < min_len) {
           vkprintf (2, "Need %d bytes, but have only %d\n", min_len, len);
-          return min_len - len;
+          return NEED_MORE_BYTES;
         }
 
         assert (rwm_skip_data (&c->in, 11) == 11);
@@ -2305,7 +2308,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         }
         min_len = 5 + 256 * header[3] + header[4];
         if (len < min_len) {
-          return min_len - len;
+          return NEED_MORE_BYTES;
         }
 
         enum { MAX_CLIENT_HELLO_READ = 4096 };
@@ -2562,7 +2565,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
 #else
         vkprintf (1, "\"random\" 64-byte header: have %d bytes, need %d more bytes to distinguish\n", len, 64 - len);
 #endif
-        return 64 - len;
+        return NEED_MORE_BYTES;
       }
 
       unsigned char random_header[64];
