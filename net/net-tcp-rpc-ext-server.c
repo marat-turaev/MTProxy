@@ -38,6 +38,7 @@
 #include <netdb.h>
 
 #include <openssl/bn.h>
+#include <openssl/evp.h>
 #include <openssl/rand.h>
 
 #include "common/common-stats.h"
@@ -393,7 +394,7 @@ static BIGNUM *get_double_x (BIGNUM *x, const BIGNUM *mod, BN_CTX *big_num_conte
   return numerator;
 }
 
-static void generate_public_key (unsigned char key[32]) {
+static void generate_public_key_slow_bn (unsigned char key[32]) {
   BIGNUM *mod = NULL;
   assert (BN_hex2bn (&mod, "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffed") == 64);
   BIGNUM *pow = NULL;
@@ -442,6 +443,30 @@ static void generate_public_key (unsigned char key[32]) {
   BN_CTX_free (big_num_context);
   BN_clear_free (pow);
   BN_clear_free (mod);
+}
+
+static void generate_public_key (unsigned char key[32]) {
+  // Generate a valid-looking X25519 keyshare for TLS 1.3.
+  // This is only used for compatibility (synthetic TLS); it is not used for any real key agreement.
+  EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_id (EVP_PKEY_X25519, NULL);
+  EVP_PKEY *pkey = NULL;
+  size_t len = 32;
+
+  if (pctx &&
+      EVP_PKEY_keygen_init (pctx) > 0 &&
+      EVP_PKEY_keygen (pctx, &pkey) > 0 &&
+      EVP_PKEY_get_raw_public_key (pkey, key, &len) > 0 &&
+      len == 32) {
+    EVP_PKEY_free (pkey);
+    EVP_PKEY_CTX_free (pctx);
+    return;
+  }
+
+  EVP_PKEY_free (pkey);
+  EVP_PKEY_CTX_free (pctx);
+
+  // Fallback for unusual OpenSSL builds: keep old slow generator.
+  generate_public_key_slow_bn (key);
 }
 
 static void add_string (unsigned char *str, int *pos, const char *data, int data_len) {
