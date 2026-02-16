@@ -1779,6 +1779,9 @@ static void probe_set_key_key (struct probe_entry *e, unsigned ip4, const unsign
 static struct probe_entry *probe_get_entry_tbl (struct probe_entry *tbl, const struct connection_info *c) {
   unsigned idx = c->remote_ip ? probe_hash4 (c->remote_ip) : probe_hash6 (c->remote_ipv6);
   unsigned i;
+  struct probe_entry *evict = NULL;
+  int evict_score = 0;
+  int evict_last_time = 0;
   for (i = 0; i < 16; i++) {
     struct probe_entry *e = &tbl[(idx + i) & (PROBE_TABLE_SIZE - 1)];
     if (!e->last_time) {
@@ -1788,9 +1791,14 @@ static struct probe_entry *probe_get_entry_tbl (struct probe_entry *tbl, const s
     if (probe_match (e, c)) {
       return e;
     }
+    if (evict == NULL || e->score < evict_score || (e->score == evict_score && e->last_time < evict_last_time)) {
+      evict = e;
+      evict_score = e->score;
+      evict_last_time = e->last_time;
+    }
   }
-  // Table is saturated in this window; fall back to an arbitrary slot.
-  struct probe_entry *e = &tbl[idx & (PROBE_TABLE_SIZE - 1)];
+  // Table is saturated in this window; evict the least valuable entry.
+  struct probe_entry *e = evict ? evict : &tbl[idx & (PROBE_TABLE_SIZE - 1)];
   probe_set_key (e, c);
   e->score = 0;
   e->blocked_until = 0;
@@ -1813,6 +1821,9 @@ static struct probe_entry *probe_get_entry_net (const struct connection_info *c)
 
   unsigned idx = !is_ipv6 ? probe_hash4 (ip4) : probe_hash6 (ip6);
   unsigned i;
+  struct probe_entry *evict = NULL;
+  int evict_score = 0;
+  int evict_last_time = 0;
   for (i = 0; i < 16; i++) {
     struct probe_entry *e = &probe_net_table[(idx + i) & (PROBE_TABLE_SIZE - 1)];
     if (!e->last_time) {
@@ -1822,8 +1833,13 @@ static struct probe_entry *probe_get_entry_net (const struct connection_info *c)
     if (probe_match_key (e, ip4, ip6, is_ipv6)) {
       return e;
     }
+    if (evict == NULL || e->score < evict_score || (e->score == evict_score && e->last_time < evict_last_time)) {
+      evict = e;
+      evict_score = e->score;
+      evict_last_time = e->last_time;
+    }
   }
-  struct probe_entry *e = &probe_net_table[idx & (PROBE_TABLE_SIZE - 1)];
+  struct probe_entry *e = evict ? evict : &probe_net_table[idx & (PROBE_TABLE_SIZE - 1)];
   probe_set_key_key (e, ip4, ip6, is_ipv6);
   e->score = 0;
   e->blocked_until = 0;
