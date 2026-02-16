@@ -2376,15 +2376,6 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         memcpy (client_random, client_hello + 11, 32);
         memset (client_hello + 11, '\0', 32);
 
-        if (have_client_random (client_random)) {
-          vkprintf (1, "Receive again request with the same client random\n");
-          return tls_reject_or_fallback (C, 40 /* handshake_failure */);
-        }
-        if (add_client_random (client_random) < 0) {
-          return tls_reject_or_fallback (C, 80 /* internal_error */);
-        }
-        delete_old_client_randoms();
-
         unsigned char expected_random[32];
         int secret_id;
         for (secret_id = 0; secret_id < ext_secret_cnt; secret_id++) {
@@ -2404,6 +2395,17 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         if (!is_allowed_timestamp (timestamp)) {
           return tls_reject_or_fallback (C, 40 /* handshake_failure */);
         }
+
+        // Track replay only for authenticated attempts: unauthenticated probes
+        // should not consume replay-cache entries or eviction budget.
+        if (have_client_random (client_random)) {
+          vkprintf (1, "Receive again request with the same client random\n");
+          return tls_reject_or_fallback (C, 40 /* handshake_failure */);
+        }
+        if (add_client_random (client_random) < 0) {
+          return tls_reject_or_fallback (C, 80 /* internal_error */);
+        }
+        delete_old_client_randoms();
 
         int pos = 76;
         int cipher_suites_length = read_length (client_hello, &pos);
