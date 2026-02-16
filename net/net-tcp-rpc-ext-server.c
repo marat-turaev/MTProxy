@@ -2740,8 +2740,9 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         // less rigid for generic clients, without blocking a worker thread.
         // (Most connections send immediately; a minority are delayed by a few ms.)
         int jitter_ms = 0;
-        if ((lrand48_j () & 3) == 0) { // 25%
-          jitter_ms = 1 + (lrand48_j () % 12); // 1..12ms
+        unsigned int jitter_r = (unsigned int) lrand48_j ();
+        if ((jitter_r & 7) < 2) { // ~25%
+          jitter_ms = 1 + ((jitter_r >> 3) % 4); // 1..4ms
         }
         if (jitter_ms > 0) {
           tls_schedule_delayed_run (C, jitter_ms);
