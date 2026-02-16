@@ -1425,8 +1425,12 @@ static int have_client_random (unsigned char random[16]) {
 
 static void trim_client_randoms_limit (void);
 
-static void add_client_random (unsigned char random[16]) {
+static int add_client_random (unsigned char random[16]) {
   struct client_random *entry = malloc (sizeof (struct client_random));
+  if (entry == NULL) {
+    vkprintf (0, "failed to allocate client_random cache entry\n");
+    return -1;
+  }
   memcpy (entry->random, random, 16);
   entry->time = now;
   entry->next_by_time = NULL;
@@ -1444,6 +1448,7 @@ static void add_client_random (unsigned char random[16]) {
 
   client_random_count++;
   trim_client_randoms_limit ();
+  return 0;
 }
 
 #define MAX_CLIENT_RANDOM_CACHE_TIME 2 * 86400
@@ -2352,7 +2357,9 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
           vkprintf (1, "Receive again request with the same client random\n");
           return tls_reject_or_fallback (C, 40 /* handshake_failure */);
         }
-        add_client_random (client_random);
+        if (add_client_random (client_random) < 0) {
+          return tls_reject_or_fallback (C, 80 /* internal_error */);
+        }
         delete_old_client_randoms();
 
         unsigned char expected_random[32];
