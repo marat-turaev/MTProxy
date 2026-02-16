@@ -50,7 +50,7 @@ DEPDIRS := ${DEP} $(addprefix ${DEP}/,${PROJECTS})
 ALLDIRS := ${DEPDIRS} ${OBJDIRS}
 
 
-.PHONY:	all clean 
+.PHONY:	all clean sanitize tsan
 
 EXELIST	:= ${EXE}/mtproto-proxy
 
@@ -123,3 +123,13 @@ clean:
 	rm -rf ${OBJ} ${DEP} ${EXE} || true
 
 force-clean: clean
+
+sanitize:
+	@$(MAKE) clean
+	@$(MAKE) CFLAGS='$(CFLAGS) -O1 -g -fno-omit-frame-pointer -fno-lto -fsanitize=address,undefined' \
+	  LDFLAGS='$(LDFLAGS) -fno-lto -fsanitize=address,undefined' all
+
+tsan:
+	@$(MAKE) clean
+	@$(MAKE) CFLAGS='$(CFLAGS) -O1 -g -fno-omit-frame-pointer -fno-lto -fsanitize=thread' \
+	  LDFLAGS='$(LDFLAGS) -fno-lto -fsanitize=thread' all

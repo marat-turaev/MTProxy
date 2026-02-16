@@ -28,6 +28,13 @@ make && cd objs/bin
 
 If the build has failed, you should run `make clean` before building it again.
 
+For local one-off hardening checks, sanitizer builds are available:
+```bash
+make sanitize   # ASan + UBSan
+make tsan       # ThreadSanitizer
+```
+These targets are intended for local/debug validation, not production deployment.
+
 ## Running
 1. Obtain a secret, used to connect to telegram servers.
 ```bash
