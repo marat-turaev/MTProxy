@@ -362,6 +362,8 @@ int tcp_rpc_proxy_domains_prepare_stat (stats_buffer_t *sb) {
   sb_printf (sb, "tls_probe_throttle_blocked\t%llu\n", __atomic_load_n (&probe_stat_blocked, __ATOMIC_RELAXED));
   sb_printf (sb, "tls_probe_throttle_delayed\t%llu\n", __atomic_load_n (&probe_stat_delayed, __ATOMIC_RELAXED));
   sb_printf (sb, "tls_probe_throttle_delay_ms_sum\t%llu\n", __atomic_load_n (&probe_stat_delay_ms_sum, __ATOMIC_RELAXED));
+  sb_printf (sb, "tls_probe_table_size\t%u\n", (unsigned)PROBE_TABLE_SIZE);
+  sb_printf (sb, "tls_probe_table_bits\t%d\n", (int)MT_TLS_PROBE_TABLE_BITS);
   sb_printf (sb, "tls_dos_undetermined_conns_limit\t%d\n", (int)MAX_UNDETERMINED_CONNS);
   sb_printf (sb, "tls_dos_undetermined_conns_global_limit\t%d\n", (int)MAX_UNDETERMINED_CONNS_GLOBAL);
   sb_printf (sb, "tls_dos_undetermined_conns_global_now\t%d\n", (int)__atomic_load_n (&undetermined_conn_count_global, __ATOMIC_RELAXED));
@@ -1511,7 +1513,13 @@ static int is_allowed_timestamp (int timestamp) {
 
 // Per-thread invalid-traffic throttling (cheap, lock-free, best-effort).
 // This aims to make repeated invalid TLS handshakes expensive without affecting real clients.
-#define PROBE_TABLE_SIZE 2048
+#ifndef MT_TLS_PROBE_TABLE_BITS
+#define MT_TLS_PROBE_TABLE_BITS 13
+#endif
+#if MT_TLS_PROBE_TABLE_BITS < 8 || MT_TLS_PROBE_TABLE_BITS > 20
+#error "MT_TLS_PROBE_TABLE_BITS must be in range [8, 20]"
+#endif
+#define PROBE_TABLE_SIZE (1u << MT_TLS_PROBE_TABLE_BITS)
 struct probe_entry {
   unsigned ip4;
   unsigned char ip6[16];
@@ -1525,7 +1533,7 @@ static __thread struct probe_entry probe_net_table[PROBE_TABLE_SIZE];
 
 static unsigned probe_hash4 (unsigned ip4) {
   // Knuth multiplicative hash.
-  return (ip4 * 2654435761u) >> (32 - 11); // 2^11 == 2048
+  return (ip4 * 2654435761u) >> (32 - MT_TLS_PROBE_TABLE_BITS);
 }
 
 static unsigned probe_hash6 (const unsigned char ip6[16]) {
@@ -1533,7 +1541,7 @@ static unsigned probe_hash6 (const unsigned char ip6[16]) {
   unsigned w[4];
   memcpy (w, ip6, 16);
   unsigned h = w[0] ^ w[1] ^ w[2] ^ w[3];
-  return (h * 2654435761u) >> (32 - 11);
+  return (h * 2654435761u) >> (32 - MT_TLS_PROBE_TABLE_BITS);
 }
 
 static unsigned probe_ipv4_prefix24 (unsigned ip4_host) {
