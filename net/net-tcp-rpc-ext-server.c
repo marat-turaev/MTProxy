@@ -1267,6 +1267,8 @@ int tcp_rpc_proxy_domains_prepare_stat (stats_buffer_t *sb) {
 
 #define TLS_REQUEST_LENGTH 517
 #define MAX_TLS_RESPONSE_ALLOC (1 << 15)
+#define TLS_CERT_JITTER_MIN 50
+#define TLS_CERT_JITTER_MAX 500
 
 static BIGNUM *get_y2 (BIGNUM *x, const BIGNUM *mod, BN_CTX *big_num_context) {
   // returns y^2 = x^3 + 486662 * x^2 + x
@@ -3842,6 +3844,21 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         // TLS record length is 16-bit and normally limited to 16384 bytes.
         if (encrypted_payload_size > 16384) {
           encrypted_payload_size = 16384;
+        }
+        // Add per-connection jitter to the encrypted first flight size to avoid
+        // a fixed cert-chain-like length fingerprint per domain.
+        if (encrypted_payload_size < 16384) {
+          unsigned int jr = (unsigned int) lrand48_j ();
+          if ((jr & 7) != 0) { // usually on
+            int room = 16384 - encrypted_payload_size;
+            int cert_jitter = TLS_CERT_JITTER_MIN + (int)(jr % (TLS_CERT_JITTER_MAX - TLS_CERT_JITTER_MIN + 1));
+            if (cert_jitter > room) {
+              cert_jitter = room;
+            }
+            if (cert_jitter > 0) {
+              encrypted_payload_size += cert_jitter;
+            }
+          }
         }
 
         int server_hello_rec_len = 127;
