@@ -2506,7 +2506,7 @@ int f_parse_option (int val) {
       if (val == 'S') {
 	int r = tcp_rpcs_set_ext_secret (secret);
 	if (r < 0) {
-          kprintf ("too many mtproto-secret values (maximum 16)\n");
+          kprintf ("too many mtproto-secret values (maximum %d)\n", EXT_SECRET_MAX);
           usage ();
           return 2;
         }

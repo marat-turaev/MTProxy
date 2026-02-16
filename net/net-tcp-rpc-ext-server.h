@@ -21,6 +21,7 @@
 #pragma once
 
 #define __ALLOW_UNOBFS__ 0
+#define EXT_SECRET_MAX 256
 
 #include "net/net-tcp-rpc-server.h"
 #include "net/net-connections.h"

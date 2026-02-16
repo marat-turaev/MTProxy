@@ -158,7 +158,7 @@ int tcp_proxy_pass_write_packet (connection_job_t C, struct raw_message *raw) {
 
 int tcp_rpcs_default_execute (connection_job_t c, int op, struct raw_message *msg);
 
-static unsigned char ext_secret[16][16];
+static unsigned char ext_secret[EXT_SECRET_MAX][16];
 static int ext_secret_cnt = 0;
 
 int tcp_rpcs_set_ext_secret (unsigned char secret[16]) {
@@ -168,7 +168,7 @@ int tcp_rpcs_set_ext_secret (unsigned char secret[16]) {
       return 1;
     }
   }
-  if (ext_secret_cnt >= 16) {
+  if (ext_secret_cnt >= EXT_SECRET_MAX) {
     return -1;
   }
   memcpy (ext_secret[ext_secret_cnt ++], secret, 16);
@@ -223,8 +223,34 @@ static unsigned long long tls_ip_allowlist_denied;
 static unsigned long long tls_ip_blocklist_denied;
 static unsigned long long tls_ip_acl_refresh_success;
 static unsigned long long tls_ip_acl_refresh_fail;
-static __thread unsigned int secret_conn_count[16];
-static __thread unsigned long long secret_total_octets[16];
+static __thread unsigned int secret_conn_count[EXT_SECRET_MAX];
+static __thread unsigned long long secret_total_octets[EXT_SECRET_MAX];
+
+static int is_forbidden_obf2_prefix (const unsigned char random_header[64]) {
+  static const unsigned char forbidden_ascii[][4] = {
+    {'G', 'E', 'T', ' '},
+    {'P', 'O', 'S', 'T'},
+    {'H', 'E', 'A', 'D'},
+    {'O', 'P', 'T', 'I'}
+  };
+
+  if (!memcmp (random_header, "\0\0\0\0", 4) ||
+      !memcmp (random_header + 4, "\0\0\0\0", 4) ||
+      !memcmp (random_header, "\xdd\xdd\xdd\xdd", 4) ||
+      !memcmp (random_header, "\xee\xee\xee\xee", 4) ||
+      !memcmp (random_header, "\xef\xef\xef\xef", 4)) {
+    return 1;
+  }
+
+  int i;
+  for (i = 0; i < (int)(sizeof (forbidden_ascii) / sizeof (forbidden_ascii[0])); i++) {
+    if (!memcmp (random_header, forbidden_ascii[i], 4)) {
+      return 1;
+    }
+  }
+
+  return 0;
+}
 
 typedef struct {
   uint32_t start;
@@ -1173,7 +1199,7 @@ int tcp_rpc_proxy_domains_prepare_stat (stats_buffer_t *sb) {
   unsigned long long secret_active_connections = 0;
   unsigned long long secret_total_octets_sum = 0;
   int si;
-  for (si = 0; si < ext_secret_cnt && si < 16; si++) {
+  for (si = 0; si < ext_secret_cnt && si < EXT_SECRET_MAX; si++) {
     secret_active_connections += (unsigned long long) secret_conn_count[si];
     secret_total_octets_sum += secret_total_octets[si];
   }
@@ -2620,7 +2646,7 @@ struct secret_ip_entry {
   unsigned char state; // 0 = empty, 1 = used, 2 = tombstone
 };
 static __thread struct secret_ip_entry secret_ip_table[SECRET_IP_TABLE_SIZE];
-static __thread int secret_unique_ip_count[16];
+static __thread int secret_unique_ip_count[EXT_SECRET_MAX];
 
 static int conn_get_secret_slot (connection_job_t C) {
   struct tcp_rpc_data *D = TCP_RPC_DATA (C);
@@ -2650,7 +2676,7 @@ static int secret_ip_entry_match (const struct secret_ip_entry *e, int secret_sl
 }
 
 static int secret_ip_limit_enter (connection_job_t C, int secret_slot) {
-  if (max_secret_unique_ips <= 0 || secret_slot < 0 || secret_slot >= 16) {
+  if (max_secret_unique_ips <= 0 || secret_slot < 0 || secret_slot >= EXT_SECRET_MAX) {
     return 0;
   }
   if (conn_get_secret_slot (C) >= 0) {
@@ -2710,7 +2736,7 @@ static int secret_ip_limit_enter (connection_job_t C, int secret_slot) {
 
 static void secret_ip_limit_leave (connection_job_t C) {
   int secret_slot = conn_get_secret_slot (C);
-  if (max_secret_unique_ips <= 0 || secret_slot < 0 || secret_slot >= 16) {
+  if (max_secret_unique_ips <= 0 || secret_slot < 0 || secret_slot >= EXT_SECRET_MAX) {
     conn_set_secret_slot (C, -1);
     return;
   }
@@ -2749,7 +2775,7 @@ static void secret_ip_limit_leave (connection_job_t C) {
 
 static int secret_conn_limit_enter (connection_job_t C) {
   int secret_slot = conn_get_secret_slot (C);
-  if (secret_slot < 0 || secret_slot >= 16) {
+  if (secret_slot < 0 || secret_slot >= EXT_SECRET_MAX) {
     return 0;
   }
   struct tcp_rpc_data *D = TCP_RPC_DATA (C);
@@ -2776,7 +2802,7 @@ static void secret_conn_limit_leave (connection_job_t C) {
     return;
   }
   D->extra_int &= ~(EXT_TCPRPC_F_SECRET_CONN_COUNTED | EXT_TCPRPC_F_SECRET_QUOTA_HIT);
-  if (secret_slot >= 0 && secret_slot < 16 && secret_conn_count[secret_slot] > 0) {
+  if (secret_slot >= 0 && secret_slot < EXT_SECRET_MAX && secret_conn_count[secret_slot] > 0) {
     secret_conn_count[secret_slot]--;
   }
 }
@@ -2786,7 +2812,7 @@ static void secret_octet_quota_note (connection_job_t C, int bytes) {
     return;
   }
   int secret_slot = conn_get_secret_slot (C);
-  if (secret_slot < 0 || secret_slot >= 16) {
+  if (secret_slot < 0 || secret_slot >= EXT_SECRET_MAX) {
     return;
   }
   unsigned long long prev = __atomic_fetch_add (&secret_total_octets[secret_slot], (unsigned long long)bytes, __ATOMIC_RELAXED);
@@ -4021,6 +4047,16 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
       unsigned char random_header[64];
       unsigned char k[48];
       assert (rwm_fetch_lookup (&c->in, random_header, 64) == 64);
+
+      if (is_forbidden_obf2_prefix (random_header)) {
+        vkprintf (1, "forbidden obfuscated2 prefix, closing\n");
+        int blocked = 0;
+        int delay_ms = probe_note_failure (C, 2, &blocked);
+        if (blocked) {
+          return tls_schedule_blocked_reject (C, 50 /* decode_error */);
+        }
+        return tls_schedule_delayed_reject (C, delay_ms, 50 /* decode_error */);
+      }
         
       unsigned char random_header_sav[64];
       memcpy (random_header_sav, random_header, 64);
