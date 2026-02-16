@@ -2438,7 +2438,12 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
           pos += 3;
         response_buffer[pos++] = encrypted_payload_size / 256;
         response_buffer[pos++] = encrypted_payload_size % 256;
-        RAND_bytes (response_buffer + pos, encrypted_payload_size);
+        if (RAND_bytes (response_buffer + pos, encrypted_payload_size) != 1) {
+          vkprintf (1, "RAND_bytes failed while building TLS response, closing connection\n");
+          free (buffer);
+          connection_write_close (C);
+          return NEED_MORE_BYTES;
+        }
         pos += encrypted_payload_size;
         assert (pos == response_size);
 
