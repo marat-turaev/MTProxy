@@ -110,6 +110,9 @@ const char FullVersionStr[] = VERSION_STR " compiled at " __DATE__ " " __TIME__ 
 #define MAX_MTFRONT_NB			((NB_max * 3) >> 2)
 #endif
 
+#define CONN_BACKPRESSURE_HIGH (1 << 16)
+#define CONN_BACKPRESSURE_LOW  (1 << 15)
+
 static double ping_interval = PING_INTERVAL;
 static int window_clamp;
 
@@ -192,6 +195,12 @@ struct ext_connection_ref {
 };
 
 long long ext_connections, ext_connections_created;
+
+struct conn_backpressure_state {
+  int generation;
+  unsigned char paused;
+};
+static struct conn_backpressure_state ConnBackpressure[MAX_CONNECTIONS];
 
 struct ext_connection_ref OutExtConnections[EXT_CONN_TABLE_SIZE];
 struct ext_connection *InExtConnectionHash[EXT_CONN_HASH_SIZE];
@@ -2170,12 +2179,54 @@ void check_all_conn_buffers (void) {
 
 int check_conn_buffers (connection_job_t c) {
   int tot_used_bytes = CONN_INFO(c)->in.total_bytes + CONN_INFO(c)->in_u.total_bytes + CONN_INFO(c)->out.total_bytes + CONN_INFO(c)->out_p.total_bytes;
+  int fd = CONN_INFO(c)->fd;
+  int generation = CONN_INFO(c)->generation;
+  int paused = 0;
+  if ((unsigned)fd < MAX_CONNECTIONS) {
+    struct conn_backpressure_state *bp = &ConnBackpressure[fd];
+    paused = bp->paused && bp->generation == generation;
+  }
+
   if (tot_used_bytes > MAX_CONNECTION_BUFFER_SPACE) {
     vkprintf (2, "check_conn_buffers(): closing connection %d because of %d buffer bytes used (%d max)\n", CONN_INFO(c)->fd, tot_used_bytes, MAX_CONNECTION_BUFFER_SPACE);
+    if ((unsigned)fd < MAX_CONNECTIONS) {
+      ConnBackpressure[fd].paused = 0;
+      ConnBackpressure[fd].generation = generation;
+    }
     fail_connection (c, -429);
     ++connections_failed_flood;
     return -1;
   }
+
+  if (!paused && tot_used_bytes >= CONN_BACKPRESSURE_HIGH) {
+    socket_connection_job_t S = CONN_INFO(c)->io_conn;
+    __sync_fetch_and_or (&CONN_INFO(c)->flags, C_STOPREAD);
+    if (S) {
+      __sync_fetch_and_or (&SOCKET_CONN_INFO(S)->flags, C_STOPREAD);
+    }
+    if ((unsigned)fd < MAX_CONNECTIONS) {
+      ConnBackpressure[fd].paused = 1;
+      ConnBackpressure[fd].generation = generation;
+    }
+    vkprintf (3, "check_conn_buffers(): pausing read on fd=%d at %d bytes\n", fd, tot_used_bytes);
+  } else if (paused && tot_used_bytes <= CONN_BACKPRESSURE_LOW) {
+    struct connection_info *ci = CONN_INFO(c);
+    if (ci->status == conn_working && !(ci->flags & (C_ERROR | C_FAILED | C_NET_FAILED | C_STOPPARSE))) {
+      socket_connection_job_t S = ci->io_conn;
+      __sync_fetch_and_and (&ci->flags, ~C_STOPREAD);
+      if (S) {
+        __sync_fetch_and_and (&SOCKET_CONN_INFO(S)->flags, ~C_STOPREAD);
+        job_signal (JOB_REF_CREATE_PASS (S), JS_RUN);
+      }
+      job_signal (JOB_REF_CREATE_PASS (c), JS_RUN);
+      vkprintf (3, "check_conn_buffers(): resuming read on fd=%d at %d bytes\n", fd, tot_used_bytes);
+    }
+    if ((unsigned)fd < MAX_CONNECTIONS) {
+      ConnBackpressure[fd].paused = 0;
+      ConnBackpressure[fd].generation = generation;
+    }
+  }
+
   return 0;
 }
 
