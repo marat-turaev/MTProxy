@@ -144,6 +144,11 @@ File format:
 
 Operational note:
 - Current implementation is file-based only. If you use remote feeds, fetch them externally (cron/systemd timer), validate/sanitize, then atomically replace the local file.
+- A helper updater is included in this repo: `scripts/mtproxy-update-ip-blocklist.sh`.
+- Example cron line:
+```text
+*/30 * * * * root /usr/local/sbin/mtproxy-update-ip-blocklist.sh >>/var/log/mtproxy-ip-blocklist.log 2>&1
+```
 
 Client secret format for TLS-transport is:
 `ee<secret_hex><domain_hex>`
