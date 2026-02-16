@@ -1266,6 +1266,7 @@ int tcp_rpc_proxy_domains_prepare_stat (stats_buffer_t *sb) {
 }
 
 #define TLS_REQUEST_LENGTH 517
+#define MAX_TLS_RESPONSE_ALLOC (1 << 15)
 
 static BIGNUM *get_y2 (BIGNUM *x, const BIGNUM *mod, BN_CTX *big_num_context) {
   // returns y^2 = x^3 + 486662 * x^2 + x
@@ -3834,9 +3835,14 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
           server_hello_rec_len = info->server_hello_template_len;
         }
         int response_size = server_hello_rec_len + 6 + 5 + encrypted_payload_size;
-        unsigned char *buffer = malloc (32 + response_size);
+        if (response_size <= 0 || response_size > MAX_TLS_RESPONSE_ALLOC - 32) {
+          vkprintf (0, "invalid TLS response size: %d (limit %d)\n", response_size, MAX_TLS_RESPONSE_ALLOC - 32);
+          return tls_send_alert_and_close (C, 80 /* internal_error */);
+        }
+        size_t response_alloc = (size_t)32 + (size_t)response_size;
+        unsigned char *buffer = malloc (response_alloc);
         if (buffer == NULL) {
-          vkprintf (0, "failed to allocate TLS response buffer of %d bytes\n", 32 + response_size);
+          vkprintf (0, "failed to allocate TLS response buffer of %llu bytes\n", (unsigned long long)response_alloc);
           return tls_send_alert_and_close (C, 80 /* internal_error */);
         }
         memcpy (buffer, client_random, 32);
