@@ -1865,6 +1865,29 @@ static int tls_schedule_delayed_close (connection_job_t C, int delay_ms) {
   return NEED_MORE_BYTES;
 }
 
+static int input_looks_like_tls_handshake (connection_job_t C) {
+  struct connection_info *c = CONN_INFO (C);
+  if (c->flags & C_IS_TLS) {
+    return 1;
+  }
+  if (c->in.total_bytes < 3) {
+    return 0;
+  }
+  unsigned char pfx[3];
+  if (rwm_fetch_lookup (&c->in, pfx, 3) != 3) {
+    return 0;
+  }
+  // TLS Handshake record (content-type 22), TLS family version marker (0x03 xx).
+  return pfx[0] == 0x16 && pfx[1] == 0x03 && pfx[2] <= 0x04;
+}
+
+static int tls_schedule_delayed_reject (connection_job_t C, int delay_ms, unsigned char alert_description) {
+  if (input_looks_like_tls_handshake (C)) {
+    return tls_schedule_delayed_alert (C, alert_description, delay_ms);
+  }
+  return tls_schedule_delayed_close (C, delay_ms);
+}
+
 static int tls_schedule_delayed_run (connection_job_t C, int delay_ms) {
   struct tcp_rpc_data *D = TCP_RPC_DATA (C);
   if (D->extra_int2 != TLS_DELAY_ACTION_NONE) {
@@ -1932,7 +1955,7 @@ static int reject_or_fallback_close (connection_job_t C) {
   connection_write_close (C);
   return NEED_MORE_BYTES;
   }
-  return tls_schedule_delayed_close (C, delay_ms);
+  return tls_schedule_delayed_reject (C, delay_ms, 50 /* decode_error */);
 }
 
 static int proxy_connection_fallback (connection_job_t C) {
@@ -2185,7 +2208,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
           connection_write_close (C);
           return NEED_MORE_BYTES;
         }
-        return tls_schedule_delayed_close (C, delay_ms);
+        return tls_schedule_delayed_reject (C, delay_ms, 50 /* decode_error */);
       }
     }
 
@@ -2199,7 +2222,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         connection_write_close (C);
         return NEED_MORE_BYTES;
       }
-      return tls_schedule_delayed_close (C, delay_ms);
+      return tls_schedule_delayed_reject (C, delay_ms, 50 /* decode_error */);
     }
 
     int min_len = (D->flags & RPC_F_MEDIUM) ? 4 : 1;
@@ -2743,7 +2766,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         connection_write_close (C);
         return NEED_MORE_BYTES;
       }
-        return tls_schedule_delayed_close (C, delay_ms);
+        return tls_schedule_delayed_reject (C, delay_ms, 50 /* decode_error */);
       }
 
 #if __ALLOW_UNOBFS__
@@ -2763,7 +2786,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
       connection_write_close (C);
       return NEED_MORE_BYTES;
       }
-      return tls_schedule_delayed_close (C, delay_ms);
+      return tls_schedule_delayed_reject (C, delay_ms, 50 /* decode_error */);
 #endif
     }
 
