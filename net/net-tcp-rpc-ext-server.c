@@ -2365,7 +2365,10 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         unsigned char expected_random[32];
         int secret_id;
         for (secret_id = 0; secret_id < ext_secret_cnt; secret_id++) {
-          sha256_hmac (ext_secret[secret_id], 16, client_hello, len, expected_random);
+          if (sha256_hmac (ext_secret[secret_id], 16, client_hello, len, expected_random) < 0) {
+            vkprintf (0, "sha256_hmac failed while validating ClientHello\n");
+            return tls_reject_or_fallback (C, 80 /* internal_error */);
+          }
           if (memcmp (expected_random, client_random, 28) == 0) {
             break;
           }
@@ -2509,7 +2512,11 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         assert (pos == response_size);
 
         unsigned char server_random[32];
-        sha256_hmac (ext_secret[secret_id], 16, buffer, 32 + response_size, server_random);
+        if (sha256_hmac (ext_secret[secret_id], 16, buffer, 32 + response_size, server_random) < 0) {
+          vkprintf (0, "sha256_hmac failed while building TLS response\n");
+          free (buffer);
+          return tls_send_alert_and_close (C, 80 /* internal_error */);
+        }
         memcpy (response_buffer + 11, server_random, 32);
 
         struct raw_message *m = rwm_alloc_raw_message ();
