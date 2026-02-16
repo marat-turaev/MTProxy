@@ -110,6 +110,41 @@ Behavior:
 Security note:
 - Be careful: `--fallback-backend` can unintentionally expose an internal service to the Internet. This fork only allows loopback targets (`127.0.0.1:<port>` or `[::1]:<port>`) to reduce the chance of misconfiguration; do not point it at admin panels/databases/metadata endpoints.
 
+### IP allowlist / blocklist (CIDR ACL)
+This fork supports file-based client IP ACLs with periodic reload:
+
+```bash
+./mtproto-proxy ... \
+  --ip-allowlist-file /etc/telegram/ip-allowlist.txt \
+  --ip-blocklist-file /etc/telegram/ip-blocklist.txt \
+  --ip-acl-refresh-interval 60
+```
+
+Behavior:
+- `--ip-allowlist-file`: if set, only client IPs from this file are allowed.
+- `--ip-blocklist-file`: if set, client IPs from this file are denied.
+- If both are set, allowlist check is applied first, then blocklist.
+- ACL checks are performed early on accepted connections (before expensive handshake work).
+- Reload is based on file mtime/size and runs every `--ip-acl-refresh-interval` seconds (`0` disables periodic refresh).
+
+File format:
+- One IPv4/IPv6 address or CIDR per line.
+- `#` starts a comment.
+- Empty lines are ignored.
+- Examples:
+```text
+# IPv4
+203.0.113.0/24
+198.51.100.10
+
+# IPv6
+2001:db8::/32
+2001:db8:1234::1
+```
+
+Operational note:
+- Current implementation is file-based only. If you use remote feeds, fetch them externally (cron/systemd timer), validate/sanitize, then atomically replace the local file.
+
 Client secret format for TLS-transport is:
 `ee<secret_hex><domain_hex>`
 
