@@ -14,8 +14,25 @@ ifeq ($m, 64)
 ARCH = -m64
 endif
 
-CFLAGS = $(ARCH) -O3 -std=gnu11 -Wall -Wno-array-bounds -mpclmul -march=core2 -mfpmath=sse -mssse3 -fno-strict-aliasing -fno-strict-overflow -fwrapv -DAES=1 -DCOMMIT=\"${COMMIT}\" -D_GNU_SOURCE=1 -D_FILE_OFFSET_BITS=64
-LDFLAGS = $(ARCH) -ggdb -rdynamic -lm -lrt -lcrypto -lz -lpthread -lcrypto
+HOST_ARCH := $(shell uname -m 2>/dev/null)
+HOST_OS := $(shell uname -s 2>/dev/null)
+
+SIMD_CFLAGS =
+ifneq ($(filter x86_64 amd64 i386 i686,$(HOST_ARCH)),)
+SIMD_CFLAGS += -mpclmul -mssse3 -mfpmath=sse
+endif
+
+LTO_CFLAGS =
+LTO_LDFLAGS =
+GC_SECTIONS_LDFLAGS =
+ifeq ($(HOST_OS),Linux)
+LTO_CFLAGS += -flto=auto
+LTO_LDFLAGS += -flto=auto
+GC_SECTIONS_LDFLAGS += -Wl,--gc-sections
+endif
+
+CFLAGS = $(ARCH) -O3 -std=gnu11 -Wall -Wno-array-bounds -march=native -ffunction-sections -fdata-sections $(SIMD_CFLAGS) $(LTO_CFLAGS) -fno-strict-aliasing -fno-strict-overflow -fwrapv -DAES=1 -DCOMMIT=\"${COMMIT}\" -D_GNU_SOURCE=1 -D_FILE_OFFSET_BITS=64
+LDFLAGS = $(ARCH) -ggdb $(LTO_LDFLAGS) $(GC_SECTIONS_LDFLAGS) -lm -lrt -lcrypto -lz -lpthread
 
 LIB = ${OBJ}/lib
 CINCLUDE = -iquote common -iquote .
