@@ -118,11 +118,24 @@ static inline void prepare_bs_inv (struct msg_buffers_chunk *C) {
 }
 
 static void lock_chunk_head (struct msg_buffers_chunk *CH) {
+  unsigned int backoff_us = 10;
+  int spins = 0;
   while (1) {
     if (__sync_bool_compare_and_swap (&CH->magic, MSG_CHUNK_HEAD_MAGIC, MSG_CHUNK_HEAD_LOCKED_MAGIC)) {
       break;
     }
-    usleep (1000);
+    if (spins < 64) {
+      spins++;
+      continue;
+    }
+    usleep (backoff_us);
+    if (backoff_us < 1000) {
+      backoff_us <<= 1;
+      if (backoff_us > 1000) {
+        backoff_us = 1000;
+      }
+    }
+    spins++;
   }
 }
 
