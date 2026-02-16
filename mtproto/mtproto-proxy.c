@@ -2085,13 +2085,21 @@ void cron (void) {
   check_all_conn_buffers ();
 
   static int last_pool_trim_time;
+  static int last_replay_cleanup_time;
   if (!last_pool_trim_time) {
     last_pool_trim_time = now;
+  }
+  if (!last_replay_cleanup_time) {
+    last_replay_cleanup_time = now;
   }
   if (now - last_pool_trim_time >= 60) {
     net_msg_pools_trim ();
     notification_event_pool_trim ();
     last_pool_trim_time = now;
+  }
+  if (now - last_replay_cleanup_time >= 5) {
+    tcp_rpc_ext_replay_cache_cleanup ();
+    last_replay_cleanup_time = now;
   }
 }
 

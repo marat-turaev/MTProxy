@@ -44,3 +44,6 @@ int tcp_rpc_set_fallback_backend (const char *backend);
 
 // Exposes TLS-transport domain sizing results and fallback config via /stats.
 int tcp_rpc_proxy_domains_prepare_stat (stats_buffer_t *sb);
+
+// Periodic replay cache maintenance for TLS transport mode.
+void tcp_rpc_ext_replay_cache_cleanup (void);

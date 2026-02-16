@@ -1699,6 +1699,11 @@ static void delete_old_client_randoms (void) {
   }
 }
 
+void tcp_rpc_ext_replay_cache_cleanup (void) {
+  delete_old_client_randoms ();
+  trim_client_randoms_limit ();
+}
+
 static int is_allowed_timestamp (int timestamp) {
   if (timestamp > now + 3) {
     // do not allow timestamps in the future
