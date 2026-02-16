@@ -183,6 +183,7 @@ static char fallback_backend_printable[256];
 static int max_secret_unique_ips;
 static int max_secret_connections;
 static unsigned long long max_secret_total_octets;
+static int client_handshake_timeout = 3;
 
 // Aggregate throttling stats (no per-IP data, safe for /stats).
 static unsigned long long probe_stat_calls;
@@ -197,6 +198,7 @@ static unsigned long long tls_handshake_success;
 static unsigned long long tls_handshake_fail_hmac;
 static unsigned long long tls_handshake_fail_timestamp;
 static unsigned long long tls_handshake_fail_replay;
+static unsigned long long tls_handshake_timeouts;
 static unsigned long long tls_delayed_reject_alert;
 static unsigned long long tls_delayed_reject_close;
 static unsigned long long tls_reject_non_tls;
@@ -567,6 +569,8 @@ int tcp_rpc_proxy_domains_prepare_stat (stats_buffer_t *sb) {
   sb_printf (sb, "tls_handshake_fail_hmac\t%llu\n", __atomic_load_n (&tls_handshake_fail_hmac, __ATOMIC_RELAXED));
   sb_printf (sb, "tls_handshake_fail_timestamp\t%llu\n", __atomic_load_n (&tls_handshake_fail_timestamp, __ATOMIC_RELAXED));
   sb_printf (sb, "tls_handshake_fail_replay\t%llu\n", __atomic_load_n (&tls_handshake_fail_replay, __ATOMIC_RELAXED));
+  sb_printf (sb, "tls_handshake_timeouts\t%llu\n", __atomic_load_n (&tls_handshake_timeouts, __ATOMIC_RELAXED));
+  sb_printf (sb, "tls_client_handshake_timeout_sec\t%d\n", client_handshake_timeout);
   sb_printf (sb, "tls_delayed_reject_alert\t%llu\n", __atomic_load_n (&tls_delayed_reject_alert, __ATOMIC_RELAXED));
   sb_printf (sb, "tls_delayed_reject_close\t%llu\n", __atomic_load_n (&tls_delayed_reject_close, __ATOMIC_RELAXED));
   sb_printf (sb, "tls_reject_non_tls\t%llu\n", __atomic_load_n (&tls_reject_non_tls, __ATOMIC_RELAXED));
@@ -1634,6 +1638,15 @@ void tcp_rpc_set_secret_max_total_octets (unsigned long long limit) {
   max_secret_total_octets = limit;
 }
 
+void tcp_rpc_set_client_handshake_timeout (int timeout_seconds) {
+  if (timeout_seconds < 1) {
+    timeout_seconds = 1;
+  } else if (timeout_seconds > 60) {
+    timeout_seconds = 60;
+  }
+  client_handshake_timeout = timeout_seconds;
+}
+
 struct client_random {
   unsigned char random[16];
   struct client_random *next_by_time;
@@ -2616,6 +2629,9 @@ int tcp_rpcs_ext_alarm (connection_job_t C) {
       return 0;
     }
   }
+  if (D->in_packet_num == -3) {
+    __atomic_fetch_add (&tls_handshake_timeouts, 1, __ATOMIC_RELAXED);
+  }
   if (D->in_packet_num == -3 && default_domain_info != NULL) {
     // Timed-out undetermined connections route to fallback only when enabled.
     if (fallback_backend_enabled) {
@@ -2671,7 +2687,7 @@ int tcp_rpcs_ext_alarm (connection_job_t C) {
 int tcp_rpcs_ext_init_accepted (connection_job_t C) {
   // Timeout while the connection type is still undetermined (before we see enough bytes).
   // Keep it short to reduce idle accepted-connection hold time.
-  job_timer_insert (C, precise_now + 3);
+  job_timer_insert (C, precise_now + client_handshake_timeout);
   int r = tcp_rpcs_init_accepted_nohs (C);
   undetermined_conn_enter (C);
   int global_undetermined = __atomic_load_n (&undetermined_conn_count_global, __ATOMIC_RELAXED);

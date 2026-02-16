@@ -47,6 +47,7 @@ int tcp_rpc_fallback_backend_enabled (void);
 void tcp_rpc_set_secret_max_unique_ips (int limit);
 void tcp_rpc_set_secret_max_connections (int limit);
 void tcp_rpc_set_secret_max_total_octets (unsigned long long limit);
+void tcp_rpc_set_client_handshake_timeout (int timeout_seconds);
 void tcp_rpc_secret_note_data_received (connection_job_t C, int bytes_received);
 void tcp_rpc_secret_note_data_sent (connection_job_t C, int bytes_sent);
 

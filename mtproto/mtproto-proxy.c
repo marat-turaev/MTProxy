@@ -2502,6 +2502,16 @@ int f_parse_option (int val) {
     tcp_rpc_set_secret_max_total_octets (x);
     break;
   }
+  case 2005: {
+    int x = atoi (optarg);
+    if (x < 1 || x > 60) {
+      kprintf ("'--client-handshake-timeout' must be in range [1, 60] seconds, got '%s'\n", optarg);
+      usage ();
+      return 2;
+    }
+    tcp_rpc_set_client_handshake_timeout (x);
+    break;
+  }
   default:
     return -1;
   }
@@ -2514,6 +2524,7 @@ void mtfront_prepare_parse_options (void) {
   parse_option ("max-unique-ips-per-secret", required_argument, 0, 2002, "limit concurrent unique client IPs per mtproto-secret (0 disables)");
   parse_option ("max-connections-per-secret", required_argument, 0, 2003, "limit concurrent connections per mtproto-secret (0 disables)");
   parse_option ("max-total-octets-per-secret", required_argument, 0, 2004, "limit cumulative octets per mtproto-secret since process start (0 disables)");
+  parse_option ("client-handshake-timeout", required_argument, 0, 2005, "timeout in seconds for undetermined client handshake state (1..60)");
   parse_option ("mtproto-secret", required_argument, 0, 'S', "16-byte secret in hex mode");
   parse_option ("proxy-tag", required_argument, 0, 'P', "16-byte proxy tag in hex mode to be passed along with all forwarded queries");
   parse_option ("domain", required_argument, 0, 'D', "adds allowed domain for TLS-transport mode, disables other transports; can be specified more than once");
