@@ -1690,12 +1690,23 @@ static int probe_entry_note_failure (struct probe_entry *e, int weight, int *blo
   }
 
   *blocked = 0;
-  if (e->score <= 6) {
+  if (e->score <= 4) {
     return 0;
   }
-  int d = (e->score - 6) * 20;
-  if (d > 200) { d = 200; }
-  d += (lrand48_j () % 31); // small jitter
+  if (e->score <= 6) {
+    // Keep low-score failures mostly cheap, but occasionally add a tiny delay
+    // so active probes don't see a perfectly sharp "zero-delay" threshold.
+    unsigned int r = (unsigned int) lrand48_j ();
+    if ((r & 3) != 0) { // ~75% immediate close
+      return 0;
+    }
+    return 2 + (int)((r >> 2) % 9); // 2..10ms
+  }
+
+  // Above low score, use a smoother delay curve with wider jitter.
+  int d = (e->score - 6) * 18;
+  d += (int)(lrand48_j () % 61) - 15; // -15..45ms jitter
+  if (d < 0) { d = 0; }
   if (d > 200) { d = 200; }
   return d;
 }
