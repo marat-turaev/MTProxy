@@ -180,6 +180,7 @@ static unsigned char fallback_backend_target_ipv6[16];
 static int fallback_backend_is_ipv6;
 static int fallback_backend_port;
 static char fallback_backend_printable[256];
+static int max_secret_unique_ips;
 
 // Aggregate throttling stats (no per-IP data, safe for /stats).
 static unsigned long long probe_stat_calls;
@@ -204,6 +205,7 @@ static unsigned long long tls_replay_cache_hits;
 static unsigned long long tls_replay_cache_additions;
 static unsigned long long tls_probe_table_ip_used;
 static unsigned long long tls_probe_table_net_used;
+static unsigned long long tls_secret_unique_ip_rejects;
 
 #ifndef MT_TLS_PROBE_TABLE_BITS
 #define MT_TLS_PROBE_TABLE_BITS 13
@@ -530,6 +532,8 @@ int tcp_rpc_proxy_domains_prepare_stat (stats_buffer_t *sb) {
   sb_printf (sb, "tls_replay_cache_hits\t%llu\n", replay_hits);
   sb_printf (sb, "tls_replay_cache_additions\t%llu\n", __atomic_load_n (&tls_replay_cache_additions, __ATOMIC_RELAXED));
   sb_printf (sb, "tls_replay_cache_hit_rate_ppm\t%llu\n", replay_checks ? (replay_hits * 1000000ULL) / replay_checks : 0ULL);
+  sb_printf (sb, "tls_secret_unique_ip_limit\t%d\n", max_secret_unique_ips);
+  sb_printf (sb, "tls_secret_unique_ip_rejects\t%llu\n", __atomic_load_n (&tls_secret_unique_ip_rejects, __ATOMIC_RELAXED));
   sb_printf (sb, "tls_dos_undetermined_conns_limit\t%d\n", (int)MAX_UNDETERMINED_CONNS);
   sb_printf (sb, "tls_dos_undetermined_conns_global_limit\t%d\n", (int)MAX_UNDETERMINED_CONNS_GLOBAL);
   sb_printf (sb, "tls_dos_undetermined_conns_global_now\t%d\n", (int)__atomic_load_n (&undetermined_conn_count_global, __ATOMIC_RELAXED));
@@ -1599,6 +1603,10 @@ int tcp_rpc_fallback_backend_enabled (void) {
   return fallback_backend_enabled;
 }
 
+void tcp_rpc_set_secret_max_unique_ips (int limit) {
+  max_secret_unique_ips = limit > 0 ? limit : 0;
+}
+
 struct client_random {
   unsigned char random[16];
   struct client_random *next_by_time;
@@ -1785,6 +1793,143 @@ static unsigned probe_ipv4_prefix24 (unsigned ip4_host) {
 static void probe_ipv6_prefix64 (unsigned char out[16], const unsigned char in[16]) {
   memcpy (out, in, 16);
   memset (out + 8, 0, 8);
+}
+
+#define SECRET_IP_TABLE_SIZE (1u << 12)
+struct secret_ip_entry {
+  unsigned ip4;
+  unsigned char ip6[16];
+  unsigned short refs;
+  unsigned char secret_slot;
+  unsigned char is_ipv6;
+  unsigned char state; // 0 = empty, 1 = used, 2 = tombstone
+};
+static __thread struct secret_ip_entry secret_ip_table[SECRET_IP_TABLE_SIZE];
+static __thread int secret_unique_ip_count[16];
+
+static int conn_get_secret_slot (connection_job_t C) {
+  struct tcp_rpc_data *D = TCP_RPC_DATA (C);
+  int marker = (int)D->extra_double2;
+  return marker > 0 ? marker - 1 : -1;
+}
+
+static void conn_set_secret_slot (connection_job_t C, int secret_slot) {
+  struct tcp_rpc_data *D = TCP_RPC_DATA (C);
+  D->extra_double2 = secret_slot >= 0 ? (double)(secret_slot + 1) : 0.0;
+}
+
+static unsigned secret_ip_hash (int secret_slot, unsigned ip4, const unsigned char ip6[16], int is_ipv6) {
+  unsigned h = (unsigned)secret_slot * 2246822519u;
+  h ^= !is_ipv6 ? probe_hash4 (ip4) : probe_hash6 (ip6);
+  return h & (SECRET_IP_TABLE_SIZE - 1);
+}
+
+static int secret_ip_entry_match (const struct secret_ip_entry *e, int secret_slot, unsigned ip4, const unsigned char ip6[16], int is_ipv6) {
+  if (e->state != 1 || e->secret_slot != (unsigned char)secret_slot || e->is_ipv6 != (unsigned char)is_ipv6) {
+    return 0;
+  }
+  if (!is_ipv6) {
+    return e->ip4 == ip4;
+  }
+  return !memcmp (e->ip6, ip6, 16);
+}
+
+static int secret_ip_limit_enter (connection_job_t C, int secret_slot) {
+  if (max_secret_unique_ips <= 0 || secret_slot < 0 || secret_slot >= 16) {
+    return 0;
+  }
+  if (conn_get_secret_slot (C) >= 0) {
+    return 0;
+  }
+  struct connection_info *c = CONN_INFO (C);
+  unsigned ip4 = c->remote_ip;
+  unsigned char ip6[16];
+  int is_ipv6 = c->remote_ip ? 0 : 1;
+  if (is_ipv6) {
+    memcpy (ip6, c->remote_ipv6, 16);
+  } else {
+    memset (ip6, 0, 16);
+  }
+
+  unsigned idx = secret_ip_hash (secret_slot, ip4, ip6, is_ipv6);
+  int i;
+  int tomb = -1;
+  for (i = 0; i < (int)SECRET_IP_TABLE_SIZE; i++) {
+    struct secret_ip_entry *e = &secret_ip_table[(idx + i) & (SECRET_IP_TABLE_SIZE - 1)];
+    if (e->state == 0) {
+      if (secret_unique_ip_count[secret_slot] >= max_secret_unique_ips) {
+        __atomic_fetch_add (&tls_secret_unique_ip_rejects, 1, __ATOMIC_RELAXED);
+        return -1;
+      }
+      if (tomb >= 0) {
+        e = &secret_ip_table[tomb];
+      }
+      e->state = 1;
+      e->secret_slot = (unsigned char)secret_slot;
+      e->is_ipv6 = (unsigned char)is_ipv6;
+      e->ip4 = ip4;
+      memcpy (e->ip6, ip6, 16);
+      e->refs = 1;
+      secret_unique_ip_count[secret_slot]++;
+      conn_set_secret_slot (C, secret_slot);
+      return 0;
+    }
+    if (e->state == 2) {
+      if (tomb < 0) {
+        tomb = (idx + i) & (SECRET_IP_TABLE_SIZE - 1);
+      }
+      continue;
+    }
+    if (secret_ip_entry_match (e, secret_slot, ip4, ip6, is_ipv6)) {
+      if (e->refs < 0xffff) {
+        e->refs++;
+      }
+      conn_set_secret_slot (C, secret_slot);
+      return 0;
+    }
+  }
+
+  __atomic_fetch_add (&tls_secret_unique_ip_rejects, 1, __ATOMIC_RELAXED);
+  return -1;
+}
+
+static void secret_ip_limit_leave (connection_job_t C) {
+  int secret_slot = conn_get_secret_slot (C);
+  if (max_secret_unique_ips <= 0 || secret_slot < 0 || secret_slot >= 16) {
+    conn_set_secret_slot (C, -1);
+    return;
+  }
+  struct connection_info *c = CONN_INFO (C);
+  unsigned ip4 = c->remote_ip;
+  unsigned char ip6[16];
+  int is_ipv6 = c->remote_ip ? 0 : 1;
+  if (is_ipv6) {
+    memcpy (ip6, c->remote_ipv6, 16);
+  } else {
+    memset (ip6, 0, 16);
+  }
+
+  unsigned idx = secret_ip_hash (secret_slot, ip4, ip6, is_ipv6);
+  int i;
+  for (i = 0; i < (int)SECRET_IP_TABLE_SIZE; i++) {
+    struct secret_ip_entry *e = &secret_ip_table[(idx + i) & (SECRET_IP_TABLE_SIZE - 1)];
+    if (e->state == 0) {
+      break;
+    }
+    if (secret_ip_entry_match (e, secret_slot, ip4, ip6, is_ipv6)) {
+      if (e->refs > 1) {
+        e->refs--;
+      } else {
+        e->refs = 0;
+        e->state = 2;
+        if (secret_unique_ip_count[secret_slot] > 0) {
+          secret_unique_ip_count[secret_slot]--;
+        }
+      }
+      break;
+    }
+  }
+  conn_set_secret_slot (C, -1);
 }
 
 static int probe_match (const struct probe_entry *e, const struct connection_info *c) {
@@ -2455,6 +2600,7 @@ int tcp_rpcs_ext_init_accepted (connection_job_t C) {
 int tcp_rpcs_ext_close_connection (connection_job_t C, int who) {
   // Keep undetermined connection accounting correct on all close paths.
   undetermined_conn_leave (C);
+  secret_ip_limit_leave (C);
   return tcp_rpcs_close_connection (C, who);
 }
 
@@ -2701,6 +2847,9 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
           return tls_reject_authenticated (C, 80 /* internal_error */);
         }
         delete_old_client_randoms();
+        if (secret_ip_limit_enter (C, secret_id) < 0) {
+          return tls_reject_authenticated (C, 40 /* handshake_failure */);
+        }
 
         int pos = 76;
         int cipher_suites_length = read_length (client_hello, &pos);
@@ -3043,6 +3192,10 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
           assert (c->type->crypto_decrypt_input (C) >= 0);
 
           int target = *(short *)(random_header + 60);
+          if (ext_secret_cnt > 0 && secret_ip_limit_enter (C, secret_id) < 0) {
+            connection_write_close (C);
+            return NEED_MORE_BYTES;
+          }
           D->extra_int4 = target;
           vkprintf (1, "tcp opportunistic encryption mode detected, tag = %08x, target=%d\n", tag, target);
           ok = 1;

@@ -44,6 +44,7 @@ void tcp_rpc_init_proxy_domains();
 // Returns 0 on success, <0 on error.
 int tcp_rpc_set_fallback_backend (const char *backend);
 int tcp_rpc_fallback_backend_enabled (void);
+void tcp_rpc_set_secret_max_unique_ips (int limit);
 
 // Exposes TLS-transport domain sizing results and fallback config via /stats.
 int tcp_rpc_proxy_domains_prepare_stat (stats_buffer_t *sb);

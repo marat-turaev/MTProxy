@@ -2287,6 +2287,16 @@ int f_parse_option (int val) {
       usage ();
     }
     break;
+  case 2002: {
+    int x = atoi (optarg);
+    if (x < 0 || x > 1000000) {
+      kprintf ("'--max-unique-ips-per-secret' must be in range [0, 1000000], got '%s'\n", optarg);
+      usage ();
+      return 2;
+    }
+    tcp_rpc_set_secret_max_unique_ips (x);
+    break;
+  }
   default:
     return -1;
   }
@@ -2296,6 +2306,7 @@ int f_parse_option (int val) {
 void mtfront_prepare_parse_options (void) {
   parse_option ("http-stats", no_argument, 0, 2000, "allow http server to answer on stats queries");
   parse_option ("fallback-backend", required_argument, 0, 2001, "proxy non-MTProxy TLS connections to loopback <host:port> instead of SNI domain");
+  parse_option ("max-unique-ips-per-secret", required_argument, 0, 2002, "limit concurrent unique client IPs per mtproto-secret (0 disables)");
   parse_option ("mtproto-secret", required_argument, 0, 'S', "16-byte secret in hex mode");
   parse_option ("proxy-tag", required_argument, 0, 'P', "16-byte proxy tag in hex mode to be passed along with all forwarded queries");
   parse_option ("domain", required_argument, 0, 'D', "adds allowed domain for TLS-transport mode, disables other transports; can be specified more than once");
