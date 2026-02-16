@@ -51,7 +51,7 @@ head -c 16 /dev/urandom | xxd -ps
 - `8888` is the local port (loopback-only). You can use it to get statistics from `mtproto-proxy` (enable with `--http-stats`). Like `wget localhost:8888/stats`.
 - `<secret>` is the secret generated at step 3. Also you can set multiple secrets: `-S <secret1> -S <secret2>`.
 - `proxy-secret` and `proxy-multi.conf` are obtained at steps 1 and 2.
-- `1` is the number of workers. You can increase the number of workers, if you have a powerful server.
+- `1` is the number of worker processes (`-M`). For TLS-transport mode (`-D`), a single worker is usually preferred.
 
 Also feel free to check out other options using `mtproto-proxy --help`.
 
@@ -70,7 +70,10 @@ added to packets if such mode is enabled.
 It's only enabled for clients which request it.
 
 Add `dd` prefix to secret (`cafe...babe` => `ddcafe...babe`) to enable
-this mode on client side.
+this mode on client side (classic transport mode).
+
+In TLS-transport mode (`-D`), clients use:
+`ee<secret_hex><domain_hex>`
 
 ## TLS-transport mode (-D)
 The proxy also supports "TLS-transport" mode. In this mode, the proxy only
@@ -84,6 +87,16 @@ Notes:
 - You can specify `-D` multiple times (allowlist). The first `-D` domain is used as default.
 - When `-D` is used, other transports are disabled (TLS-transport only).
 - On startup, the proxy may make outbound connections to the configured domains to learn realistic TLS response sizing. If that fails, it falls back to defaults.
+- Connections that stay undetermined are closed quickly (short timeout) to keep resource usage bounded.
+
+### Connection handling in TLS-transport mode
+Without `--fallback-backend`:
+- MTProxy TLS-transport connections are served normally.
+- Plain HTTP requests get a `301 Moved Permanently` redirect to `https://<first -D domain>/...`.
+- Other non-MTProxy traffic is rejected/closed in a standard way.
+
+With `--fallback-backend`:
+- Non-MTProxy traffic is proxied (TCP passthrough) to the configured local backend.
 
 ### Fallback backend (--fallback-backend)
 In TLS-transport mode (`-D`), you can optionally configure a local fallback backend:
@@ -92,7 +105,7 @@ In TLS-transport mode (`-D`), you can optionally configure a local fallback back
 ```
 Behavior:
 - Non-MTProxy connections on a TLS-only listener (for example: plain HTTP, regular TLS handshakes that are not TLS-transport) are proxied (TCP passthrough) to the fallback backend.
-- This can be used to serve something plausible on the same port (for example: an HTTP `301 Moved Permanently` to a public website, or a simple landing page).
+- This can be used to serve content on the same port (for example: an HTTPS site or landing page).
 
 Security note:
 - Be careful: `--fallback-backend` can unintentionally expose an internal service to the Internet. This fork only allows loopback targets (`127.0.0.1:<port>` or `[::1]:<port>`) to reduce the chance of misconfiguration; do not point it at admin panels/databases/metadata endpoints.
