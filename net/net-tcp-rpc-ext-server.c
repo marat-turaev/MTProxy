@@ -2093,6 +2093,12 @@ static int tls_schedule_delayed_run (connection_job_t C, int delay_ms) {
   return 0;
 }
 
+static int tls_reject_authenticated (connection_job_t C, unsigned char alert_description) {
+  // HMAC-matched failures (replay/stale timestamp/internal) are not probing attempts.
+  // Reject with a normal TLS alert, but do not update probe-throttle state.
+  return tls_schedule_delayed_alert (C, alert_description, 0);
+}
+
 static int tls_reject_or_fallback (connection_job_t C, unsigned char alert_description) {
   // For TLS-looking inputs: either forward to local fallback HTTPS (if configured),
   // or send a standard TLS alert and close (avoid proxying to the -D domain).
@@ -2577,17 +2583,17 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         }
         int timestamp = *(int *)(expected_random + 28) ^ *(int *)(client_random + 28);
         if (!is_allowed_timestamp (timestamp)) {
-          return tls_reject_or_fallback (C, 40 /* handshake_failure */);
+          return tls_reject_authenticated (C, 40 /* handshake_failure */);
         }
 
         // Track replay only for authenticated attempts: unauthenticated probes
         // should not consume replay-cache entries or eviction budget.
         if (have_client_random (client_random)) {
           vkprintf (1, "Receive again request with the same client random\n");
-          return tls_reject_or_fallback (C, 40 /* handshake_failure */);
+          return tls_reject_authenticated (C, 40 /* handshake_failure */);
         }
         if (add_client_random (client_random) < 0) {
-          return tls_reject_or_fallback (C, 80 /* internal_error */);
+          return tls_reject_authenticated (C, 80 /* internal_error */);
         }
         delete_old_client_randoms();
 
