@@ -26,6 +26,7 @@
 
 #include <assert.h>
 #include <errno.h>
+#include <stdint.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -863,10 +864,16 @@ int process_client_packet (struct tl_in_state *tlio_in, int op, connection_job_t
       }
       if (D) {
 	vkprintf (2, "proxying answer into connection %d:%llx\n", Ex->in_fd, Ex->in_conn_id);
+        double rtt_ms = -1;
+        if (CONN_INFO(D)->query_start_time > 0) {
+          rtt_ms = (get_utime_monotonic () - CONN_INFO(D)->query_start_time) * 1000.0;
+        }
+        target_route_note_success (CONN_INFO(C)->target, rtt_ms);
 	tot_forwarded_responses++;
 	client_send_message (JOB_REF_PASS(D), Ex->in_conn_id, tlio_in, flags);
       } else {
 	vkprintf (2, "external connection not found, dropping proxied answer\n");
+        target_route_note_failure (CONN_INFO(C)->target);
 	dropped_responses++;
 	_notify_remote_closed (JOB_REF_CREATE_PASS(C), out_conn_id);
       }
@@ -1664,23 +1671,193 @@ int client_send_message (JOB_REF_ARG(C), long long in_conn_id, struct tl_in_stat
 
 // connection_job_t get_target_connection (conn_target_job_t S, int rotate);
 
+#define TARGET_ROUTE_TABLE_SIZE (1u << 12)
+struct target_route_entry {
+  conn_target_job_t target;
+  double ewma_ms;
+  int fail_streak;
+  int unhealthy_until;
+  int last_seen;
+};
+static struct target_route_entry target_route_table[TARGET_ROUTE_TABLE_SIZE];
+
+static unsigned target_route_hash (conn_target_job_t S) {
+  unsigned long long x = (unsigned long long)(uintptr_t)S;
+  x ^= x >> 33;
+  x *= 0xff51afd7ed558ccdULL;
+  x ^= x >> 33;
+  return (unsigned)x & (TARGET_ROUTE_TABLE_SIZE - 1);
+}
+
+static struct target_route_entry *target_route_get (conn_target_job_t S, int create) {
+  if (!S) {
+    return 0;
+  }
+  unsigned idx = target_route_hash (S);
+  unsigned i;
+  for (i = 0; i < TARGET_ROUTE_TABLE_SIZE; i++) {
+    struct target_route_entry *e = &target_route_table[(idx + i) & (TARGET_ROUTE_TABLE_SIZE - 1)];
+    if (e->target == S) {
+      return e;
+    }
+    if (!e->target) {
+      if (!create) {
+        return 0;
+      }
+      e->target = S;
+      e->ewma_ms = 0;
+      e->fail_streak = 0;
+      e->unhealthy_until = 0;
+      e->last_seen = now;
+      return e;
+    }
+  }
+  return 0;
+}
+
+static void target_route_note_success (conn_target_job_t S, double rtt_ms) {
+  struct target_route_entry *e = target_route_get (S, 1);
+  if (!e) {
+    return;
+  }
+  if (rtt_ms > 0) {
+    if (rtt_ms < 1) { rtt_ms = 1; }
+    if (rtt_ms > 20000) { rtt_ms = 20000; }
+    if (e->ewma_ms <= 0) {
+      e->ewma_ms = rtt_ms;
+    } else {
+      e->ewma_ms = e->ewma_ms * 0.8 + rtt_ms * 0.2;
+    }
+  }
+  e->fail_streak = 0;
+  e->unhealthy_until = 0;
+  e->last_seen = now;
+}
+
+static void target_route_note_failure (conn_target_job_t S) {
+  struct target_route_entry *e = target_route_get (S, 1);
+  if (!e) {
+    return;
+  }
+  if (e->fail_streak < 1000) {
+    e->fail_streak++;
+  }
+  int penalty = 0;
+  if (e->fail_streak > 3) {
+    penalty = (e->fail_streak - 3) * 2;
+    if (penalty > 30) {
+      penalty = 30;
+    }
+  }
+  if (penalty > 0) {
+    e->unhealthy_until = now + penalty;
+  }
+  e->last_seen = now;
+}
+
+static double target_route_rank (conn_target_job_t S) {
+  struct conn_target_info *CT = CONN_TARGET_INFO (S);
+  double rank = 0.0;
+
+  if (CT->ready_outbound_connections <= 0) {
+    rank += 100000.0;
+  } else {
+    rank += 1000.0 / (1.0 + CT->ready_outbound_connections);
+  }
+
+  struct target_route_entry *e = target_route_get (S, 0);
+  if (e) {
+    if (e->ewma_ms > 0) {
+      rank += e->ewma_ms;
+    } else {
+      rank += 300.0;
+    }
+    if (e->unhealthy_until > now) {
+      rank += 5000.0 + 50.0 * (e->unhealthy_until - now);
+    }
+    rank += 20.0 * e->fail_streak;
+  } else {
+    rank += 500.0;
+  }
+
+  // Keep tie-breaking non-deterministic across equal ranks.
+  rank += drand48_j ();
+  return rank;
+}
+
 conn_target_job_t choose_proxy_target (int target_dc) {
   assert (CurConf->auth_clusters > 0);
   struct mf_cluster *MFC = mf_cluster_lookup (CurConf, target_dc, 1);
   if (!MFC) {
     return 0;
   }
-  int attempts = 5;
-  while (attempts --> 0) {
-    assert (MFC->targets_num > 0);
-    conn_target_job_t S = MFC->cluster_targets[lrand48() % MFC->targets_num];
+  assert (MFC->targets_num > 0);
+
+  int targets_num = MFC->targets_num;
+  if (targets_num > MAX_CFG_TARGETS) {
+    targets_num = MAX_CFG_TARGETS;
+  }
+  unsigned char used[MAX_CFG_TARGETS];
+  memset (used, 0, targets_num);
+
+  int pass;
+  for (pass = 0; pass < targets_num; pass++) {
+    int best_idx = -1;
+    double best_rank = 0;
+    int i;
+    for (i = 0; i < targets_num; i++) {
+      if (used[i]) {
+        continue;
+      }
+      conn_target_job_t cand = MFC->cluster_targets[i];
+      if (!cand) {
+        continue;
+      }
+      double rank = target_route_rank (cand);
+      if (best_idx < 0 || rank < best_rank) {
+        best_idx = i;
+        best_rank = rank;
+      }
+    }
+    if (best_idx < 0) {
+      break;
+    }
+    used[best_idx] = 1;
+
+    conn_target_job_t S = MFC->cluster_targets[best_idx];
     connection_job_t C = 0;
     rpc_target_choose_random_connections (S, 0, 1, &C);
     if (C && TCP_RPC_DATA(C)->extra_int == get_conn_tag (C)) {
       job_decref (JOB_REF_PASS (C));
+      target_route_note_success (S, -1);
       return S;
     }
+    if (C) {
+      job_decref (JOB_REF_PASS (C));
+    }
+    target_route_note_failure (S);
   }
+
+  // Fallback path to preserve previous random behavior when ranking cannot find a ready route.
+  int attempts = 5;
+  while (attempts --> 0) {
+    conn_target_job_t S = MFC->cluster_targets[lrand48() % MFC->targets_num];
+    if (!S) {
+      continue;
+    }
+    connection_job_t C = 0;
+    rpc_target_choose_random_connections (S, 0, 1, &C);
+    if (C && TCP_RPC_DATA(C)->extra_int == get_conn_tag (C)) {
+      job_decref (JOB_REF_PASS (C));
+      target_route_note_success (S, -1);
+      return S;
+    }
+    if (C) {
+      job_decref (JOB_REF_PASS (C));
+    }
+    target_route_note_failure (S);
+  }
+
   return 0;
 }
 
@@ -1778,6 +1955,7 @@ int forward_tcp_query (struct tl_in_state *tlio_in, connection_job_t c, conn_tar
     }
     if (!d) {
       vkprintf (2, "nowhere to forward user query from connection %d, dropping\n", CONN_INFO(c)->fd);
+      target_route_note_failure (S);
       dropped_queries++;
       if (CONN_INFO(c)->type == &ct_tcp_rpc_ext_server_mtfront) {
 	__sync_fetch_and_or (&TCP_RPC_DATA(c)->flags, RPC_F_DROPPED);
