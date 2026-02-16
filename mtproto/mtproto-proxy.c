@@ -424,6 +424,9 @@ long long mtproto_proxy_errors;
 char proxy_tag[16];
 int proxy_tag_set;
 
+static void target_route_note_success (conn_target_job_t S, double rtt_ms);
+static void target_route_note_failure (conn_target_job_t S);
+
 static void update_local_stats_copy (struct worker_stats *S) {
   S->cnt++;
   __sync_synchronize();
