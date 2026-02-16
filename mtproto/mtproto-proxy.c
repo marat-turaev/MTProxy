@@ -1675,6 +1675,8 @@ int client_send_message (JOB_REF_ARG(C), long long in_conn_id, struct tl_in_stat
 // connection_job_t get_target_connection (conn_target_job_t S, int rotate);
 
 #define TARGET_ROUTE_TABLE_SIZE (1u << 12)
+#define TARGET_ROUTE_PROBE_INTERVAL 5
+#define TARGET_ROUTE_PROBE_BUDGET 16
 struct target_route_entry {
   conn_target_job_t target;
   double ewma_ms;
@@ -1683,6 +1685,8 @@ struct target_route_entry {
   int last_seen;
 };
 static struct target_route_entry target_route_table[TARGET_ROUTE_TABLE_SIZE];
+static int target_route_probe_cluster_idx;
+static int target_route_probe_target_idx;
 
 static unsigned target_route_hash (conn_target_job_t S) {
   unsigned long long x = (unsigned long long)(uintptr_t)S;
@@ -1786,6 +1790,50 @@ static double target_route_rank (conn_target_job_t S) {
   // Keep tie-breaking non-deterministic across equal ranks.
   rank += drand48_j ();
   return rank;
+}
+
+static void target_route_probe_one (conn_target_job_t S) {
+  if (!S) {
+    return;
+  }
+  connection_job_t C = 0;
+  rpc_target_choose_random_connections (S, 0, 1, &C);
+  if (C && TCP_RPC_DATA(C)->extra_int == get_conn_tag (C)) {
+    job_decref (JOB_REF_PASS (C));
+    target_route_note_success (S, -1);
+    return;
+  }
+  if (C) {
+    job_decref (JOB_REF_PASS (C));
+  }
+  target_route_note_failure (S);
+}
+
+static void target_route_probe_step (int budget) {
+  if (!CurConf || CurConf->auth_clusters <= 0 || budget <= 0) {
+    return;
+  }
+  int checks = 0;
+  while (checks < budget) {
+    if (target_route_probe_cluster_idx >= CurConf->auth_clusters) {
+      target_route_probe_cluster_idx = 0;
+      target_route_probe_target_idx = 0;
+    }
+    struct mf_cluster *MFC = &CurConf->auth_cluster[target_route_probe_cluster_idx];
+    if (!MFC || MFC->targets_num <= 0 || !MFC->cluster_targets) {
+      target_route_probe_cluster_idx++;
+      target_route_probe_target_idx = 0;
+      continue;
+    }
+    if (target_route_probe_target_idx >= MFC->targets_num) {
+      target_route_probe_cluster_idx++;
+      target_route_probe_target_idx = 0;
+      continue;
+    }
+    conn_target_job_t S = MFC->cluster_targets[target_route_probe_target_idx++];
+    target_route_probe_one (S);
+    checks++;
+  }
 }
 
 conn_target_job_t choose_proxy_target (int target_dc) {
@@ -2283,6 +2331,14 @@ void cron (void) {
   if (now - last_replay_cleanup_time >= 5) {
     tcp_rpc_ext_replay_cache_cleanup ();
     last_replay_cleanup_time = now;
+  }
+  static int last_target_route_probe_time;
+  if (!last_target_route_probe_time) {
+    last_target_route_probe_time = now;
+  }
+  if (now - last_target_route_probe_time >= TARGET_ROUTE_PROBE_INTERVAL) {
+    target_route_probe_step (TARGET_ROUTE_PROBE_BUDGET);
+    last_target_route_probe_time = now;
   }
 }
 
