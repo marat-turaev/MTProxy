@@ -3123,6 +3123,20 @@ static void stop_reading_temporarily (connection_job_t C) {
   __sync_fetch_and_or (&c->flags, C_STOPREAD | C_STOPPARSE);
 }
 
+static int adjust_reject_delay_ms (int delay_ms) {
+  if (delay_ms < 10) {
+    return delay_ms;
+  }
+  int jitter = (int)((unsigned int) lrand48_j () % 101) - 50; // -50..+50ms
+  int out = delay_ms + jitter;
+  if (out < 50) {
+    out = 50;
+  } else if (out > 500) {
+    out = 500;
+  }
+  return out;
+}
+
 enum {
   TLS_DELAY_ACTION_NONE = 0,
   TLS_DELAY_ACTION_ALERT = 1,
@@ -3135,6 +3149,7 @@ static int tls_schedule_delayed_alert (connection_job_t C, unsigned char alert_d
   if (D->extra_int2 != TLS_DELAY_ACTION_NONE) {
     return NEED_MORE_BYTES;
   }
+  delay_ms = adjust_reject_delay_ms (delay_ms);
   if (D->in_packet_num == -3) {
     // Once we decided to reject this connection, it is no longer "undetermined".
     undetermined_conn_leave (C);
@@ -3155,6 +3170,7 @@ static int tls_schedule_delayed_close (connection_job_t C, int delay_ms) {
   if (D->extra_int2 != TLS_DELAY_ACTION_NONE) {
     return NEED_MORE_BYTES;
   }
+  delay_ms = adjust_reject_delay_ms (delay_ms);
   if (D->in_packet_num == -3) {
     // Once we decided to reject this connection, it is no longer "undetermined".
     undetermined_conn_leave (C);
