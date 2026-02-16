@@ -27,11 +27,13 @@
 #define        _FILE_OFFSET_BITS        64
 
 #include <assert.h>
+#include <ctype.h>
 #include <errno.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <pthread.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -59,6 +61,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <sys/stat.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -212,8 +215,451 @@ static unsigned long long tls_probe_table_net_used;
 static unsigned long long tls_secret_unique_ip_rejects;
 static unsigned long long tls_secret_conn_limit_rejects;
 static unsigned long long tls_secret_total_octet_rejects;
+static unsigned long long tls_ip_allowlist_denied;
+static unsigned long long tls_ip_blocklist_denied;
+static unsigned long long tls_ip_acl_refresh_success;
+static unsigned long long tls_ip_acl_refresh_fail;
 static __thread unsigned int secret_conn_count[16];
 static __thread unsigned long long secret_total_octets[16];
+
+typedef struct {
+  uint32_t start;
+  uint32_t end;
+} ip4_range_t;
+
+typedef struct {
+  uint64_t start_hi;
+  uint64_t start_lo;
+  uint64_t end_hi;
+  uint64_t end_lo;
+} ip6_range_t;
+
+typedef struct {
+  ip4_range_t *v4;
+  int v4_num;
+  ip6_range_t *v6;
+  int v6_num;
+  unsigned long long parsed_lines;
+  unsigned long long active_lines;
+  int loaded_at;
+} ip_acl_set_t;
+
+typedef struct {
+  char *path;
+  ip_acl_set_t *set;
+  long long mtime;
+  long long size;
+} ip_acl_source_t;
+
+static pthread_rwlock_t ip_acl_lock = PTHREAD_RWLOCK_INITIALIZER;
+static ip_acl_source_t ip_blocklist;
+static ip_acl_source_t ip_allowlist;
+static int ip_acl_refresh_interval = 300;
+static int ip_acl_next_refresh_time;
+
+static void ip_acl_free_set (ip_acl_set_t *set) {
+  if (!set) {
+    return;
+  }
+  free (set->v4);
+  free (set->v6);
+  free (set);
+}
+
+static int ip_acl_u128_cmp (uint64_t ah, uint64_t al, uint64_t bh, uint64_t bl) {
+  if (ah < bh) {
+    return -1;
+  }
+  if (ah > bh) {
+    return 1;
+  }
+  if (al < bl) {
+    return -1;
+  }
+  if (al > bl) {
+    return 1;
+  }
+  return 0;
+}
+
+static int ip_acl_cmp_v4 (const void *A, const void *B) {
+  const ip4_range_t *a = A;
+  const ip4_range_t *b = B;
+  if (a->start < b->start) {
+    return -1;
+  }
+  if (a->start > b->start) {
+    return 1;
+  }
+  if (a->end < b->end) {
+    return -1;
+  }
+  if (a->end > b->end) {
+    return 1;
+  }
+  return 0;
+}
+
+static int ip_acl_cmp_v6 (const void *A, const void *B) {
+  const ip6_range_t *a = A;
+  const ip6_range_t *b = B;
+  int c = ip_acl_u128_cmp (a->start_hi, a->start_lo, b->start_hi, b->start_lo);
+  if (c) {
+    return c;
+  }
+  return ip_acl_u128_cmp (a->end_hi, a->end_lo, b->end_hi, b->end_lo);
+}
+
+static int ip_acl_append_v4 (ip_acl_set_t *set, uint32_t start, uint32_t end) {
+  assert (start <= end);
+  ip4_range_t *v4 = realloc (set->v4, (size_t)(set->v4_num + 1) * sizeof (*set->v4));
+  if (!v4) {
+    return -1;
+  }
+  set->v4 = v4;
+  set->v4[set->v4_num].start = start;
+  set->v4[set->v4_num].end = end;
+  set->v4_num++;
+  return 0;
+}
+
+static int ip_acl_append_v6 (ip_acl_set_t *set, uint64_t sh, uint64_t sl, uint64_t eh, uint64_t el) {
+  assert (ip_acl_u128_cmp (sh, sl, eh, el) <= 0);
+  ip6_range_t *v6 = realloc (set->v6, (size_t)(set->v6_num + 1) * sizeof (*set->v6));
+  if (!v6) {
+    return -1;
+  }
+  set->v6 = v6;
+  set->v6[set->v6_num].start_hi = sh;
+  set->v6[set->v6_num].start_lo = sl;
+  set->v6[set->v6_num].end_hi = eh;
+  set->v6[set->v6_num].end_lo = el;
+  set->v6_num++;
+  return 0;
+}
+
+static int ip_acl_merge_v4 (ip_acl_set_t *set) {
+  if (set->v4_num <= 1) {
+    return 0;
+  }
+  qsort (set->v4, (size_t)set->v4_num, sizeof (*set->v4), ip_acl_cmp_v4);
+  int out = 0;
+  int i;
+  for (i = 1; i < set->v4_num; i++) {
+    ip4_range_t *cur = &set->v4[out];
+    ip4_range_t *next = &set->v4[i];
+    if (next->start <= cur->end || (cur->end != 0xffffffffu && next->start == cur->end + 1)) {
+      if (next->end > cur->end) {
+        cur->end = next->end;
+      }
+      continue;
+    }
+    set->v4[++out] = *next;
+  }
+  set->v4_num = out + 1;
+  return 0;
+}
+
+static int ip_acl_merge_v6 (ip_acl_set_t *set) {
+  if (set->v6_num <= 1) {
+    return 0;
+  }
+  qsort (set->v6, (size_t)set->v6_num, sizeof (*set->v6), ip_acl_cmp_v6);
+  int out = 0;
+  int i;
+  for (i = 1; i < set->v6_num; i++) {
+    ip6_range_t *cur = &set->v6[out];
+    ip6_range_t *next = &set->v6[i];
+    uint64_t limit_hi = cur->end_hi;
+    uint64_t limit_lo = cur->end_lo;
+    if (limit_lo == ~0ULL) {
+      if (limit_hi != ~0ULL) {
+        limit_hi++;
+        limit_lo = 0;
+      }
+    } else {
+      limit_lo++;
+    }
+    if (ip_acl_u128_cmp (next->start_hi, next->start_lo, limit_hi, limit_lo) <= 0) {
+      if (ip_acl_u128_cmp (next->end_hi, next->end_lo, cur->end_hi, cur->end_lo) > 0) {
+        cur->end_hi = next->end_hi;
+        cur->end_lo = next->end_lo;
+      }
+      continue;
+    }
+    set->v6[++out] = *next;
+  }
+  set->v6_num = out + 1;
+  return 0;
+}
+
+static char *ip_acl_trim (char *s) {
+  while (*s && isspace ((unsigned char)*s)) {
+    s++;
+  }
+  if (!*s) {
+    return s;
+  }
+  char *e = s + strlen (s) - 1;
+  while (e >= s && isspace ((unsigned char)*e)) {
+    *e-- = 0;
+  }
+  return s;
+}
+
+static void ip_acl_parse_ipv6_to_u128 (const unsigned char ip[16], uint64_t *hi, uint64_t *lo) {
+  *hi = ((uint64_t)ip[0] << 56) | ((uint64_t)ip[1] << 48) | ((uint64_t)ip[2] << 40) | ((uint64_t)ip[3] << 32) |
+        ((uint64_t)ip[4] << 24) | ((uint64_t)ip[5] << 16) | ((uint64_t)ip[6] << 8) | (uint64_t)ip[7];
+  *lo = ((uint64_t)ip[8] << 56) | ((uint64_t)ip[9] << 48) | ((uint64_t)ip[10] << 40) | ((uint64_t)ip[11] << 32) |
+        ((uint64_t)ip[12] << 24) | ((uint64_t)ip[13] << 16) | ((uint64_t)ip[14] << 8) | (uint64_t)ip[15];
+}
+
+static int ip_acl_parse_token (ip_acl_set_t *set, const char *token) {
+  char buf[256];
+  if ((int)strlen (token) >= (int)sizeof (buf)) {
+    return -1;
+  }
+  strcpy (buf, token);
+  char *slash = strchr (buf, '/');
+  int prefix = -1;
+  if (slash) {
+    *slash++ = 0;
+    if (!*slash) {
+      return -1;
+    }
+    char *end = 0;
+    errno = 0;
+    long x = strtol (slash, &end, 10);
+    if (errno || !end || *end) {
+      return -1;
+    }
+    prefix = (int)x;
+  }
+
+  struct in_addr ip4;
+  if (inet_pton (AF_INET, buf, &ip4) == 1) {
+    if (prefix < 0) {
+      prefix = 32;
+    }
+    if (prefix < 0 || prefix > 32) {
+      return -1;
+    }
+    uint32_t ip = ntohl (ip4.s_addr);
+    uint32_t mask = prefix == 0 ? 0u : (0xffffffffu << (32 - prefix));
+    uint32_t start = ip & mask;
+    uint32_t end = start | (~mask);
+    return ip_acl_append_v4 (set, start, end);
+  }
+
+  unsigned char ip6[16];
+  if (inet_pton (AF_INET6, buf, ip6) == 1) {
+    if (prefix < 0) {
+      prefix = 128;
+    }
+    if (prefix < 0 || prefix > 128) {
+      return -1;
+    }
+    uint64_t hi, lo;
+    ip_acl_parse_ipv6_to_u128 (ip6, &hi, &lo);
+    uint64_t mask_hi = 0;
+    uint64_t mask_lo = 0;
+    if (prefix == 0) {
+      mask_hi = 0;
+      mask_lo = 0;
+    } else if (prefix < 64) {
+      mask_hi = ~0ULL << (64 - prefix);
+      mask_lo = 0;
+    } else if (prefix == 64) {
+      mask_hi = ~0ULL;
+      mask_lo = 0;
+    } else if (prefix < 128) {
+      mask_hi = ~0ULL;
+      mask_lo = ~0ULL << (128 - prefix);
+    } else {
+      mask_hi = ~0ULL;
+      mask_lo = ~0ULL;
+    }
+    uint64_t sh = hi & mask_hi;
+    uint64_t sl = lo & mask_lo;
+    uint64_t eh = sh | (~mask_hi);
+    uint64_t el = sl | (~mask_lo);
+    return ip_acl_append_v6 (set, sh, sl, eh, el);
+  }
+
+  return -1;
+}
+
+static int ip_acl_load_file (const char *filename, ip_acl_set_t **out, long long *mtime, long long *size) {
+  struct stat st;
+  if (stat (filename, &st) < 0) {
+    vkprintf (0, "ip-acl: cannot stat '%s': %m\n", filename);
+    return -1;
+  }
+  if (!S_ISREG (st.st_mode)) {
+    vkprintf (0, "ip-acl: '%s' is not a regular file\n", filename);
+    return -1;
+  }
+
+  FILE *fp = fopen (filename, "r");
+  if (!fp) {
+    vkprintf (0, "ip-acl: cannot open '%s': %m\n", filename);
+    return -1;
+  }
+
+  ip_acl_set_t *set = calloc (1, sizeof (*set));
+  if (!set) {
+    fclose (fp);
+    return -1;
+  }
+
+  char *line = 0;
+  size_t cap = 0;
+  ssize_t r;
+  int line_no = 0;
+  int ok = 0;
+
+  while ((r = getline (&line, &cap, fp)) >= 0) {
+    (void)r;
+    line_no++;
+    set->parsed_lines++;
+
+    char *hash = strchr (line, '#');
+    if (hash) {
+      *hash = 0;
+    }
+    char *s = ip_acl_trim (line);
+    if (!*s) {
+      continue;
+    }
+    char *end = s;
+    while (*end && !isspace ((unsigned char)*end)) {
+      end++;
+    }
+    if (*end) {
+      *end = 0;
+    }
+    if (ip_acl_parse_token (set, s) < 0) {
+      vkprintf (0, "ip-acl: bad entry in '%s' at line %d: '%s'\n", filename, line_no, s);
+      goto fail;
+    }
+    set->active_lines++;
+  }
+  if (ferror (fp)) {
+    vkprintf (0, "ip-acl: read error in '%s': %m\n", filename);
+    goto fail;
+  }
+
+  if (ip_acl_merge_v4 (set) < 0 || ip_acl_merge_v6 (set) < 0) {
+    goto fail;
+  }
+  set->loaded_at = now ? now : (int)time (0);
+  *out = set;
+  *mtime = (long long)st.st_mtime;
+  *size = (long long)st.st_size;
+  ok = 1;
+
+fail:
+  if (!ok) {
+    ip_acl_free_set (set);
+  }
+  free (line);
+  fclose (fp);
+  return ok ? 0 : -1;
+}
+
+static int ip_acl_match_v4 (const ip_acl_set_t *set, uint32_t ip) {
+  if (!set || set->v4_num <= 0) {
+    return 0;
+  }
+  int l = 0;
+  int r = set->v4_num;
+  while (l < r) {
+    int m = l + ((r - l) >> 1);
+    if (set->v4[m].start <= ip) {
+      l = m + 1;
+    } else {
+      r = m;
+    }
+  }
+  if (l <= 0) {
+    return 0;
+  }
+  const ip4_range_t *x = &set->v4[l - 1];
+  return x->end >= ip;
+}
+
+static int ip_acl_match_v6 (const ip_acl_set_t *set, const unsigned char ip[16]) {
+  if (!set || set->v6_num <= 0) {
+    return 0;
+  }
+  uint64_t hi, lo;
+  ip_acl_parse_ipv6_to_u128 (ip, &hi, &lo);
+  int l = 0;
+  int r = set->v6_num;
+  while (l < r) {
+    int m = l + ((r - l) >> 1);
+    if (ip_acl_u128_cmp (set->v6[m].start_hi, set->v6[m].start_lo, hi, lo) <= 0) {
+      l = m + 1;
+    } else {
+      r = m;
+    }
+  }
+  if (l <= 0) {
+    return 0;
+  }
+  const ip6_range_t *x = &set->v6[l - 1];
+  return ip_acl_u128_cmp (x->end_hi, x->end_lo, hi, lo) >= 0;
+}
+
+static int ip_acl_match_conn (const ip_acl_set_t *set, connection_job_t C) {
+  const struct connection_info *c = CONN_INFO (C);
+  if (c->flags & C_IPV6) {
+    return ip_acl_match_v6 (set, c->remote_ipv6);
+  }
+  return ip_acl_match_v4 (set, c->remote_ip);
+}
+
+static int ip_acl_reload_source (ip_acl_source_t *src, int force) {
+  if (!src->path || !*src->path) {
+    return 0;
+  }
+  if (!force && src->set) {
+    struct stat st;
+    if (stat (src->path, &st) == 0 &&
+        (long long)st.st_mtime == src->mtime &&
+        (long long)st.st_size == src->size) {
+      return 0;
+    }
+  }
+
+  ip_acl_set_t *set = 0;
+  long long mtime = 0;
+  long long size = 0;
+  if (ip_acl_load_file (src->path, &set, &mtime, &size) < 0) {
+    return -1;
+  }
+
+  ip_acl_set_t *old = src->set;
+  src->set = set;
+  src->mtime = mtime;
+  src->size = size;
+  ip_acl_free_set (old);
+  return 1;
+}
+
+static int ip_acl_reload_all (int force) {
+  int refreshed = 0;
+  pthread_rwlock_wrlock (&ip_acl_lock);
+  int r1 = ip_acl_reload_source (&ip_allowlist, force);
+  int r2 = ip_acl_reload_source (&ip_blocklist, force);
+  if (r1 < 0 || r2 < 0) {
+    refreshed = -1;
+  } else if (r1 > 0 || r2 > 0) {
+    refreshed = 1;
+  }
+  pthread_rwlock_unlock (&ip_acl_lock);
+  return refreshed;
+}
 
 #ifndef MT_TLS_PROBE_TABLE_BITS
 #define MT_TLS_PROBE_TABLE_BITS 13
@@ -525,6 +971,43 @@ int tcp_rpc_proxy_domains_prepare_stat (stats_buffer_t *sb) {
     sb_printf (sb, "tls_fallback_backend_is_ipv6\t%d\n", fallback_backend_is_ipv6 ? 1 : 0);
     sb_printf (sb, "tls_fallback_backend_port\t%d\n", fallback_backend_port);
   }
+
+  char allow_path[256] = "-";
+  char block_path[256] = "-";
+  int allow_v4 = 0, allow_v6 = 0, allow_loaded = 0;
+  int block_v4 = 0, block_v6 = 0, block_loaded = 0;
+  pthread_rwlock_rdlock (&ip_acl_lock);
+  if (ip_allowlist.path && *ip_allowlist.path) {
+    snprintf (allow_path, sizeof (allow_path), "%s", ip_allowlist.path);
+  }
+  if (ip_blocklist.path && *ip_blocklist.path) {
+    snprintf (block_path, sizeof (block_path), "%s", ip_blocklist.path);
+  }
+  if (ip_allowlist.set) {
+    allow_v4 = ip_allowlist.set->v4_num;
+    allow_v6 = ip_allowlist.set->v6_num;
+    allow_loaded = ip_allowlist.set->loaded_at;
+  }
+  if (ip_blocklist.set) {
+    block_v4 = ip_blocklist.set->v4_num;
+    block_v6 = ip_blocklist.set->v6_num;
+    block_loaded = ip_blocklist.set->loaded_at;
+  }
+  pthread_rwlock_unlock (&ip_acl_lock);
+
+  sb_printf (sb, "tls_ip_acl_refresh_interval_sec\t%d\n", ip_acl_refresh_interval);
+  sb_printf (sb, "tls_ip_allowlist_file\t%s\n", allow_path);
+  sb_printf (sb, "tls_ip_allowlist_loaded_at\t%d\n", allow_loaded);
+  sb_printf (sb, "tls_ip_allowlist_ranges_v4\t%d\n", allow_v4);
+  sb_printf (sb, "tls_ip_allowlist_ranges_v6\t%d\n", allow_v6);
+  sb_printf (sb, "tls_ip_blocklist_file\t%s\n", block_path);
+  sb_printf (sb, "tls_ip_blocklist_loaded_at\t%d\n", block_loaded);
+  sb_printf (sb, "tls_ip_blocklist_ranges_v4\t%d\n", block_v4);
+  sb_printf (sb, "tls_ip_blocklist_ranges_v6\t%d\n", block_v6);
+  sb_printf (sb, "tls_ip_allowlist_denied\t%llu\n", __atomic_load_n (&tls_ip_allowlist_denied, __ATOMIC_RELAXED));
+  sb_printf (sb, "tls_ip_blocklist_denied\t%llu\n", __atomic_load_n (&tls_ip_blocklist_denied, __ATOMIC_RELAXED));
+  sb_printf (sb, "tls_ip_acl_refresh_success\t%llu\n", __atomic_load_n (&tls_ip_acl_refresh_success, __ATOMIC_RELAXED));
+  sb_printf (sb, "tls_ip_acl_refresh_fail\t%llu\n", __atomic_load_n (&tls_ip_acl_refresh_fail, __ATOMIC_RELAXED));
 
   sb_printf (sb, "tls_probe_throttle_calls\t%llu\n", __atomic_load_n (&probe_stat_calls, __ATOMIC_RELAXED));
   sb_printf (sb, "tls_probe_throttle_blocked\t%llu\n", __atomic_load_n (&probe_stat_blocked, __ATOMIC_RELAXED));
@@ -1628,6 +2111,74 @@ int tcp_rpc_fallback_backend_enabled (void) {
   return fallback_backend_enabled;
 }
 
+static int ip_acl_set_file (ip_acl_source_t *src, const char *filename) {
+  if (!filename || !*filename) {
+    return -1;
+  }
+
+  ip_acl_set_t *set = 0;
+  long long mtime = 0;
+  long long size = 0;
+  if (ip_acl_load_file (filename, &set, &mtime, &size) < 0) {
+    return -2;
+  }
+
+  char *path = strdup (filename);
+  if (!path) {
+    ip_acl_free_set (set);
+    return -3;
+  }
+
+  pthread_rwlock_wrlock (&ip_acl_lock);
+  char *old_path = src->path;
+  ip_acl_set_t *old_set = src->set;
+  src->path = path;
+  src->set = set;
+  src->mtime = mtime;
+  src->size = size;
+  ip_acl_next_refresh_time = 0;
+  pthread_rwlock_unlock (&ip_acl_lock);
+
+  free (old_path);
+  ip_acl_free_set (old_set);
+  __atomic_fetch_add (&tls_ip_acl_refresh_success, 1, __ATOMIC_RELAXED);
+  return 0;
+}
+
+int tcp_rpc_set_ip_blocklist_file (const char *filename) {
+  return ip_acl_set_file (&ip_blocklist, filename);
+}
+
+int tcp_rpc_set_ip_allowlist_file (const char *filename) {
+  return ip_acl_set_file (&ip_allowlist, filename);
+}
+
+void tcp_rpc_set_ip_acl_refresh_interval (int seconds) {
+  if (seconds < 0) {
+    seconds = 0;
+  } else if (seconds > 86400) {
+    seconds = 86400;
+  }
+  ip_acl_refresh_interval = seconds;
+}
+
+void tcp_rpc_refresh_ip_acl (void) {
+  if (ip_acl_refresh_interval <= 0) {
+    return;
+  }
+  int ts = now ? now : (int)time (0);
+  if (ip_acl_next_refresh_time && ts < ip_acl_next_refresh_time) {
+    return;
+  }
+  ip_acl_next_refresh_time = ts + ip_acl_refresh_interval;
+  int r = ip_acl_reload_all (0);
+  if (r > 0) {
+    __atomic_fetch_add (&tls_ip_acl_refresh_success, 1, __ATOMIC_RELAXED);
+  } else if (r < 0) {
+    __atomic_fetch_add (&tls_ip_acl_refresh_fail, 1, __ATOMIC_RELAXED);
+  }
+}
+
 void tcp_rpc_set_secret_max_unique_ips (int limit) {
   max_secret_unique_ips = limit > 0 ? limit : 0;
 }
@@ -2685,6 +3236,22 @@ int tcp_rpcs_ext_alarm (connection_job_t C) {
 }
 
 int tcp_rpcs_ext_init_accepted (connection_job_t C) {
+  // Drop denied client IPs before entering the expensive handshake path.
+  pthread_rwlock_rdlock (&ip_acl_lock);
+  int allow_deny = ip_allowlist.set && !ip_acl_match_conn (ip_allowlist.set, C);
+  int block_deny = !allow_deny && ip_blocklist.set && ip_acl_match_conn (ip_blocklist.set, C);
+  pthread_rwlock_unlock (&ip_acl_lock);
+  if (allow_deny) {
+    __atomic_fetch_add (&tls_ip_allowlist_denied, 1, __ATOMIC_RELAXED);
+    connection_write_close (C);
+    return 0;
+  }
+  if (block_deny) {
+    __atomic_fetch_add (&tls_ip_blocklist_denied, 1, __ATOMIC_RELAXED);
+    connection_write_close (C);
+    return 0;
+  }
+
   // Timeout while the connection type is still undetermined (before we see enough bytes).
   // Keep it short to reduce idle accepted-connection hold time.
   job_timer_insert (C, precise_now + client_handshake_timeout);

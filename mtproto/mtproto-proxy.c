@@ -2332,6 +2332,7 @@ void cron (void) {
     tcp_rpc_ext_replay_cache_cleanup ();
     last_replay_cleanup_time = now;
   }
+  tcp_rpc_refresh_ip_acl ();
   static int last_target_route_probe_time;
   if (!last_target_route_probe_time) {
     last_target_route_probe_time = now;
@@ -2568,6 +2569,30 @@ int f_parse_option (int val) {
     tcp_rpc_set_client_handshake_timeout (x);
     break;
   }
+  case 2006:
+    if (tcp_rpc_set_ip_blocklist_file (optarg) < 0) {
+      kprintf ("'--ip-blocklist-file' expects a readable text file with CIDR/IP entries, got '%s'\n", optarg);
+      usage ();
+      return 2;
+    }
+    break;
+  case 2007:
+    if (tcp_rpc_set_ip_allowlist_file (optarg) < 0) {
+      kprintf ("'--ip-allowlist-file' expects a readable text file with CIDR/IP entries, got '%s'\n", optarg);
+      usage ();
+      return 2;
+    }
+    break;
+  case 2008: {
+    int x = atoi (optarg);
+    if (x < 0 || x > 86400) {
+      kprintf ("'--ip-acl-refresh-interval' must be in range [0, 86400] seconds, got '%s'\n", optarg);
+      usage ();
+      return 2;
+    }
+    tcp_rpc_set_ip_acl_refresh_interval (x);
+    break;
+  }
   default:
     return -1;
   }
@@ -2581,6 +2606,9 @@ void mtfront_prepare_parse_options (void) {
   parse_option ("max-connections-per-secret", required_argument, 0, 2003, "limit concurrent connections per mtproto-secret (0 disables)");
   parse_option ("max-total-octets-per-secret", required_argument, 0, 2004, "limit cumulative octets per mtproto-secret since process start (0 disables)");
   parse_option ("client-handshake-timeout", required_argument, 0, 2005, "timeout in seconds for undetermined client handshake state (1..60)");
+  parse_option ("ip-blocklist-file", required_argument, 0, 2006, "path to CIDR/IP deny-list file, refreshed periodically");
+  parse_option ("ip-allowlist-file", required_argument, 0, 2007, "path to CIDR/IP allow-list file, refreshed periodically");
+  parse_option ("ip-acl-refresh-interval", required_argument, 0, 2008, "IP ACL refresh period in seconds (0 disables periodic refresh)");
   parse_option ("mtproto-secret", required_argument, 0, 'S', "16-byte secret in hex mode");
   parse_option ("proxy-tag", required_argument, 0, 'P', "16-byte proxy tag in hex mode to be passed along with all forwarded queries");
   parse_option ("domain", required_argument, 0, 'D', "adds allowed domain for TLS-transport mode, disables other transports; can be specified more than once");

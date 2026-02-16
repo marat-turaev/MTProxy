@@ -44,6 +44,10 @@ void tcp_rpc_init_proxy_domains();
 // Returns 0 on success, <0 on error.
 int tcp_rpc_set_fallback_backend (const char *backend);
 int tcp_rpc_fallback_backend_enabled (void);
+int tcp_rpc_set_ip_blocklist_file (const char *filename);
+int tcp_rpc_set_ip_allowlist_file (const char *filename);
+void tcp_rpc_set_ip_acl_refresh_interval (int seconds);
+void tcp_rpc_refresh_ip_acl (void);
 void tcp_rpc_set_secret_max_unique_ips (int limit);
 void tcp_rpc_set_secret_max_connections (int limit);
 void tcp_rpc_set_secret_max_total_octets (unsigned long long limit);
