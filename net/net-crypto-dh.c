@@ -142,12 +142,15 @@ int init_dh_params (void) {
 }
 
 
-void create_g_a (unsigned char g_a[256], unsigned char a[256]) {
+static int create_g_a (unsigned char g_a[256], unsigned char a[256]) {
   if (!rpc_BN_ctx) {
     rpc_BN_ctx = BN_CTX_new ();
   }
   do {
-    assert (RAND_bytes (a, 256) >= 0); /* if you write '>0', the assert will fail. It's very sad */
+    if (RAND_bytes (a, 256) != 1) {
+      vkprintf (1, "RAND_bytes failed in create_g_a\n");
+      return 0;
+    }
 
     BIGNUM *dh_power = BN_new ();
     assert (BN_bin2bn (a, 256, dh_power) == dh_power);
@@ -163,12 +166,15 @@ void create_g_a (unsigned char g_a[256], unsigned char a[256]) {
 
     BN_free (value);
   } while (!is_good_rpc_dh_bin (g_a));
+  return 1;
 }
 
 
 int dh_first_round (unsigned char g_a[256], struct crypto_temp_dh_params *dh_params) {
   dh_params->dh_params_select = dh_params_select;
-  create_g_a (g_a, dh_params->a);
+  if (!create_g_a (g_a, dh_params->a)) {
+    return 0;
+  }
   dh_params->magic = CRYPTO_TEMP_DH_PARAMS_MAGIC;
   MODULE_STAT->tot_dh_rounds[0] ++;
   
@@ -209,7 +215,9 @@ int dh_second_round (unsigned char g_ab[256], unsigned char g_a[256], const unsi
     return 0;
   }
 
-  create_g_a (g_a, a);
+  if (!create_g_a (g_a, a)) {
+    return 0;
+  }
 
   dh_inner_round (g_ab, g_b, a);
 

@@ -603,7 +603,9 @@ int tcp_rpcs_init_crypto (connection_job_t C, struct tcp_rpc_nonce_packet *P) {
     }
 
     temp_dh_len = dh_second_round (temp_dh, new_dh->g_a, old_dh->g_a);
-    assert (temp_dh_len == 256);
+    if (temp_dh_len != 256) {
+      return -1;
+    }
 
     incr_active_dh_connections ();
     __sync_fetch_and_or (&c->flags, C_ISDH);

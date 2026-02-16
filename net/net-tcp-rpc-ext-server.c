@@ -444,7 +444,7 @@ static BIGNUM *get_double_x (BIGNUM *x, const BIGNUM *mod, BN_CTX *big_num_conte
   return numerator;
 }
 
-static void generate_public_key_slow_bn (unsigned char key[32]) {
+static int generate_public_key_slow_bn (unsigned char key[32]) {
   BIGNUM *mod = NULL;
   assert (BN_hex2bn (&mod, "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffed") == 64);
   BIGNUM *pow = NULL;
@@ -454,7 +454,13 @@ static void generate_public_key_slow_bn (unsigned char key[32]) {
 
   BIGNUM *x = BN_new();
   while (1) {
-    assert (RAND_bytes (key, 32) == 1);
+    if (RAND_bytes (key, 32) != 1) {
+      BN_clear_free (x);
+      BN_CTX_free (big_num_context);
+      BN_clear_free (pow);
+      BN_clear_free (mod);
+      return 0;
+    }
     key[31] &= 127;
     BN_bin2bn (key, 32, x);
     assert (x != NULL);
@@ -493,9 +499,10 @@ static void generate_public_key_slow_bn (unsigned char key[32]) {
   BN_CTX_free (big_num_context);
   BN_clear_free (pow);
   BN_clear_free (mod);
+  return 1;
 }
 
-static void generate_public_key (unsigned char key[32]) {
+static int generate_public_key (unsigned char key[32]) {
   // Generate a valid-looking X25519 keyshare for TLS 1.3.
   // This is only used for compatibility (synthetic TLS); it is not used for any real key agreement.
   EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_id (EVP_PKEY_X25519, NULL);
@@ -509,14 +516,14 @@ static void generate_public_key (unsigned char key[32]) {
       len == 32) {
     EVP_PKEY_free (pkey);
     EVP_PKEY_CTX_free (pctx);
-    return;
+    return 1;
   }
 
   EVP_PKEY_free (pkey);
   EVP_PKEY_CTX_free (pctx);
 
   // Fallback for unusual OpenSSL builds: keep old slow generator.
-  generate_public_key_slow_bn (key);
+  return generate_public_key_slow_bn (key);
 }
 
 static void add_string (unsigned char *str, int *pos, const char *data, int data_len) {
@@ -525,10 +532,13 @@ static void add_string (unsigned char *str, int *pos, const char *data, int data
   (*pos) += data_len;
 }
 
-static void add_random (unsigned char *str, int *pos, int random_len) {
+static int add_random (unsigned char *str, int *pos, int random_len) {
   assert (*pos + random_len <= TLS_REQUEST_LENGTH);
-  assert (RAND_bytes (str + (*pos), random_len) == 1);
+  if (RAND_bytes (str + (*pos), random_len) != 1) {
+    return 0;
+  }
   (*pos) += random_len;
+  return 1;
 }
 
 static void add_length (unsigned char *str, int *pos, int length) {
@@ -545,19 +555,28 @@ static void add_grease (unsigned char *str, int *pos, const unsigned char *greas
   (*pos) += 2;
 }
 
-static void add_public_key (unsigned char *str, int *pos) {
+static int add_public_key (unsigned char *str, int *pos) {
   assert (*pos + 32 <= TLS_REQUEST_LENGTH);
-  generate_public_key (str + (*pos));
+  if (!generate_public_key (str + (*pos))) {
+    return 0;
+  }
   (*pos) += 32;
+  return 1;
 }
 
 static unsigned char *create_request (const char *domain) {
   unsigned char *result = malloc (TLS_REQUEST_LENGTH);
+  if (result == NULL) {
+    return NULL;
+  }
   int pos = 0;
 
 #define MAX_GREASE 7
   unsigned char greases[MAX_GREASE];
-  assert (RAND_bytes (greases, MAX_GREASE) == 1);
+  if (RAND_bytes (greases, MAX_GREASE) != 1) {
+    free (result);
+    return NULL;
+  }
   int i;
   for (i = 0; i < MAX_GREASE; i++) {
     greases[i] = (unsigned char)((greases[i] & 0xF0) + 0x0A);
@@ -572,9 +591,15 @@ static unsigned char *create_request (const char *domain) {
   int domain_length = (int)strlen (domain);
 
   add_string (result, &pos, "\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03", 11);
-  add_random (result, &pos, 32);
+  if (!add_random (result, &pos, 32)) {
+    free (result);
+    return NULL;
+  }
   add_string (result, &pos, "\x20", 1);
-  add_random (result, &pos, 32);
+  if (!add_random (result, &pos, 32)) {
+    free (result);
+    return NULL;
+  }
   add_string (result, &pos, "\x00\x22", 2);
   add_grease (result, &pos, greases, 0);
   add_string (result, &pos, "\x13\x01\x13\x02\x13\x03\xc0\x2b\xc0\x2f\xc0\x2c\xc0\x30\xcc\xa9\xcc\xa8"
@@ -595,7 +620,10 @@ static unsigned char *create_request (const char *domain) {
                             "\x33\x00\x2b\x00\x29", 77);
   add_grease (result, &pos, greases, 4);
   add_string (result, &pos, "\x00\x01\x00\x00\x1d\x00\x20", 7);
-  add_public_key (result, &pos);
+  if (!add_public_key (result, &pos)) {
+    free (result);
+    return NULL;
+  }
   add_string (result, &pos, "\x00\x2d\x00\x02\x01\x01\x00\x2b\x00\x0b\x0a", 11);
   add_grease (result, &pos, greases, 6);
   add_string (result, &pos, "\x03\x04\x03\x03\x03\x02\x03\x01\x00\x1b\x00\x03\x02\x00\x02", 15);
@@ -795,9 +823,15 @@ static int update_domain_info (struct domain_info *info) {
     }
   }
 
-  unsigned char *requests[TRIES];
+  int have_error = 0;
+  unsigned char *requests[TRIES] = {};
   for (i = 0; i < TRIES; i++) {
     requests[i] = create_request (domain);
+    if (requests[i] == NULL) {
+      kprintf ("Failed to build probe request for checking domain %s\n", domain);
+      have_error = 1;
+      break;
+    }
   }
   unsigned char *responses[TRIES] = {};
   int response_len[TRIES] = {};
@@ -814,7 +848,6 @@ static int update_domain_info (struct domain_info *info) {
   int try_encrypted_application_data_lengths[TRIES][3] = {{0}};
   int is_reversed_extension_order_min = 0;
   int is_reversed_extension_order_max = 0;
-  int have_error = 0;
   while (get_utime_monotonic() < finish_time && finished_count < TRIES && !have_error) {
     struct timeval timeout_data;
     timeout_data.tv_sec = (int)(finish_time - precise_now + 1);

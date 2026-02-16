@@ -635,7 +635,11 @@ int tcp_rpcc_init_crypto (connection_job_t C) {
     assert (!c->crypto_temp);
     c->crypto_temp = alloc_crypto_temp (sizeof (struct crypto_temp_dh_params));
     assert (c->crypto_temp);
-    dh_first_round (dh->g_a, c->crypto_temp);
+    if (!dh_first_round (dh->g_a, c->crypto_temp)) {
+      free_crypto_temp (c->crypto_temp, sizeof (struct crypto_temp_dh_params));
+      c->crypto_temp = 0;
+      return -1;
+    }
   } else if (extra_keys) {
     buf.s.crypto_schema = RPC_CRYPTO_AES_EXT;
     len = offsetof (struct tcp_rpc_nonce_ext_packet, extra_key_select) + 4 * extra_keys;
