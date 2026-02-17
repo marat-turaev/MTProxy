@@ -51,6 +51,18 @@ MODULE_STAT_FUNCTION_END
 static __thread event_timer_t **et_heap;
 __thread int et_heap_size;
 
+static int ensure_event_timer_heap (void) {
+  if (et_heap) {
+    return 1;
+  }
+  et_heap = calloc (MAX_EVENT_TIMERS, sizeof (*et_heap));
+  if (!et_heap) {
+    vkprintf (0, "failed to allocate timer heap (%d entries)\n", MAX_EVENT_TIMERS);
+    return 0;
+  }
+  return 1;
+}
+
 
 static inline int basic_et_adjust (event_timer_t *et, int i) {
   int j;
@@ -82,8 +94,8 @@ static inline int basic_et_adjust (event_timer_t *et, int i) {
 }
 
 int insert_event_timer (event_timer_t *et) {
-  if (!et_heap) {
-    et_heap = calloc (sizeof (void *), MAX_EVENT_TIMERS);
+  if (!ensure_event_timer_heap ()) {
+    return 0;
   }
   MODULE_STAT->event_timer_insert_ops ++;
   int i;
@@ -91,16 +103,19 @@ int insert_event_timer (event_timer_t *et) {
     i = et->h_idx;
     assert (i > 0 && i <= et_heap_size && et_heap[i] == et);
   } else {
-    MODULE_STAT->total_timers ++;
-    assert (et_heap_size < MAX_EVENT_TIMERS);
+    if (et_heap_size >= MAX_EVENT_TIMERS) {
+      vkprintf (0, "timer heap is full (%d)\n", MAX_EVENT_TIMERS);
+      return 0;
+    }
     i = ++et_heap_size;
+    MODULE_STAT->total_timers ++;
   }
   return basic_et_adjust (et, i);
 }
 
 int remove_event_timer (event_timer_t *et) {
-  if (!et_heap) {
-    et_heap = calloc (sizeof (void *), MAX_EVENT_TIMERS);
+  if (!ensure_event_timer_heap ()) {
+    return 0;
   }
   int i = et->h_idx;
   if (!i) {
@@ -120,8 +135,8 @@ int remove_event_timer (event_timer_t *et) {
 }
   
 int thread_run_timers (void) {  
-  if (!et_heap) {
-    et_heap = calloc (sizeof (void *), MAX_EVENT_TIMERS);
+  if (!ensure_event_timer_heap ()) {
+    return 100000;
   }
   double wait_time;
   event_timer_t *et;

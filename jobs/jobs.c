@@ -1280,7 +1280,12 @@ void do_immediate_timer_insert (job_t W) {
   double r = ev->real_wakeup_time;
   if (r > 0) {
     ev->wakeup_time = r;
-    insert_event_timer (ev);
+    if (!insert_event_timer (ev)) {
+      vkprintf (0, "failed to insert timer for job %p\n", W);
+      ev->wakeup_time = 0;
+      ev->real_wakeup_time = 0;
+      return;
+    }
     assert (ev->wakeup == job_timer_wakeup_gateway);
     if (!active) {
       job_incref (W);
