@@ -99,7 +99,14 @@ static rpc_target_job_t rpc_target_alloc (struct process_id PID) {
     __sync_fetch_and_add (&old->refcnt, 1);
   }
 
-  rpc_target_tree = tree_insert_rpc_target (rpc_target_tree, SS, lrand48_j ());
+  struct tree_rpc_target *new_tree = tree_insert_rpc_target (rpc_target_tree, SS, lrand48_j ());
+  if (!new_tree) {
+    vkprintf (0, "rpc_target_alloc: failed to insert target into tree\n");
+    free_tree_ptr_rpc_target (old);
+    free (SS);
+    return 0;
+  }
+  rpc_target_tree = new_tree;
   MODULE_STAT->total_rpc_targets ++;
   //hexdump ((void *)rpc_target_tree, (void *)(rpc_target_tree + 1));
   free_tree_ptr_rpc_target (old);
@@ -147,7 +154,14 @@ void rpc_target_insert_conn (connection_job_t C) {
     __sync_fetch_and_add (&old->refcnt, 1);
   }
 
-  S->conn_tree = tree_insert_connection (S->conn_tree, job_incref (C), lrand48_j ());
+  struct tree_connection *new_tree = tree_insert_connection (S->conn_tree, job_incref (C), lrand48_j ());
+  if (!new_tree) {
+    vkprintf (0, "rpc_target_insert_conn: failed to insert connection into target tree\n");
+    job_decref (JOB_REF_PASS (C));
+    free_tree_ptr_connection (old);
+    return;
+  }
+  S->conn_tree = new_tree;
   MODULE_STAT->total_connections_in_rpc_targets ++;
 
   __sync_synchronize ();

@@ -56,6 +56,7 @@
  */
 
 struct mf_config Config[2], *CurConf = Config, *NextConf = Config + 1;
+static const char config_md5_fallback[] = "unavailable";
 
 
 //#define MAX_CONFIG_SIZE (1 << 20)
@@ -139,6 +140,10 @@ void clear_config (struct mf_config *MC, int do_destroy_targets) {
   MC->tot_targets = 0;
   MC->auth_clusters = 0;
   memset (&MC->auth_stats, 0, sizeof (struct mf_group_stats));
+  if (MC->config_md5_hex && MC->config_md5_hex != config_md5_fallback) {
+    free (MC->config_md5_hex);
+  }
+  MC->config_md5_hex = (char *) config_md5_fallback;
 }
 
 conn_target_job_t *cfg_parse_server_port (struct mf_config *MC, int flags) {
@@ -414,11 +419,15 @@ int do_reload_config (int flags) {
   CurConf->config_loaded_at = now ? now : time (0);
   CurConf->config_bytes = config_bytes;
   CurConf->config_md5_hex = malloc (33);
-  md5_hex_config (CurConf->config_md5_hex);
-  CurConf->config_md5_hex[32] = 0;
+  if (CurConf->config_md5_hex) {
+    md5_hex_config (CurConf->config_md5_hex);
+    CurConf->config_md5_hex[32] = 0;
+  } else {
+    CurConf->config_md5_hex = (char *) config_md5_fallback;
+    vkprintf (0, "failed to allocate config md5 string buffer\n");
+  }
 
   kprintf ("configuration file %s re-read successfully (%d bytes parsed), new configuration active\n", config_filename, config_bytes);
 
   return 0;
 }
-
