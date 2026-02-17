@@ -85,6 +85,10 @@ MODULE_STAT_FUNCTION_END
 static rpc_target_job_t rpc_target_alloc (struct process_id PID) {
   assert_engine_thread ();
   rpc_target_job_t SS = calloc (sizeof (struct async_job) + sizeof (struct rpc_target_info), 1);
+  if (!SS) {
+    vkprintf (0, "rpc_target_alloc: calloc failed for " IP_PRINT_STR ":%d\n", IP_TO_PRINT (PID.ip), (int) PID.port);
+    return 0;
+  }
   struct rpc_target_info *S = RPC_TARGET_INFO (SS);
   
   S->PID = PID;
@@ -126,6 +130,10 @@ void rpc_target_insert_conn (connection_job_t C) {
   
   if (!SS) {
     SS = rpc_target_alloc (t.PID);
+    if (!SS) {
+      vkprintf (0, "rpc_target_insert_conn: failed to allocate rpc target for " IP_PRINT_STR ":%d\n", IP_TO_PRINT (t.PID.ip), (int) t.PID.port);
+      return;
+    }
   }
 
   struct rpc_target_info *S = RPC_TARGET_INFO (SS);
@@ -169,7 +177,9 @@ void rpc_target_delete_conn (connection_job_t C) {
   rpc_target_job_t SS = tree_lookup_ptr_rpc_target (rpc_target_tree, fake_target);
   
   if (!SS) {
-    SS = rpc_target_alloc (t.PID);
+    vkprintf (1, "rpc_target_delete_conn: target for " IP_PRINT_STR ":%d is missing\n", IP_TO_PRINT (t.PID.ip), (int) t.PID.port);
+    TCP_RPC_DATA(C)->in_rpc_target = 0;
+    return;
   }
 
   struct rpc_target_info *S = RPC_TARGET_INFO (SS);

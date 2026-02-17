@@ -103,7 +103,9 @@ static struct notification_event *notification_event_alloc (void) {
     __sync_fetch_and_add (&nev_pool_hits, 1);
   } else {
     ev = malloc (sizeof (*ev));
-    assert (ev);
+    if (!ev) {
+      return NULL;
+    }
     __sync_fetch_and_add (&nev_pool_misses, 1);
     __sync_fetch_and_add (&nev_malloc, 1);
   }
@@ -242,6 +244,10 @@ void notification_event_job_create (void) {
 
 void notification_event_insert_conn (connection_job_t C, int type) {
   struct notification_event *ev = notification_event_alloc ();
+  if (!ev) {
+    vkprintf (0, "notification_event_insert_conn: allocation failed (type=%d)\n", type);
+    return;
+  }
   ev->who = job_incref (C);
   ev->type = type;
 
