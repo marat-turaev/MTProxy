@@ -1517,14 +1517,23 @@ static int check_response (const unsigned char *response, int len, const unsigne
   if (pos + (length) > len) { \
     FAIL("Too short");        \
   }
-#define EXPECT_STR(pos, str, error)                          \
-  if (memcmp (response + pos, str, sizeof (str) - 1) != 0) { \
-    FAIL(error);                                             \
-  }
+#define EXPECT_BYTES(offset, bytes, bytes_len, error)                                             \
+  do {                                                                                             \
+    if ((offset) < 0 || (bytes_len) < 0 || (offset) + (bytes_len) > len ||                       \
+        memcmp (response + (offset), (bytes), (bytes_len)) != 0) {                                \
+      FAIL(error);                                                                                 \
+    }                                                                                              \
+  } while (0)
 
   int pos = 0;
-  CHECK_LENGTH(3);
-  EXPECT_STR(0, "\x16\x03\x03", "Non-TLS response or TLS <= 1.1");
+  static const unsigned char tls_record_header[] = {0x16, 0x03, 0x03};
+  static const unsigned char server_hello_prefix[] = {0x02, 0x00};
+  static const unsigned char tls13_version[] = {0x03, 0x03};
+  static const unsigned char session_id_len_32[] = {0x20};
+  static const unsigned char dummy_ccs[] = {0x14, 0x03, 0x03, 0x00, 0x01, 0x01};
+  static const unsigned char appdata_prefix[] = {0x17, 0x03, 0x03};
+
+  EXPECT_BYTES(0, tls_record_header, (int)sizeof (tls_record_header), "Non-TLS response or TLS <= 1.1");
   pos += 3;
   CHECK_LENGTH(2);
   int server_hello_length = read_length (response, &pos);
@@ -1533,8 +1542,8 @@ static int check_response (const unsigned char *response, int len, const unsigne
   }
   CHECK_LENGTH(server_hello_length);
 
-  EXPECT_STR(5, "\x02\x00", "Non-TLS response 2");
-  EXPECT_STR(9, "\x03\x03", "Non-TLS response 3");
+  EXPECT_BYTES(5, server_hello_prefix, (int)sizeof (server_hello_prefix), "Non-TLS response 2");
+  EXPECT_BYTES(9, tls13_version, (int)sizeof (tls13_version), "Non-TLS response 3");
 
   if (memcmp (response + 11, "\xcf\x21\xad\x74\xe5\x9a\x61\x11\xbe\x1d\x8c\x02\x1e\x65\xb8\x91"
                              "\xc2\xa2\x11\x16\x7a\xbb\x8c\x5e\x07\x9e\x09\xe2\xc8\xa8\x33\x9c", 32) == 0) {
@@ -1543,7 +1552,7 @@ static int check_response (const unsigned char *response, int len, const unsigne
   if (response[43] == '\x00') {
     FAIL("TLS <= 1.2: empty session_id");
   }
-  EXPECT_STR(43, "\x20", "Non-TLS response 4");
+  EXPECT_BYTES(43, session_id_len_32, (int)sizeof (session_id_len_32), "Non-TLS response 4");
   if (server_hello_length <= 75) {
     FAIL("Receive too short server hello 2");
   }
@@ -1588,13 +1597,13 @@ static int check_response (const unsigned char *response, int len, const unsigne
   }
 
   CHECK_LENGTH(9);
-  EXPECT_STR(pos, "\x14\x03\x03\x00\x01\x01", "Expected dummy ChangeCipherSpec");
+  EXPECT_BYTES(pos, dummy_ccs, (int)sizeof (dummy_ccs), "Expected dummy ChangeCipherSpec");
   pos += 6;
 
   int rec_cnt = 0;
   while (pos < len) {
     CHECK_LENGTH(5);
-    EXPECT_STR(pos, "\x17\x03\x03", "Expected encrypted application data");
+    EXPECT_BYTES(pos, appdata_prefix, (int)sizeof (appdata_prefix), "Expected encrypted application data");
     pos += 3;
 
     CHECK_LENGTH(2);
@@ -1616,7 +1625,7 @@ static int check_response (const unsigned char *response, int len, const unsigne
   *encrypted_application_data_records = rec_cnt;
 #undef FAIL
 #undef CHECK_LENGTH
-#undef EXPECT_STR
+#undef EXPECT_BYTES
 
   return 1;
 }
@@ -1810,6 +1819,11 @@ static int update_domain_info (struct domain_info *info) {
           }
           response_len[i] = 5 + sh_len + 6 + 5;
           responses[i] = malloc (response_len[i]);
+          if (responses[i] == NULL) {
+            kprintf ("Failed to allocate %d bytes for domain probe response (%s)\n", response_len[i], domain);
+            have_error = 1;
+            break;
+          }
           memcpy (responses[i], header, sizeof (header));
           read_pos[i] = 5;
         } else {
@@ -1819,10 +1833,10 @@ static int update_domain_info (struct domain_info *info) {
             have_error = 1;
             break;
           }
-	          read_pos[i] += read_res;
+          read_pos[i] += read_res;
 
-	          if (read_pos[i] == response_len[i]) {
-	            if (!is_encrypted_application_data_length_read[i]) {
+          if (read_pos[i] == response_len[i]) {
+            if (!is_encrypted_application_data_length_read[i]) {
               if (memcmp (responses[i] + response_len[i] - 11, "\x14\x03\x03\x00\x01\x01\x17\x03\x03", 9) != 0) {
                 kprintf ("Not found TLS 1.3 support on domain %s\n", domain);
                 have_error = 1;
@@ -1837,53 +1851,61 @@ static int update_domain_info (struct domain_info *info) {
                 break;
               }
               response_len[i] += encrypted_application_data_length;
-	              unsigned char *new_buffer = realloc (responses[i], response_len[i]);
-	              assert (new_buffer != NULL);
-	              responses[i] = new_buffer;
-	              continue;
-	            }
+              unsigned char *new_buffer = realloc (responses[i], response_len[i]);
+              if (new_buffer == NULL) {
+                kprintf ("Failed to grow domain probe buffer to %d bytes (%s)\n", response_len[i], domain);
+                have_error = 1;
+                break;
+              }
+              responses[i] = new_buffer;
+              continue;
+            }
 
-	            // Finished reading one full encrypted application data record.
-	            if (encrypted_application_data_records_read[i] < 3) {
-	              encrypted_application_data_records_read[i]++;
-	            }
+            // Finished reading one full encrypted application data record.
+            if (encrypted_application_data_records_read[i] < 3) {
+              encrypted_application_data_records_read[i]++;
+            }
 
             // Try to read additional encrypted appdata records if immediately available.
-	            if (encrypted_application_data_records_read[i] < 3) {
-	              unsigned char hdr2[5];
-	              ssize_t pr = recv (sockets[i], hdr2, 5, MSG_PEEK);
-	              if (pr == 5 && !memcmp (hdr2, "\x17\x03\x03", 3)) {
-	                int l2 = hdr2[3] * 256 + hdr2[4];
-		                if (l2 > 0 && l2 <= MAX_PROBE_ENCRYPTED_RECORD_PAYLOAD) {
-	                  response_len[i] += 5 + l2;
-	                  unsigned char *new_buffer = realloc (responses[i], response_len[i]);
-	                  assert (new_buffer != NULL);
-	                  responses[i] = new_buffer;
-	                  continue;
-	                }
-	              }
-	            }
+            if (encrypted_application_data_records_read[i] < 3) {
+              unsigned char hdr2[5];
+              ssize_t pr = recv (sockets[i], hdr2, 5, MSG_PEEK);
+              if (pr == 5 && !memcmp (hdr2, "\x17\x03\x03", 3)) {
+                int l2 = hdr2[3] * 256 + hdr2[4];
+                if (l2 > 0 && l2 <= MAX_PROBE_ENCRYPTED_RECORD_PAYLOAD) {
+                  response_len[i] += 5 + l2;
+                  unsigned char *new_buffer = realloc (responses[i], response_len[i]);
+                  if (new_buffer == NULL) {
+                    kprintf ("Failed to grow domain probe buffer to %d bytes (%s)\n", response_len[i], domain);
+                    have_error = 1;
+                    break;
+                  }
+                  responses[i] = new_buffer;
+                  continue;
+                }
+              }
+            }
 
-	            int is_reversed_extension_order = -1;
-	            int encrypted_application_data_records = -1;
-	            int encrypted_application_data_lengths[3] = {0, 0, 0};
-	            if (check_response (responses[i], response_len[i], requests[i] + 44,
-	                                &is_reversed_extension_order,
-	                                &encrypted_application_data_records,
-	                                encrypted_application_data_lengths)) {
-	              assert (is_reversed_extension_order != -1);
-	              assert (encrypted_application_data_records > 0);
-	              try_is_reversed_extension_order[i] = is_reversed_extension_order;
-	              try_encrypted_application_data_records[i] = encrypted_application_data_records;
-	              {
-	                int k;
-	                for (k = 0; k < 3; k++) {
-	                  try_encrypted_application_data_lengths[i][k] = encrypted_application_data_lengths[k];
-	                }
-	              }
+            int is_reversed_extension_order = -1;
+            int encrypted_application_data_records = -1;
+            int encrypted_application_data_lengths[3] = {0, 0, 0};
+            if (check_response (responses[i], response_len[i], requests[i] + 44,
+                                &is_reversed_extension_order,
+                                &encrypted_application_data_records,
+                                encrypted_application_data_lengths)) {
+              assert (is_reversed_extension_order != -1);
+              assert (encrypted_application_data_records > 0);
+              try_is_reversed_extension_order[i] = is_reversed_extension_order;
+              try_encrypted_application_data_records[i] = encrypted_application_data_records;
+              {
+                int k;
+                for (k = 0; k < 3; k++) {
+                  try_encrypted_application_data_lengths[i][k] = encrypted_application_data_lengths[k];
+                }
+              }
 
-	              FD_CLR(sockets[i], &write_fd);
-	              FD_CLR(sockets[i], &read_fd);
+              FD_CLR(sockets[i], &write_fd);
+              FD_CLR(sockets[i], &read_fd);
               FD_CLR(sockets[i], &except_fd);
               is_finished[i] = 1;
               finished_count++;
@@ -2121,8 +2143,16 @@ void tcp_rpc_add_proxy_domain (const char *domain) {
   assert (domain != NULL);
 
   struct domain_info *info = calloc (1, sizeof (struct domain_info));
-  assert (info != NULL);
+  if (info == NULL) {
+    kprintf ("Failed to allocate domain info for %s\n", domain);
+    return;
+  }
   info->domain = strdup (domain);
+  if (info->domain == NULL) {
+    kprintf ("Failed to allocate domain string for %s\n", domain);
+    free (info);
+    return;
+  }
 
   struct domain_info **bucket = get_domain_info_bucket (domain, strlen (domain));
   info->next = *bucket;
