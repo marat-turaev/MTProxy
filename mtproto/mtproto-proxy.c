@@ -1323,13 +1323,22 @@ int process_http_query (struct tl_in_state *tlio_in, job_t HQJ) {
     }
     if (D->query_type == htqt_options) {
       char response_buffer[512];
-      int len = snprintf (response_buffer, 511, "HTTP/1.1 200 OK\r\nConnection: %s\r\nContent-type: text/plain\r\nPragma: no-cache\r\nCache-control: no-store\r\n%sContent-length: 0\r\n\r\n", (HTS_DATA(c)->query_flags & QF_KEEPALIVE) ? "keep-alive" : "close", HTS_DATA(c)->query_flags & QF_EXTRA_HEADERS ? mtproto_cors_http_headers : "");
-      assert (len < 511);
+      int len = snprintf (response_buffer, sizeof (response_buffer),
+                          "HTTP/1.1 200 OK\r\nConnection: %s\r\nContent-type: text/plain\r\nPragma: no-cache\r\nCache-control: no-store\r\n%sContent-length: 0\r\n\r\n",
+                          (HTS_DATA(c)->query_flags & QF_KEEPALIVE) ? "keep-alive" : "close",
+                          HTS_DATA(c)->query_flags & QF_EXTRA_HEADERS ? mtproto_cors_http_headers : "");
+      if (len < 0 || len >= (int)sizeof (response_buffer)) {
+        return -500;
+      }
       struct raw_message *m = calloc (sizeof (struct raw_message), 1);
       if (!m) {
         return -500;
       }
-      rwm_create (m, response_buffer, len);
+      if (rwm_create (m, response_buffer, len) != len) {
+        rwm_free (m);
+        free (m);
+        return -500;
+      }
       http_flush (c, m);
       return 0;
     }
@@ -1446,7 +1455,9 @@ int hts_stats_execute (connection_job_t c, struct raw_message *msg, int op) {
   }
   
   char ReqHdr[MAX_HTTP_HEADER_SIZE];
-  assert (rwm_fetch_data (msg, &ReqHdr, D->header_size) == D->header_size);
+  if (rwm_fetch_data (msg, &ReqHdr, D->header_size) != D->header_size) {
+    return -400;
+  }
   
   if (memcmp (ReqHdr + D->uri_offset, "/stats", 6)) {
     return -404;
@@ -1463,7 +1474,12 @@ int hts_stats_execute (connection_job_t c, struct raw_message *msg, int op) {
   }
   rwm_init (raw, 0);
   write_basic_http_header_raw (c, raw, 200, 0, sb.pos, 0, "text/plain");
-  assert (rwm_push_data (raw, sb.buff, sb.pos) == sb.pos);
+  if (rwm_push_data (raw, sb.buff, sb.pos) != sb.pos) {
+    rwm_free (raw);
+    free (raw);
+    sb_release (&sb);
+    return -500;
+  }
   mpq_push_w (CONN_INFO(c)->out_queue, raw, 0);
   job_signal (JOB_REF_CREATE_PASS (c), JS_RUN);
 
