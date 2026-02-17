@@ -1696,16 +1696,28 @@ static int update_domain_info (struct domain_info *info) {
 
 #define TRIES 20
   int sockets[TRIES];
+  unsigned char *requests[TRIES] = {};
+  unsigned char *responses[TRIES] = {};
+  int response_len[TRIES] = {};
+  int is_encrypted_application_data_length_read[TRIES] = {};  // 0 = need first appdata length; 1 = have it
+  int encrypted_application_data_records_read[TRIES] = {};    // number of complete appdata records read into buffer (max 3)
+  int have_error = 0;
+  int ok = 0;
   int i;
+  for (i = 0; i < TRIES; i++) {
+    sockets[i] = -1;
+  }
   for (i = 0; i < TRIES; i++) {
     sockets[i] = socket (host->h_addrtype, SOCK_STREAM, IPPROTO_TCP);
     if (sockets[i] < 0) {
       kprintf ("Failed to open socket for %s: %s\n", domain, strerror (errno));
-      return 0;
+      have_error = 1;
+      goto cleanup;
     }
     if (fcntl (sockets[i], F_SETFL, O_NONBLOCK) == -1) {
       kprintf ("Failed to make socket non-blocking: %s\n", strerror (errno));
-      return 0;
+      have_error = 1;
+      goto cleanup;
     }
 
     int e_connect;
@@ -1736,12 +1748,11 @@ static int update_domain_info (struct domain_info *info) {
 
     if (e_connect == -1 && errno != EINPROGRESS) {
       kprintf ("Failed to connect to %s: %s\n", domain, strerror (errno));
-      return 0;
+      have_error = 1;
+      goto cleanup;
     }
   }
 
-  int have_error = 0;
-  unsigned char *requests[TRIES] = {};
   for (i = 0; i < TRIES; i++) {
     requests[i] = create_request (domain);
     if (requests[i] == NULL) {
@@ -1750,10 +1761,6 @@ static int update_domain_info (struct domain_info *info) {
       break;
     }
   }
-  unsigned char *responses[TRIES] = {};
-  int response_len[TRIES] = {};
-  int is_encrypted_application_data_length_read[TRIES] = {};  // 0 = need first appdata length; 1 = have it
-  int encrypted_application_data_records_read[TRIES] = {};    // number of complete appdata records read into buffer (max 3)
 
   int finished_count = 0;
   int is_written[TRIES] = {};
@@ -1934,20 +1941,11 @@ static int update_domain_info (struct domain_info *info) {
     }
   }
 
-  // Close sockets first; keep response buffers until we extract stats/templates.
-  for (i = 0; i < TRIES; i++) {
-    close (sockets[i]);
-    free (requests[i]);
-  }
-
   if (finished_count != TRIES) {
     if (!have_error) {
       kprintf ("Failed to check domain %s in 5 seconds\n", domain);
     }
-    for (i = 0; i < TRIES; i++) {
-      free (responses[i]);
-    }
-    return 0;
+    goto cleanup;
   }
 
   // Build per-domain startup profiles and pick one per connection.
@@ -2081,10 +2079,16 @@ static int update_domain_info (struct domain_info *info) {
             domain, get_utime_monotonic() - (finish_time - 5.0), info->is_reversed_extension_order, (int)info->server_hello_encrypted_records,
             info->server_hello_encrypted_size, info->server_hello_encrypted_size2, info->server_hello_encrypted_size3);
 
+  ok = 1;
+cleanup:
   for (i = 0; i < TRIES; i++) {
+    if (sockets[i] >= 0) {
+      close (sockets[i]);
+    }
+    free (requests[i]);
     free (responses[i]);
   }
-  return 1;
+  return ok;
 #undef TRIES
 }
 
