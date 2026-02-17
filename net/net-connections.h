@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include <stddef.h>
 #include <string.h>
 
 //#include "net/net-buffers.h"
@@ -232,7 +233,8 @@ struct connection_info {
   int skip_bytes;
   int pending_queries;
   int queries_ok;
-  char custom_data[CONN_CUSTOM_DATA_BYTES];
+  // Keep per-connection protocol payload aligned for structs with pointers/doubles.
+  char custom_data[CONN_CUSTOM_DATA_BYTES] __attribute__((aligned(16)));
   unsigned our_ip, remote_ip;
   unsigned our_port, remote_port;
   unsigned char our_ipv6[16], remote_ipv6[16];
@@ -280,6 +282,9 @@ struct connection_info {
   //char in_buff[BUFF_SIZE];
   //char out_buff[BUFF_SIZE];
 };
+
+_Static_assert ((offsetof (struct connection_info, custom_data) % 8) == 0,
+                "connection_info.custom_data must be at least 8-byte aligned");
 
 struct socket_connection_info {
   struct event_timer timer;
