@@ -70,6 +70,53 @@ Note:
 7. Set received tag with arguments: `-P <proxy tag>`
 8. Enjoy.
 
+## Stats endpoint (/stats)
+Enable stats with `--http-stats`, then query:
+```bash
+curl -s http://127.0.0.1:8888/stats
+```
+
+The output is tab-separated (`<key>\t<value>`). It includes module blocks
+(`>>>>>>module>>>>>>`) and aggregate keys at the end.
+
+### Metric groups
+Use these groups to read `/stats` quickly:
+
+- Process/runtime:
+  - `uptime`, `average_idle_percent`, `recent_idle_percent`, `load_average_total`, `load_recent_total`
+- Connection lifecycle and sockets:
+  - `active_connections`, `inbound_connections`, `outbound_connections`, `ready_outbound_connections`
+  - `total_connections`, `total_allocated_connections`, `total_allocated_socket_connections`
+- Relay throughput and drops:
+  - `tot_forwarded_queries`, `tot_forwarded_responses`, `tot_forwarded_simple_acks`
+  - `dropped_queries`, `dropped_responses`, `dropped_simple_acks`
+  - `tcp_readv_bytes`, `tcp_writev_bytes`
+- Buffer pressure and relay safety:
+  - `total_network_buffers_used_size`, `total_network_buffer_chunks_allocated`,
+    `total_network_buffer_chunks_allocated_max`
+  - `connections_failed_lru`, `connections_failed_flood`
+  - `relay_backpressure_pauses`, `relay_backpressure_resumes`, `relay_conn_buffer_peak_bytes`
+- TLS handshake outcomes:
+  - `tls_handshake_success`, `tls_handshake_fail_hmac`, `tls_handshake_fail_timestamp`,
+    `tls_handshake_fail_replay`
+  - `tls_handshake_timeouts`, `tls_client_handshake_timeout_sec`,
+    `tls_delayed_reject_alert`, `tls_delayed_reject_close`, `tls_reject_non_tls`
+- Probe/replay defense:
+  - `tls_probe_throttle_calls`, `tls_probe_throttle_blocked`, `tls_probe_throttle_delayed`,
+    `tls_probe_throttle_delay_ms_sum`
+  - `tls_probe_table_ip_used`, `tls_probe_table_net_used`
+  - `tls_replay_cache_entries`, `tls_replay_cache_checks`, `tls_replay_cache_hits`,
+    `tls_replay_cache_hit_rate_ppm`, `tls_replay_cache_evictions`
+- Pre-auth DoS guardrails (undetermined state):
+  - `tls_dos_undetermined_conns_*`, `tls_dos_undetermined_bytes_*`
+- Access control / policy:
+  - `tls_ip_allowlist_denied`, `tls_ip_blocklist_denied`,
+    `tls_ip_acl_refresh_success`, `tls_ip_acl_refresh_fail`
+  - `tls_secret_conn_rejects`, `tls_secret_unique_ip_rejects`, `tls_secret_total_octet_rejects`
+- Upstream/backend readiness:
+  - `total_ready_targets`, `total_allocated_targets`, `total_inactive_targets`,
+    `ext_connections`, `ext_connections_created`
+
 ## Random padding
 Due to some ISPs detecting MTProxy by packet sizes, random padding is
 added to packets if such mode is enabled.
