@@ -1958,6 +1958,7 @@ conn_target_job_t choose_proxy_target (int target_dc) {
     if (C) {
       job_decref (JOB_REF_PASS (C));
     }
+    conn_target_request_reconnect (S);
     target_route_note_failure (S);
   }
 
@@ -1978,6 +1979,7 @@ conn_target_job_t choose_proxy_target (int target_dc) {
     if (C) {
       job_decref (JOB_REF_PASS (C));
     }
+    conn_target_request_reconnect (S);
     target_route_note_failure (S);
   }
 

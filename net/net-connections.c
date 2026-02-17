@@ -2013,7 +2013,8 @@ int create_new_connections (conn_target_job_t CTJ) /* {{{ */ {
     need_c = CT->max_connections;
   }
 
-  if (precise_now >= CT->next_reconnect || CT->active_outbound_connections) {
+  int reconnect_hint = __sync_lock_test_and_set (&CT->reconnect_hint, 0);
+  if (precise_now >= CT->next_reconnect || CT->active_outbound_connections || reconnect_hint) {
     struct tree_connection *T = CT->conn_tree;  
     if (T) {
       __sync_fetch_and_add (&T->refcnt, 1);
@@ -2066,6 +2067,16 @@ int create_new_connections (conn_target_job_t CTJ) /* {{{ */ {
   return count;
 }
 /* }}} */
+
+void conn_target_request_reconnect (conn_target_job_t CTJ) {
+  if (!CTJ) {
+    return;
+  }
+  struct conn_target_info *CT = CONN_TARGET_INFO (CTJ);
+  if (!__sync_lock_test_and_set (&CT->reconnect_hint, 1)) {
+    job_signal (JOB_REF_CREATE_PASS (CTJ), JS_RUN);
+  }
+}
 
 conn_target_job_t HTarget[PRIME_TARGETS];
 pthread_mutex_t TargetsLock = PTHREAD_MUTEX_INITIALIZER;

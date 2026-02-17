@@ -196,6 +196,7 @@ struct conn_target_info {
   conn_target_job_t hnext;
 
   int global_refcnt;
+  volatile int reconnect_hint;
 };
 
 struct pseudo_conn_target_info {
@@ -375,6 +376,7 @@ void fetch_connections_stat (struct connections_stat *st);
 
 void compute_next_reconnect (conn_target_job_t CT);
 int create_all_outbound_connections (void);
+void conn_target_request_reconnect (conn_target_job_t CTJ);
 int clean_unused_target (conn_target_job_t S);
 int create_new_connections (conn_target_job_t S);
 
