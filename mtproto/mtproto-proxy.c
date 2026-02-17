@@ -2277,14 +2277,14 @@ int check_conn_buffers (connection_job_t c) {
 
 // invoked in NET-CPU context!
 int mtfront_data_received (connection_job_t c, int bytes_received) {
-  // check_conn_buffers (c);
+  check_conn_buffers (c);
   tcp_rpc_secret_note_data_received (c, bytes_received);
   return 0;
 }
 
 // invoked in NET-CPU context!
 int mtfront_data_sent (connection_job_t c, int bytes_sent) {
-  // lru_insert_conn (c);
+  check_conn_buffers (c);
   tcp_rpc_secret_note_data_sent (c, bytes_sent);
   return 0;
 }
