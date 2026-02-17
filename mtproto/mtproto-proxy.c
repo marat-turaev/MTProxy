@@ -449,6 +449,19 @@ int proxy_tag_set;
 static void target_route_note_success (conn_target_job_t S, double rtt_ms);
 static void target_route_note_failure (conn_target_job_t S);
 
+static inline connection_job_t mtfront_conn_from_job (job_t job) {
+  if (!job) {
+    return 0;
+  }
+  if (job->j_custom_bytes == (int)sizeof (struct connection_info)) {
+    return job;
+  }
+  if (job->j_custom_bytes == (int)sizeof (struct socket_connection_info)) {
+    return SOCKET_CONN_INFO ((socket_connection_job_t)job)->conn;
+  }
+  return 0;
+}
+
 static void update_local_stats_copy (struct worker_stats *S) {
   S->cnt++;
   __sync_synchronize();
@@ -2239,7 +2252,10 @@ void check_all_conn_buffers (void) {
 }
 
 int check_conn_buffers (connection_job_t c) {
-  int tot_used_bytes = CONN_INFO(c)->in.total_bytes + CONN_INFO(c)->in_u.total_bytes + CONN_INFO(c)->out.total_bytes + CONN_INFO(c)->out_p.total_bytes;
+  long long tot_used_bytes = (long long)CONN_INFO(c)->in.total_bytes
+    + (long long)CONN_INFO(c)->in_u.total_bytes
+    + (long long)CONN_INFO(c)->out.total_bytes
+    + (long long)CONN_INFO(c)->out_p.total_bytes;
   if (relay_conn_buffer_peak_bytes < tot_used_bytes) {
     relay_conn_buffer_peak_bytes = tot_used_bytes;
   }
@@ -2252,7 +2268,7 @@ int check_conn_buffers (connection_job_t c) {
   }
 
   if (tot_used_bytes > MAX_CONNECTION_BUFFER_SPACE) {
-    vkprintf (2, "check_conn_buffers(): closing connection %d because of %d buffer bytes used (%d max)\n", CONN_INFO(c)->fd, tot_used_bytes, MAX_CONNECTION_BUFFER_SPACE);
+    vkprintf (2, "check_conn_buffers(): closing connection %d because of %lld buffer bytes used (%d max)\n", CONN_INFO(c)->fd, tot_used_bytes, MAX_CONNECTION_BUFFER_SPACE);
     if ((unsigned)fd < MAX_CONNECTIONS) {
       ConnBackpressure[fd].paused = 0;
       ConnBackpressure[fd].generation = generation;
@@ -2273,7 +2289,7 @@ int check_conn_buffers (connection_job_t c) {
       ConnBackpressure[fd].generation = generation;
     }
     ++relay_backpressure_pauses;
-    vkprintf (3, "check_conn_buffers(): pausing read on fd=%d at %d bytes\n", fd, tot_used_bytes);
+    vkprintf (3, "check_conn_buffers(): pausing read on fd=%d at %lld bytes\n", fd, tot_used_bytes);
   } else if (paused && tot_used_bytes <= CONN_BACKPRESSURE_LOW) {
     struct connection_info *ci = CONN_INFO(c);
     if (ci->status == conn_working && !(ci->flags & (C_ERROR | C_FAILED | C_NET_FAILED | C_STOPPARSE))) {
@@ -2284,7 +2300,7 @@ int check_conn_buffers (connection_job_t c) {
         job_signal (JOB_REF_CREATE_PASS (S), JS_RUN);
       }
       job_signal (JOB_REF_CREATE_PASS (c), JS_RUN);
-      vkprintf (3, "check_conn_buffers(): resuming read on fd=%d at %d bytes\n", fd, tot_used_bytes);
+      vkprintf (3, "check_conn_buffers(): resuming read on fd=%d at %lld bytes\n", fd, tot_used_bytes);
     }
     if ((unsigned)fd < MAX_CONNECTIONS) {
       ConnBackpressure[fd].paused = 0;
@@ -2298,15 +2314,23 @@ int check_conn_buffers (connection_job_t c) {
 
 // invoked in NET-CPU context!
 int mtfront_data_received (connection_job_t c, int bytes_received) {
-  check_conn_buffers (c);
-  tcp_rpc_secret_note_data_received (c, bytes_received);
+  connection_job_t C = mtfront_conn_from_job (c);
+  if (!C) {
+    return 0;
+  }
+  check_conn_buffers (C);
+  tcp_rpc_secret_note_data_received (C, bytes_received);
   return 0;
 }
 
 // invoked in NET-CPU context!
 int mtfront_data_sent (connection_job_t c, int bytes_sent) {
-  check_conn_buffers (c);
-  tcp_rpc_secret_note_data_sent (c, bytes_sent);
+  connection_job_t C = mtfront_conn_from_job (c);
+  if (!C) {
+    return 0;
+  }
+  check_conn_buffers (C);
+  tcp_rpc_secret_note_data_sent (C, bytes_sent);
   return 0;
 }
 
