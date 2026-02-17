@@ -1251,7 +1251,13 @@ int insert_job_into_job_list (job_t list_job, JOB_REF_ARG(job), int mode) {
     __sync_fetch_and_add (&job->j_children, 1);
   }
   struct job_list_job_node *wj = malloc (sizeof (struct job_list_job_node));
-  assert (wj);
+  if (!wj) {
+    if (mode & JSP_PARENT_WAKEUP) {
+      __sync_fetch_and_add (&job->j_children, -1);
+    }
+    job_decref (JOB_REF_PASS (job));
+    return 0;
+  }
   wj->jl_type = job_list_node_wakeup;
   wj->jl_job = PTR_MOVE (job);
   wj->jl_flags = mode;
@@ -1525,7 +1531,16 @@ void job_message_queue_free (job_t job) {
 
 void job_message_queue_init (job_t job) {
   struct job_message_queue *q = calloc (sizeof (*q), 1);
+  if (!q) {
+    vkprintf (0, "job_message_queue_init: calloc failed\n");
+    return;
+  }
   q->unsorted = alloc_mp_queue_w ();
+  if (!q->unsorted) {
+    vkprintf (0, "job_message_queue_init: alloc_mp_queue_w failed\n");
+    free (q);
+    return;
+  }
   job_message_queue_set (job, q);
 }
 
@@ -1542,6 +1557,13 @@ void job_message_free_default (struct job_message *M) {
 void job_message_send (JOB_REF_ARG (job), JOB_REF_ARG (src), unsigned int type, struct raw_message *raw, int dup, int payload_ints, const unsigned int *payload, unsigned int flags, void (*destroy)(struct job_message *)) {
   assert (job->j_type & JT_HAVE_MSG_QUEUE);
   struct job_message *M = malloc (sizeof (*M) + payload_ints * 4);
+  if (!M) {
+    if (src) {
+      job_decref (JOB_REF_PASS (src));
+    }
+    job_decref (JOB_REF_PASS (job));
+    return;
+  }
   M->type = type;
   M->flags = 0;
   M->src = PTR_MOVE (src);
@@ -1583,6 +1605,12 @@ void job_message_send_data (JOB_REF_ARG (job), JOB_REF_ARG (src), unsigned int t
 void job_message_send_fake (JOB_REF_ARG (job), int (*receive_message)(job_t job, struct job_message *M, void *extra), void *extra, JOB_REF_ARG (src), unsigned int type, struct raw_message *raw, int dup, int payload_ints, const unsigned int *payload, unsigned int flags, void (*destroy)(struct job_message *)) {
   assert (job->j_type & JT_HAVE_MSG_QUEUE);
   struct job_message *M = malloc (sizeof (*M) + payload_ints * 4);
+  if (!M) {
+    if (src) {
+      job_decref (JOB_REF_PASS (src));
+    }
+    return;
+  }
   M->type = type;
   M->flags = 0;
   M->src = PTR_MOVE (src);
@@ -1700,6 +1728,10 @@ static int notify_job_receive_message (job_t NJ, struct job_message *M, void *ex
         complete_subjob (NJ, JOB_REF_PASS (M->src), JSP_PARENT_RWE);
       } else {
         struct notify_job_subscriber *S = malloc (sizeof (*S));
+        if (!S) {
+          complete_subjob (NJ, JOB_REF_PASS (M->src), JSP_PARENT_RWE);
+          return 1;
+        }
         S->job = PTR_MOVE (M->src);
         S->next = NULL;
         if (N->last) {

@@ -184,6 +184,11 @@ struct msg_buffers_chunk *alloc_new_msg_buffers_chunk (struct msg_buffers_chunk 
   if (!C) {
     return 0;
   }
+  struct mp_queue *free_block_queue = alloc_mp_queue_w ();
+  if (!free_block_queue) {
+    free (C);
+    return 0;
+  }
 
   int buffer_size = CH->buffer_size, two_power, chunk_buffers;
   int buffer_hd_size = buffer_size + BUFF_HD_BYTES;
@@ -272,7 +277,7 @@ struct msg_buffers_chunk *alloc_new_msg_buffers_chunk (struct msg_buffers_chunk 
     C->free_cnt[i] = C->free_cnt[2*i] + C->free_cnt[2*i+1];
   }
 
-  C->free_block_queue = alloc_mp_queue_w ();
+  C->free_block_queue = free_block_queue;
 
   //vkprintf (0, "allocated chunk %p\n", C);
   return C;
