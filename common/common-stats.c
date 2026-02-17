@@ -296,8 +296,11 @@ void sb_print_queries (stats_buffer_t *sb, const char *const desc, long long q) 
 int sb_sum_i (void **base, int len, int offset) {
   int res = 0;
   int i;
-  for (i = 0; i < len; i++) if (base[i]) {
-    res += *(int *)((base[i]) + offset);
+  for (i = 0; i < len; i++) {
+    void *p = __atomic_load_n (&base[i], __ATOMIC_ACQUIRE);
+    if (p) {
+      res += *(int *)(p + offset);
+    }
   }
   return res;
 }
@@ -305,8 +308,11 @@ int sb_sum_i (void **base, int len, int offset) {
 long long sb_sum_ll (void **base, int len, int offset) {
   long long res = 0;
   int i;
-  for (i = 0; i < len; i++) if (base[i]) {
-    res += *(long long *)((base[i]) + offset);
+  for (i = 0; i < len; i++) {
+    void *p = __atomic_load_n (&base[i], __ATOMIC_ACQUIRE);
+    if (p) {
+      res += *(long long *)(p + offset);
+    }
   }
   return res;
 }
@@ -314,8 +320,11 @@ long long sb_sum_ll (void **base, int len, int offset) {
 double sb_sum_f (void **base, int len, int offset) {
   double res = 0;
   int i;
-  for (i = 0; i < len; i++) if (base[i]) {
-    res += *(double *)((base[i]) + offset);
+  for (i = 0; i < len; i++) {
+    void *p = __atomic_load_n (&base[i], __ATOMIC_ACQUIRE);
+    if (p) {
+      res += *(double *)(p + offset);
+    }
   }
   return res;
 }

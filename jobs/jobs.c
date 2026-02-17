@@ -78,6 +78,40 @@ MODULE_STAT_TYPE {
 
 MODULE_INIT
 
+static inline int job_thread_get_status (const struct job_thread *JT) {
+  return __atomic_load_n (&JT->status, __ATOMIC_RELAXED);
+}
+
+static inline void job_thread_set_status (struct job_thread *JT, int value) {
+  __atomic_store_n (&JT->status, value, __ATOMIC_RELEASE);
+}
+
+static inline void job_thread_or_status (struct job_thread *JT, int mask) {
+  __atomic_fetch_or (&JT->status, mask, __ATOMIC_RELAXED);
+}
+
+static inline void job_thread_and_status (struct job_thread *JT, int mask) {
+  __atomic_fetch_and (&JT->status, mask, __ATOMIC_RELAXED);
+}
+
+static inline double atomic_load_double (double *p) {
+  double v;
+  __atomic_load (p, &v, __ATOMIC_RELAXED);
+  return v;
+}
+
+static inline void atomic_store_double (double *p, double v) {
+  __atomic_store (p, &v, __ATOMIC_RELAXED);
+}
+
+static inline void atomic_add_double (double *p, double delta) {
+  double old_v, new_v;
+  do {
+    __atomic_load (p, &old_v, __ATOMIC_RELAXED);
+    new_v = old_v + delta;
+  } while (!__atomic_compare_exchange (p, &old_v, &new_v, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+}
+
 MODULE_STAT_FUNCTION
   int uptime = time (0) - start_time;
   double tm = get_utime_monotonic ();
@@ -96,14 +130,15 @@ MODULE_STAT_FUNCTION
 
   int i,j;
   for (i = 0; i < max_job_thread_id + 1; i++) {
-    if (MODULE_STAT_ARR[i]) {
+    MODULE_STAT_TYPE *S = __atomic_load_n (&MODULE_STAT_ARR[i], __ATOMIC_ACQUIRE);
+    if (S) {
       assert (JobThreads[i].id == i);
       int class = JobThreads[i].thread_class & JC_MASK;
-      tot_recent_idle[class] += MODULE_STAT_ARR[i]->a_idle_time;
-      tot_recent_q[class] += MODULE_STAT_ARR[i]->a_idle_quotient;
-      tot_idle[class] += MODULE_STAT_ARR[i]->tot_idle_time;
-      if (MODULE_STAT_ARR[i]->locked_since) {
-        double lt = MODULE_STAT_ARR[i]->locked_since;
+      tot_recent_idle[class] += atomic_load_double (&S->a_idle_time);
+      tot_recent_q[class] += atomic_load_double (&S->a_idle_quotient);
+      tot_idle[class] += atomic_load_double (&S->tot_idle_time);
+      double lt = atomic_load_double (&S->locked_since);
+      if (lt) {
         tot_recent_idle[class] += (tm - lt);
         tot_recent_q[class] += (tm - lt);
         tot_idle[class] += (tm - lt);
@@ -174,7 +209,7 @@ MODULE_STAT_FUNCTION
   double max_cpu_load_rs = 0;
   double max_cpu_load_rt = 0;
   for (i = 0; i < max_job_thread_id + 1; i++) {
-    if (MODULE_STAT_ARR[i]) {
+    if (__atomic_load_n (&MODULE_STAT_ARR[i], __ATOMIC_ACQUIRE)) {
       assert (JobThreads[i].id == i);
       int class = JobThreads[i].thread_class & JC_MASK;
       jb_cpu_load_u[class] += JobThreadsStats[i].tot_user;
@@ -290,7 +325,7 @@ MODULE_STAT_FUNCTION
   memset (jb_running, 0, sizeof (jb_running));
   for (i = 1; i <= max_job_thread_id; i++) {
     struct job_thread *JT = &JobThreads[i];
-    if (JT->status) {
+    if (job_thread_get_status (JT)) {
       jb_active += JT->jobs_active;
       jb_created += JT->jobs_created;
       for (j = 0; j <= JC_MAX; j++) {
@@ -446,7 +481,7 @@ int create_job_thread_ex (int thread_class, void *(*thread_work)(void *)) {
   int i;
   struct job_thread *JT = 0;
   for (i = 1; i < MAX_JOB_THREADS; i++) {
-    if (!JobThreads[i].status && !JobThreads[i].pthread_id) {
+    if (!job_thread_get_status (&JobThreads[i]) && !JobThreads[i].pthread_id) {
       JT = &JobThreads[i];
       break;
     }
@@ -455,7 +490,7 @@ int create_job_thread_ex (int thread_class, void *(*thread_work)(void *)) {
     return -1;
   }
   memset (JT, 0, sizeof (struct job_thread));
-  JT->status = JTS_CREATED;
+  job_thread_set_status (JT, JTS_CREATED);
   JT->thread_class = thread_class;
   JT->job_class_mask = 1 | (thread_class == JC_MAIN ? 0xffff : (1 << thread_class));
   JT->job_queue = JC->job_queue;
@@ -477,7 +512,7 @@ int create_job_thread_ex (int thread_class, void *(*thread_work)(void *)) {
 
     if (r) {
       vkprintf (0, "create_job_thread: pthread_create() failed: %s\n", strerror (r));
-      JT->status = 0;
+      job_thread_set_status (JT, 0);
       return -1;
     }
   } else {
@@ -640,7 +675,7 @@ int unlock_job (JOB_REF_ARG (job)) {
         continue;
       } else {
         assert (0 && "unhandled JS_FINISH\n");
-        MODULE_STAT->jobs_allocated_memory -= sizeof (struct async_job) + job->j_custom_bytes;
+        __atomic_fetch_sub (&MODULE_STAT->jobs_allocated_memory, sizeof (struct async_job) + job->j_custom_bytes, __ATOMIC_RELAXED);
         // complete_job (job);
         job_free (JOB_REF_PASS (job)); // ???
         JT->jobs_active --;
@@ -660,17 +695,17 @@ int unlock_job (JOB_REF_ARG (job)) {
       __sync_fetch_and_and (&job->j_flags, ~JFS_SET (signo));
       JT->jobs_running[req_class] ++;
       JT->current_job = job;
-      JT->status |= JTS_PERFORMING;
+      job_thread_or_status (JT, JTS_PERFORMING);
       vkprintf (JOBS_DEBUG, "BEGIN JOB %p, type %p, flags %08x, status %08x, sigclass %08x (signal %d of class %d), refcnt %d\n", job, job->j_execute, job->j_flags, job->j_status, job->j_sigclass, signo, req_class, job->j_refcnt);
       int custom = job->j_custom_bytes;
       int res = job->j_execute (job, signo, JT);
       JT->current_job = current_job;
       if (!current_job) {
-        JT->status &= ~JTS_PERFORMING;
+        job_thread_and_status (JT, ~JTS_PERFORMING);
       }
       JT->jobs_running[req_class] --;
       if (res == JOB_DESTROYED) {
-        MODULE_STAT->jobs_allocated_memory -= sizeof (struct async_job) + custom;
+        __atomic_fetch_sub (&MODULE_STAT->jobs_allocated_memory, sizeof (struct async_job) + custom, __ATOMIC_RELAXED);
         vkprintf (JOBS_DEBUG, "JOB %p DESTROYED: RES = %d\n", job, res);
         JT->jobs_active --;
         return res;
@@ -899,7 +934,7 @@ void *job_thread_ex (void *arg, void (*work_one)(void *, int)) {
     cb = cb->next;
   }
 
-  JT->status |= JTS_RUNNING;
+  job_thread_or_status (JT, JTS_RUNNING);
 
   int thread_class = JT->thread_class;
   struct mp_queue *Q = JT->job_queue;
@@ -915,12 +950,12 @@ void *job_thread_ex (void *arg, void (*work_one)(void *, int)) {
     void *job = mpq_pop_nw (Q, 4);
     if (!job) {
       double wait_start = get_utime_monotonic ();
-      MODULE_STAT->locked_since = wait_start;
+      atomic_store_double (&MODULE_STAT->locked_since, wait_start);
       job = mpq_pop_w (Q, 4);
       double wait_time = get_utime_monotonic () - wait_start;
-      MODULE_STAT->locked_since = 0;
-      MODULE_STAT->tot_idle_time += wait_time;
-      MODULE_STAT->a_idle_time += wait_time;
+      atomic_store_double (&MODULE_STAT->locked_since, 0);
+      atomic_add_double (&MODULE_STAT->tot_idle_time, wait_time);
+      atomic_add_double (&MODULE_STAT->a_idle_time, wait_time);
     }
     long long new_rdtsc = rdtsc ();
     if (new_rdtsc - last_rdtsc > 1000000) {
@@ -929,13 +964,15 @@ void *job_thread_ex (void *arg, void (*work_one)(void *, int)) {
       now = time (0);
       if (now > prev_now && now < prev_now + 60) {
         while (prev_now < now) {
-          MODULE_STAT->a_idle_time *= 100.0 / 101;
-          MODULE_STAT->a_idle_quotient = a_idle_quotient * (100.0/101) + 1;
+          double recent_idle = atomic_load_double (&MODULE_STAT->a_idle_time) * (100.0 / 101);
+          double recent_q = atomic_load_double (&MODULE_STAT->a_idle_quotient) * (100.0 / 101) + 1;
+          atomic_store_double (&MODULE_STAT->a_idle_time, recent_idle);
+          atomic_store_double (&MODULE_STAT->a_idle_quotient, recent_q);
           prev_now++;
         }
       } else {
         if (now >= prev_now + 60) {
-          MODULE_STAT->a_idle_time = MODULE_STAT->a_idle_quotient;
+          atomic_store_double (&MODULE_STAT->a_idle_time, atomic_load_double (&MODULE_STAT->a_idle_quotient));
         }
         prev_now = now;
       }
@@ -1035,7 +1072,7 @@ int run_pending_main_jobs (void) {
   }
   struct job_thread *JT = this_job_thread;
   assert (JT && JT->thread_class == JC_MAIN);
-  JT->status |= JTS_RUNNING;
+  job_thread_or_status (JT, JTS_RUNNING);
 
   int cnt = 0;
   while (1) {
@@ -1048,7 +1085,7 @@ int run_pending_main_jobs (void) {
     cnt++;
   }
 
-  JT->status &= ~JTS_RUNNING;
+  job_thread_and_status (JT, ~JTS_RUNNING);
   return cnt;
 }
 
@@ -1069,7 +1106,7 @@ job_t create_async_job (job_function_t run_job, unsigned long long job_signals, 
     }
   }
 
-  MODULE_STAT->jobs_allocated_memory += sizeof (struct async_job) + custom_bytes;
+  __atomic_fetch_add (&MODULE_STAT->jobs_allocated_memory, sizeof (struct async_job) + custom_bytes, __ATOMIC_RELAXED);
   struct job_thread *JT = this_job_thread;
   assert (JT);
   void *p = malloc (sizeof (struct async_job) + custom_bytes + 64);
@@ -1236,7 +1273,7 @@ int insert_event_timer (event_timer_t *et);
 int remove_event_timer (event_timer_t *et);
 
 void do_immediate_timer_insert (job_t W) {
-  MODULE_STAT->timer_ops ++;
+  __atomic_fetch_add (&MODULE_STAT->timer_ops, 1, __ATOMIC_RELAXED);
   struct event_timer *ev = (void *)W->j_custom;
   int active = ev->h_idx > 0;
 
@@ -1332,7 +1369,7 @@ int do_timer_job (job_t job, int op, struct job_thread *JT) {
     return JOB_COMPLETED;
   }
   if (op == JS_FINISH) {
-    MODULE_STAT->job_timers_allocated --;
+    __atomic_fetch_sub (&MODULE_STAT->job_timers_allocated, 1, __ATOMIC_RELAXED);
     return job_free (JOB_REF_PASS (job));
   }
   return JOB_ERROR;
@@ -1346,7 +1383,7 @@ job_t job_timer_alloc (int thread_class, double (*alarm)(void *), void *extra) {
   e->wakeup = alarm;
   e->extra = extra;
   unlock_job (JOB_REF_CREATE_PASS (t));
-  MODULE_STAT->job_timers_allocated ++;
+  __atomic_fetch_add (&MODULE_STAT->job_timers_allocated, 1, __ATOMIC_RELAXED);
   return t;
 }
 
@@ -1399,7 +1436,7 @@ void job_timer_insert (job_t job, double timeout) {
   } else {
     m = JobThreads[ev->flags & 255].timer_manager;
   }
-  MODULE_STAT->timer_ops_scheduler ++;
+  __atomic_fetch_add (&MODULE_STAT->timer_ops_scheduler, 1, __ATOMIC_RELAXED);
   assert (m);
   struct job_timer_manager_extra *e = (void *)m->j_custom;
   mpq_push_w (e->mpq, job_incref (job), 0);

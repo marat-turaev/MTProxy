@@ -458,7 +458,9 @@ extern struct job_thread JobThreads[];
   void CNCT(jobs_module_thread_init_,MODULE) (void) {\
     int id = get_this_thread_id ();\
     assert (id >= 0 && id < MAX_JOB_THREADS);\
-    MODULE_STAT = MODULE_STAT_ARR[id] = calloc (sizeof (MODULE_STAT_TYPE), 1);\
+    MODULE_STAT_TYPE *M = calloc (sizeof (MODULE_STAT_TYPE), 1);\
+    MODULE_STAT = M;\
+    __atomic_store_n (&MODULE_STAT_ARR[id], M, __ATOMIC_RELEASE);\
   } \
   \
   struct thread_callback CNCT(MODULE,_thread_callback) = { \
@@ -469,4 +471,3 @@ extern struct job_thread JobThreads[];
   void CNCT(jobs_module_register_,MODULE) (void) { \
     register_thread_callback (&CNCT(MODULE,_thread_callback)); \
   }
-
