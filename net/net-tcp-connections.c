@@ -348,6 +348,7 @@ int cpu_tcp_aes_crypto_ctr128_decrypt_input (connection_job_t C) /* {{{ */ {
   struct connection_info *c = CONN_INFO (C);
   struct aes_crypto *T = c->crypto;
   assert (c->crypto);
+  const int TLS_DECRYPT_CHUNK_MAX = 16384;
 
   while (c->in_u.total_bytes) {
     int len = c->in_u.total_bytes;
@@ -367,11 +368,6 @@ int cpu_tcp_aes_crypto_ctr128_decrypt_input (connection_job_t C) /* {{{ */ {
           return 0;
         }
         c->left_tls_packet_length = 256 * header[3] + header[4];
-        if (c->left_tls_packet_length > 16384) {
-          vkprintf (1, "error while parsing packet: TLS record too large (%d)\n", c->left_tls_packet_length);
-          fail_connection (C, -1);
-          return 0;
-        }
         vkprintf (2, "Receive TLS-packet of length %d\n", c->left_tls_packet_length);
         assert (rwm_skip_data (&c->in_u, 5) == 5);
         len -= 5;
@@ -379,6 +375,9 @@ int cpu_tcp_aes_crypto_ctr128_decrypt_input (connection_job_t C) /* {{{ */ {
 
       if (c->left_tls_packet_length < len) {
         len = c->left_tls_packet_length;
+      }
+      if (len > TLS_DECRYPT_CHUNK_MAX) {
+        len = TLS_DECRYPT_CHUNK_MAX;
       }
       c->left_tls_packet_length -= len;
     }
