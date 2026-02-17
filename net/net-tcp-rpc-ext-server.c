@@ -4217,8 +4217,11 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
           }
         }
 
-        aes_crypto_ctr128_init (C, &key_data, sizeof (key_data));
-        assert (c->crypto);
+        if (aes_crypto_ctr128_init (C, &key_data, sizeof (key_data)) < 0 || !c->crypto) {
+          vkprintf (0, "failed to initialize obfuscated2 crypto state\n");
+          connection_write_close (C);
+          return NEED_MORE_BYTES;
+        }
         struct aes_crypto *T = c->crypto;
 
         evp_crypt (T->read_aeskey, random_header, random_header, 64);

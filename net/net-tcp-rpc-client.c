@@ -634,7 +634,10 @@ int tcp_rpcc_init_crypto (connection_job_t C) {
     dh->dh_params_select = dh_params_select;
     assert (!c->crypto_temp);
     c->crypto_temp = alloc_crypto_temp (sizeof (struct crypto_temp_dh_params));
-    assert (c->crypto_temp);
+    if (!c->crypto_temp) {
+      vkprintf (0, "failed to allocate temp crypto state for DH handshake\n");
+      return -1;
+    }
     if (!dh_first_round (dh->g_a, c->crypto_temp)) {
       free_crypto_temp (c->crypto_temp, sizeof (struct crypto_temp_dh_params));
       c->crypto_temp = 0;
@@ -694,5 +697,4 @@ int tcp_rpcc_start_crypto (connection_job_t C, char *nonce, int key_select, unsi
  *                END (BASIC RPC CLIENT)
  *
  */
-
 

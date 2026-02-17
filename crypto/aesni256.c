@@ -27,10 +27,14 @@
 
 EVP_CIPHER_CTX *evp_cipher_ctx_init (const EVP_CIPHER *cipher, unsigned char *key, unsigned char iv[16], int is_encrypt) {
   EVP_CIPHER_CTX *evp_ctx = EVP_CIPHER_CTX_new();
-  assert(evp_ctx);
-
-  assert(EVP_CipherInit(evp_ctx, cipher, key, iv, is_encrypt) == 1);
-  assert(EVP_CIPHER_CTX_set_padding(evp_ctx, 0) == 1);
+  if (!evp_ctx) {
+    return NULL;
+  }
+  if (EVP_CipherInit (evp_ctx, cipher, key, iv, is_encrypt) != 1 ||
+      EVP_CIPHER_CTX_set_padding (evp_ctx, 0) != 1) {
+    EVP_CIPHER_CTX_free (evp_ctx);
+    return NULL;
+  }
   return evp_ctx;
 }
 

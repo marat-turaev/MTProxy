@@ -81,14 +81,23 @@ aes_secret_t main_secret;
 int aes_crypto_init (connection_job_t c, void *key_data, int key_data_len) {
   assert (key_data_len == sizeof (struct aes_key_data));
   struct aes_crypto *T = NULL;
-  assert (!posix_memalign ((void **)&T, 16, sizeof (struct aes_crypto)));
+  if (posix_memalign ((void **)&T, 16, sizeof (struct aes_crypto)) != 0 || !T) {
+    return -1;
+  }
   struct aes_key_data *D = key_data;
-  assert (T);
-
-  MODULE_STAT->allocated_aes_crypto ++;
-  
   T->read_aeskey = evp_cipher_ctx_init (EVP_aes_256_cbc(), D->read_key, D->read_iv, 0);
   T->write_aeskey = evp_cipher_ctx_init (EVP_aes_256_cbc(), D->write_key, D->write_iv, 1);
+  if (!T->read_aeskey || !T->write_aeskey) {
+    if (T->read_aeskey) {
+      EVP_CIPHER_CTX_free (T->read_aeskey);
+    }
+    if (T->write_aeskey) {
+      EVP_CIPHER_CTX_free (T->write_aeskey);
+    }
+    free (T);
+    return -1;
+  }
+  MODULE_STAT->allocated_aes_crypto ++;
   CONN_INFO(c)->crypto = T;
   return 0;
 }
@@ -96,14 +105,23 @@ int aes_crypto_init (connection_job_t c, void *key_data, int key_data_len) {
 int aes_crypto_ctr128_init (connection_job_t c, void *key_data, int key_data_len) {
   assert (key_data_len == sizeof (struct aes_key_data));
   struct aes_crypto *T = NULL;
-  assert (!posix_memalign ((void **)&T, 16, sizeof (struct aes_crypto)));
+  if (posix_memalign ((void **)&T, 16, sizeof (struct aes_crypto)) != 0 || !T) {
+    return -1;
+  }
   struct aes_key_data *D = key_data;
-  assert (T);
-
-  MODULE_STAT->allocated_aes_crypto ++;
-  
   T->read_aeskey = evp_cipher_ctx_init (EVP_aes_256_ctr(), D->read_key, D->read_iv, 1); // NB: is_encrypt == 1 here!
   T->write_aeskey = evp_cipher_ctx_init (EVP_aes_256_ctr(), D->write_key, D->write_iv, 1);
+  if (!T->read_aeskey || !T->write_aeskey) {
+    if (T->read_aeskey) {
+      EVP_CIPHER_CTX_free (T->read_aeskey);
+    }
+    if (T->write_aeskey) {
+      EVP_CIPHER_CTX_free (T->write_aeskey);
+    }
+    free (T);
+    return -1;
+  }
+  MODULE_STAT->allocated_aes_crypto ++;
   CONN_INFO(c)->crypto = T;
   return 0;
 }
@@ -351,7 +369,9 @@ void free_crypto_temp (void *crypto, int len) {
 
 void *alloc_crypto_temp (int len) {
   void *res = malloc (len);
-  assert (res);
+  if (!res) {
+    return NULL;
+  }
   MODULE_STAT->allocated_aes_crypto_temp ++;
   return res;
 }
