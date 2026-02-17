@@ -652,8 +652,12 @@ int parse_engine_options_long (int argc, char **argv) {
   }
   
   char *shortopts = malloc (total_shortopts_len + 1);
-  assert (shortopts);
   struct option *longopts = malloc ((total_longopts + 1) * sizeof (struct option));
+  if (!shortopts || !longopts) {
+    free (shortopts);
+    free (longopts);
+    return -1;
+  }
   int lpos = 0;
   int spos = 0;
 
@@ -710,6 +714,8 @@ int parse_engine_options_long (int argc, char **argv) {
       }
     }
   }
+  free (longopts);
+  free (shortopts);
   return 0;
 }
 
