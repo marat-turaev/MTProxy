@@ -129,6 +129,7 @@ static int proxy_mode;
 conn_type_t ct_http_server_mtfront, ct_tcp_rpc_ext_server_mtfront, ct_tcp_rpc_server_mtfront;
 
 long long connections_failed_lru, connections_failed_flood;
+long long relay_backpressure_pauses, relay_backpressure_resumes, relay_conn_buffer_peak_bytes;
 long long api_invoke_requests;
 
 volatile int sigpoll_cnt;
@@ -422,6 +423,7 @@ struct worker_stats {
   long long mtproto_proxy_errors;
 
   long long connections_failed_lru, connections_failed_flood;
+  long long relay_backpressure_pauses, relay_backpressure_resumes, relay_conn_buffer_peak_bytes;
 
   long long ext_connections, ext_connections_created;
   long long http_queries, http_bad_headers;
@@ -476,6 +478,9 @@ static void update_local_stats_copy (struct worker_stats *S) {
   UPD (mtproto_proxy_errors);
   UPD (connections_failed_lru);
   UPD (connections_failed_flood);
+  UPD (relay_backpressure_pauses);
+  UPD (relay_backpressure_resumes);
+  UPD (relay_conn_buffer_peak_bytes);
   UPD (ext_connections); 
   UPD (ext_connections_created); 
   UPD (http_queries); 
@@ -549,6 +554,11 @@ static inline void add_stats (struct worker_stats *W) {
   UPD (mtproto_proxy_errors);
   UPD (connections_failed_lru);
   UPD (connections_failed_flood);
+  UPD (relay_backpressure_pauses);
+  UPD (relay_backpressure_resumes);
+  if (SumStats.relay_conn_buffer_peak_bytes < W->relay_conn_buffer_peak_bytes) {
+    SumStats.relay_conn_buffer_peak_bytes = W->relay_conn_buffer_peak_bytes;
+  }
   UPD (ext_connections); 
   UPD (ext_connections_created); 
   UPD (http_queries); 
@@ -661,10 +671,13 @@ void mtfront_prepare_stats (stats_buffer_t *sb) {
 	     "total_network_buffers_used\t%d\n"
 	     "total_network_buffer_chunks_allocated\t%d\n"
 	     "total_network_buffer_chunks_allocated_max\t%d\n"
-	     "mtproto_proxy_errors\t%lld\n"
-	     "connections_failed_lru\t%lld\n"
-	     "connections_failed_flood\t%lld\n"
-	     "http_connections\t%d\n"
+		     "mtproto_proxy_errors\t%lld\n"
+		     "connections_failed_lru\t%lld\n"
+		     "connections_failed_flood\t%lld\n"
+		     "relay_backpressure_pauses\t%lld\n"
+		     "relay_backpressure_resumes\t%lld\n"
+		     "relay_conn_buffer_peak_bytes\t%lld\n"
+		     "http_connections\t%d\n"
 	     "pending_http_queries\t%d\n"
 	     "http_queries\t%lld\n"
 	     "http_bad_headers\t%lld\n"
@@ -727,10 +740,13 @@ void mtfront_prepare_stats (stats_buffer_t *sb) {
 	     SW(bufs.total_used_buffers),
 	     SW(bufs.allocated_buffer_chunks),
 	     SW(bufs.max_allocated_buffer_chunks),
-	     S(mtproto_proxy_errors),
-	     S(connections_failed_lru),
-	     S(connections_failed_flood),
-	     S(http_connections),
+		     S(mtproto_proxy_errors),
+		     S(connections_failed_lru),
+		     S(connections_failed_flood),
+		     S(relay_backpressure_pauses),
+		     S(relay_backpressure_resumes),
+		     SW(relay_conn_buffer_peak_bytes),
+		     S(http_connections),
 	     S(pending_http_queries),
 	     S(http_queries),
 	     S(http_bad_headers),
@@ -2224,6 +2240,9 @@ void check_all_conn_buffers (void) {
 
 int check_conn_buffers (connection_job_t c) {
   int tot_used_bytes = CONN_INFO(c)->in.total_bytes + CONN_INFO(c)->in_u.total_bytes + CONN_INFO(c)->out.total_bytes + CONN_INFO(c)->out_p.total_bytes;
+  if (relay_conn_buffer_peak_bytes < tot_used_bytes) {
+    relay_conn_buffer_peak_bytes = tot_used_bytes;
+  }
   int fd = CONN_INFO(c)->fd;
   int generation = CONN_INFO(c)->generation;
   int paused = 0;
@@ -2253,6 +2272,7 @@ int check_conn_buffers (connection_job_t c) {
       ConnBackpressure[fd].paused = 1;
       ConnBackpressure[fd].generation = generation;
     }
+    ++relay_backpressure_pauses;
     vkprintf (3, "check_conn_buffers(): pausing read on fd=%d at %d bytes\n", fd, tot_used_bytes);
   } else if (paused && tot_used_bytes <= CONN_BACKPRESSURE_LOW) {
     struct connection_info *ci = CONN_INFO(c);
@@ -2270,6 +2290,7 @@ int check_conn_buffers (connection_job_t c) {
       ConnBackpressure[fd].paused = 0;
       ConnBackpressure[fd].generation = generation;
     }
+    ++relay_backpressure_resumes;
   }
 
   return 0;
