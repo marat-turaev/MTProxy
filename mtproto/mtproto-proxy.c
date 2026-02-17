@@ -106,12 +106,12 @@ const char FullVersionStr[] = VERSION_STR " compiled at " __DATE__ " " __TIME__ 
 #define	MAX_CONNECTION_BUFFER_SPACE	(1 << 10) //(1 << 25)
 #define MAX_MTFRONT_NB			1 //((NB_max * 3) >> 2)
 #else
-#define	MAX_CONNECTION_BUFFER_SPACE	(1 << 25)
+#define	MAX_CONNECTION_BUFFER_SPACE	(1 << 27)
 #define MAX_MTFRONT_NB			((NB_max * 3) >> 2)
 #endif
 
-#define CONN_BACKPRESSURE_HIGH (1 << 16)
-#define CONN_BACKPRESSURE_LOW  (1 << 15)
+#define CONN_BACKPRESSURE_HIGH (1 << 20)
+#define CONN_BACKPRESSURE_LOW  (1 << 19)
 
 static double ping_interval = PING_INTERVAL;
 static int window_clamp;
