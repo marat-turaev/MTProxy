@@ -363,6 +363,17 @@ static inline void tls_shape_store_i32 (int *p, int value, int memory_order, int
   __atomic_store_n (p, value, memory_order);
 }
 
+static inline int tcp_set_cork_best_effort (int fd, int enable) {
+#ifdef TCP_CORK
+  int flags = enable ? 1 : 0;
+  return setsockopt (fd, IPPROTO_TCP, TCP_CORK, &flags, sizeof (flags)) >= 0;
+#else
+  (void)fd;
+  (void)enable;
+  return 0;
+#endif
+}
+
 void assert_main_thread (void) {}
 void assert_net_cpu_thread (void) {}
 void assert_net_net_thread (void) {}
@@ -1106,20 +1117,42 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
 
   int stop = c->flags & C_STOPWRITE;
   const int tls_fastpath = tls_shape_single_thread_fastpath ();
+  connection_job_t CC = c->conn;
+  struct connection_info *ci = CC ? CONN_INFO (CC) : NULL;
+  int tls_corked = 0;
 
   while ((c->flags & (C_WANTWR | C_NOWR | C_ERROR | C_NET_FAILED)) == C_WANTWR) {
     if (!out->total_bytes) {
+      if (ci && (ci->flags & C_IS_TLS)) {
+        int merged = 0;
+        while (1) {
+          struct raw_message *raw = mpq_pop_nw (c->out_packet_queue, 4);
+          if (!raw) { break; }
+          rwm_union (out, raw);
+          rwm_free_raw_message (raw);
+          merged = 1;
+        }
+        if (merged) {
+          continue;
+        }
+      }
+      if (tls_corked) {
+        tcp_set_cork_best_effort (c->fd, 0);
+        tls_corked = 0;
+      }
       __sync_fetch_and_and (&c->flags, ~C_WANTWR);
       break;
     }
 
     // Small timing jitter for early post-handshake TLS transport writes.
     // Implemented as a short timer on the socket job itself (no sleeps in the IO thread).
-    connection_job_t CC = c->conn;
-    struct connection_info *ci = CC ? CONN_INFO (CC) : NULL;
     if (ci && (ci->flags & C_IS_TLS)) {
       int left = tls_shape_load_i32 (&ci->tls_write_jitter_left, __ATOMIC_RELAXED, tls_fastpath);
       if (left > 0 && !job_timer_active (C)) {
+        if (tls_corked) {
+          tcp_set_cork_best_effort (c->fd, 0);
+          tls_corked = 0;
+        }
         int ms = 1 + (lrand48_j () % 4); // 1..4ms
         tls_shape_store_i32 (&ci->tls_write_jitter_left, left - 1, __ATOMIC_RELAXED, tls_fastpath);
         __sync_fetch_and_or (&c->flags, C_NOWR);
@@ -1137,6 +1170,10 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
           tls_shape_load_i32 (&ci->tls_out_records_sent, __ATOMIC_RELAXED, tls_fastpath) > 3) {
         unsigned int r = (unsigned int) lrand48_j ();
         if ((r & 15) == 0) { // ~1/16
+          if (tls_corked) {
+            tcp_set_cork_best_effort (c->fd, 0);
+            tls_corked = 0;
+          }
           int ms = 1 + ((r >> 4) & 3); // 1..4ms
           __sync_fetch_and_or (&c->flags, C_NOWR);
           job_timer_insert (C, precise_now + 0.001 * ms);
@@ -1238,6 +1275,17 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
     int s = tcp_prepare_iovec_limited (iov, &iovcnt, (int)(sizeof (iov) / sizeof (iov[0])), out, write_limit);
     assert (iovcnt > 0 && s > 0);
 
+    int want_cork = 0;
+    if (ci && (ci->flags & C_IS_TLS) && !tls_shape_active && !tls_noise_active && iovcnt > 1 && s >= 1400) {
+      want_cork = 1;
+    }
+    if (want_cork && !tls_corked) {
+      tls_corked = tcp_set_cork_best_effort (c->fd, 1);
+    } else if (!want_cork && tls_corked) {
+      tcp_set_cork_best_effort (c->fd, 0);
+      tls_corked = 0;
+    }
+
     __sync_fetch_and_or (&c->flags, C_NOWR);
     int r = writev (c->fd, iov, iovcnt);
     MODULE_STAT->tcp_writev_calls ++;
@@ -1245,6 +1293,10 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
     if (r <= 0) {
       if (r < 0 && errno == EAGAIN) {
         if (++c->eagain_count > 100) {
+          if (tls_corked) {
+            tcp_set_cork_best_effort (c->fd, 0);
+            tls_corked = 0;
+          }
           kprintf ("Too much EAGAINs for connection %d (%s), dropping\n", c->fd, show_remote_socket_ip (C));
           job_signal (JOB_REF_CREATE_PASS (C), JS_ABORT);
           __sync_fetch_and_or (&c->flags, C_NET_FAILED);
@@ -1255,6 +1307,10 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
         MODULE_STAT->tcp_writev_intr ++;
         continue;
       } else {
+        if (tls_corked) {
+          tcp_set_cork_best_effort (c->fd, 0);
+          tls_corked = 0;
+        }
         vkprintf (1, "Connection %d: Fatal error %m\n", c->fd);
         job_signal (JOB_REF_CREATE_PASS (C), JS_ABORT);
         __sync_fetch_and_or (&c->flags, C_NET_FAILED);
@@ -1304,6 +1360,11 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
         c->type->data_sent (C, r);
       }
     }
+  }
+
+  if (tls_corked) {
+    tcp_set_cork_best_effort (c->fd, 0);
+    tls_corked = 0;
   }
 
   if (check_watermark && out->total_bytes < c->write_low_watermark) {
