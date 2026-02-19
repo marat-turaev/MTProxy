@@ -59,8 +59,14 @@ head -c 16 /dev/urandom | xxd -ps
 - `<secret>` is the secret generated at step 3. Also you can set multiple secrets: `-S <secret1> -S <secret2>` (up to 256 secrets).
 - `proxy-secret` and `proxy-multi.conf` are obtained at steps 1 and 2.
 - `1` is the number of worker processes (`-M`). For TLS-transport mode (`-D`), a single worker is usually preferred.
+- `--address <local_ip>` (optional) binds listener sockets to a specific local interface instead of wildcard bind. Useful on multi-IP hosts.
 
 Also feel free to check out other options using `mtproto-proxy --help`.
+
+Example with explicit interface bind:
+```bash
+./mtproto-proxy ... --address <local_ip> --nat-info <local_ip>:<public_ip>
+```
 
 Note:
 - `/stats` is only served to loopback clients (`127.0.0.1` / `::1`) and the local port (`-p`) is loopback-only. If you need remote access, use an SSH tunnel instead of exposing the stats port.
