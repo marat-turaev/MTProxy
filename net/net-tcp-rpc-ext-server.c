@@ -178,6 +178,7 @@ int tcp_rpcs_set_ext_secret (unsigned char secret[16]) {
 static int allow_only_tls;
 
 static int fallback_backend_enabled;
+static int fallback_relay_enabled;
 static struct in_addr fallback_backend_target;
 static unsigned char fallback_backend_target_ipv6[16];
 static int fallback_backend_is_ipv6;
@@ -1134,6 +1135,7 @@ int tcp_rpc_proxy_domains_prepare_stat (stats_buffer_t *sb) {
   }
 
   sb_printf (sb, "tls_fallback_backend_enabled\t%d\n", fallback_backend_enabled ? 1 : 0);
+  sb_printf (sb, "tls_fallback_relay_enabled\t%d\n", fallback_relay_enabled ? 1 : 0);
   if (fallback_backend_enabled) {
     sb_printf (sb, "tls_fallback_backend\t%s\n", fallback_backend_printable[0] ? fallback_backend_printable : "-");
     sb_printf (sb, "tls_fallback_backend_is_ipv6\t%d\n", fallback_backend_is_ipv6 ? 1 : 0);
@@ -2321,6 +2323,14 @@ int tcp_rpc_fallback_backend_enabled (void) {
   return fallback_backend_enabled;
 }
 
+void tcp_rpc_enable_fallback_relay (void) {
+  fallback_relay_enabled = 1;
+}
+
+int tcp_rpc_fallback_relay_enabled (void) {
+  return fallback_relay_enabled;
+}
+
 static int ip_acl_set_file (ip_acl_source_t *src, const char *filename) {
   if (!filename || !*filename) {
     return -1;
@@ -3157,6 +3167,7 @@ static int http_send_301_and_close (connection_job_t C) {
 }
 
 static int proxy_connection_fallback (connection_job_t C);
+static int proxy_connection (connection_job_t C, const struct domain_info *info);
 
 static void stop_reading_temporarily (connection_job_t C) {
   struct connection_info *c = CONN_INFO (C);
@@ -3285,7 +3296,7 @@ static int tls_reject_authenticated (connection_job_t C, unsigned char alert_des
 
 static int tls_reject_or_fallback (connection_job_t C, unsigned char alert_description) {
   // For invalid TLS transport input: reject by default, or use fallback when enabled.
-  if (fallback_backend_enabled) {
+  if (fallback_backend_enabled && !fallback_relay_enabled) {
     int blocked = 0;
     int delay_ms = probe_note_failure (C, 1, &blocked);
     if (blocked) {
@@ -3307,7 +3318,7 @@ static int tls_reject_or_fallback (connection_job_t C, unsigned char alert_descr
 static int reject_or_fallback_close (connection_job_t C) {
   // For non-TLS input on a TLS-only listener: close/reject by default,
   // with optional fallback routing when explicitly enabled.
-  if (fallback_backend_enabled) {
+  if (fallback_backend_enabled && !fallback_relay_enabled) {
     int blocked = 0;
     int delay_ms = probe_note_failure (C, 1, &blocked);
     if (blocked) {
@@ -3348,6 +3359,21 @@ static int reject_or_fallback_close (connection_job_t C) {
     return tls_schedule_blocked_reject (C, 50 /* decode_error */);
   }
   return tls_schedule_delayed_reject (C, delay_ms, 50 /* decode_error */);
+}
+
+static int tls_relay_domain_or_reject (connection_job_t C, const struct domain_info *info, unsigned char alert_description) {
+  if (!fallback_relay_enabled || info == NULL) {
+    return tls_reject_or_fallback (C, alert_description);
+  }
+  int blocked = 0;
+  int delay_ms = probe_note_failure (C, 1, &blocked);
+  if (blocked) {
+    return tls_schedule_blocked_reject (C, alert_description);
+  }
+  if (delay_ms > 0) {
+    return tls_schedule_delayed_alert (C, alert_description, delay_ms);
+  }
+  return proxy_connection (C, info);
 }
 
 static int proxy_connection_fallback (connection_job_t C) {
@@ -3812,7 +3838,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         if (secret_id == ext_secret_cnt) {
           __atomic_fetch_add (&tls_handshake_fail_hmac, 1, __ATOMIC_RELAXED);
           vkprintf (1, "Receive request with unmatched client random\n");
-          return tls_reject_or_fallback (C, 40 /* handshake_failure */);
+          return tls_relay_domain_or_reject (C, info, 40 /* handshake_failure */);
         }
         int timestamp = *(int *)(expected_random + 28) ^ *(int *)(client_random + 28);
         if (!is_allowed_timestamp (timestamp)) {

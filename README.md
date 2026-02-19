@@ -170,6 +170,10 @@ Behavior:
 Security note:
 - Be careful: `--fallback-backend` can unintentionally expose an internal service to the Internet. This fork only allows loopback targets (`127.0.0.1:<port>` or `[::1]:<port>`) to reduce the chance of misconfiguration; do not point it at admin panels/databases/metadata endpoints.
 
+Related mode:
+- `--fallback-relay` (no argument) enables strict relay of failed TLS handshakes only when SNI matches a configured `-D` domain. Unknown/mismatched SNI is rejected and not relayed.
+- `--fallback-relay` and `--fallback-backend` are mutually exclusive.
+
 ### IP allowlist / blocklist (CIDR ACL)
 This fork supports file-based client IP ACLs with periodic reload:
 

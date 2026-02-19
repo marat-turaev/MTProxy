@@ -2670,6 +2670,9 @@ int f_parse_option (int val) {
       usage ();
     }
     break;
+  case 2009:
+    tcp_rpc_enable_fallback_relay ();
+    break;
   case 2002: {
     int x = atoi (optarg);
     if (x < 0 || x > 1000000) {
@@ -2836,6 +2839,7 @@ void mtfront_prepare_parse_options (void) {
   parse_option ("ip-blocklist-file", required_argument, 0, 2006, "path to CIDR/IP deny-list file, refreshed periodically");
   parse_option ("ip-allowlist-file", required_argument, 0, 2007, "path to CIDR/IP allow-list file, refreshed periodically");
   parse_option ("ip-acl-refresh-interval", required_argument, 0, 2008, "IP ACL refresh period in seconds (0 disables periodic refresh)");
+  parse_option ("fallback-relay", no_argument, 0, 2009, "strictly relay failed TLS handshakes only to matched -D domain targets");
   parse_option ("replay-cache-max-entries", required_argument, 0, 2010, "hard cap for replay cache entries");
   parse_option ("replay-cache-max-age", required_argument, 0, 2011, "hard cap for replay cache entry age in seconds");
   parse_option ("replay-cache-max-bytes", required_argument, 0, 2012, "optional replay cache memory budget in bytes (0 disables)");
@@ -2891,6 +2895,14 @@ void mtfront_pre_init (void) {
   }
   if (tcp_rpc_fallback_backend_enabled () && !domain_count) {
     kprintf ("--fallback-backend requires TLS-transport mode. Add at least one -D <domain>.\n");
+    exit (2);
+  }
+  if (tcp_rpc_fallback_relay_enabled () && !domain_count) {
+    kprintf ("--fallback-relay requires TLS-transport mode. Add at least one -D <domain>.\n");
+    exit (2);
+  }
+  if (tcp_rpc_fallback_backend_enabled () && tcp_rpc_fallback_relay_enabled ()) {
+    kprintf ("--fallback-backend and --fallback-relay are mutually exclusive.\n");
     exit (2);
   }
 
