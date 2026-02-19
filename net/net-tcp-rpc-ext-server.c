@@ -3006,12 +3006,18 @@ static int probe_entry_note_failure (struct probe_entry *e, int weight, int *blo
     return 0;
   }
 
-  int dt = t - e->last_time;
-  if (dt < 0) { dt = 0; }
-  if (dt > 0) {
-    // Decay score quickly so occasional mistakes don't penalize.
-    e->score -= dt * 2;
-    if (e->score < 0) { e->score = 0; }
+  if (e->last_time > 0) {
+    int dt = t - e->last_time;
+    if (dt < 0) { dt = 0; }
+    if (dt > 0) {
+      // Decay score quickly so occasional mistakes don't penalize.
+      long long decay = (long long) dt * 2;
+      if (decay >= e->score) {
+        e->score = 0;
+      } else {
+        e->score -= (int) decay;
+      }
+    }
   }
   e->last_time = t;
 
