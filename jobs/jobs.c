@@ -1100,17 +1100,27 @@ void job_change_signals (job_t job, unsigned long long job_signals) {
 
 /* "destroys" one reference to parent_job */
 job_t create_async_job (job_function_t run_job, unsigned long long job_signals, int job_subclass, int custom_bytes, unsigned long long job_type, JOB_REF_ARG (parent_job)) {
+  int parent_wakeup = 0;
   if (parent_job) {
     if (job_signals & JSP_PARENT_WAKEUP) {
       __sync_fetch_and_add (&parent_job->j_children, 1);
+      parent_wakeup = 1;
     }
   }
 
-  __atomic_fetch_add (&MODULE_STAT->jobs_allocated_memory, sizeof (struct async_job) + custom_bytes, __ATOMIC_RELAXED);
   struct job_thread *JT = this_job_thread;
   assert (JT);
   void *p = malloc (sizeof (struct async_job) + custom_bytes + 64);
-  assert (p);
+  if (!p) {
+    if (parent_job && parent_wakeup) {
+      __sync_fetch_and_add (&parent_job->j_children, -1);
+    }
+    if (parent_job) {
+      job_decref (JOB_REF_PASS (parent_job));
+    }
+    return NULL;
+  }
+  __atomic_fetch_add (&MODULE_STAT->jobs_allocated_memory, sizeof (struct async_job) + custom_bytes, __ATOMIC_RELAXED);
   int align = -((uintptr_t) p) & 63;
   job_t job = p + align;
   assert (!(((uintptr_t) job) & 63));
