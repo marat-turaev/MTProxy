@@ -2999,6 +2999,13 @@ static struct probe_entry *probe_get_entry_net (const struct connection_info *c)
 
 static int probe_entry_note_failure (struct probe_entry *e, int weight, int *blocked) {
   const int t = now;
+  if (e->blocked_until > t) {
+    // While blocked, do not refresh decay anchors; otherwise background probe
+    // noise can keep postponing effective recovery for shared subnets.
+    *blocked = 1;
+    return 0;
+  }
+
   int dt = t - e->last_time;
   if (dt < 0) { dt = 0; }
   if (dt > 0) {
@@ -3007,11 +3014,6 @@ static int probe_entry_note_failure (struct probe_entry *e, int weight, int *blo
     if (e->score < 0) { e->score = 0; }
   }
   e->last_time = t;
-
-  if (e->blocked_until > t) {
-    *blocked = 1;
-    return 0;
-  }
 
   if (weight < 1) { weight = 1; }
   if (weight > 10) { weight = 10; }
