@@ -2116,6 +2116,7 @@ int forward_tcp_query (struct tl_in_state *tlio_in, connection_job_t c, conn_tar
     flags |= 8;
   }
 
+  int len = 0;
   TLS_START (JOB_REF_PASS (d)); // open tlio_out context
 
   tl_store_int (RPC_PROXY_REQ);
@@ -2164,7 +2165,7 @@ int forward_tcp_query (struct tl_in_state *tlio_in, connection_job_t c, conn_tar
     *extra_size_ptr = TL_OUT_POS - pos;
   }
 
-  int len = TL_IN_REMAINING;
+  len = TL_IN_REMAINING;
   assert (tl_copy_through (tlio_in, tlio_out, len, 1) == len);
 
   TLS_END;   // close tlio_out context
