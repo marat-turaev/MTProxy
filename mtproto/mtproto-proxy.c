@@ -1492,6 +1492,10 @@ int hts_stats_execute (connection_job_t c, struct raw_message *msg, int op) {
     return -404;
   }
 
+  // Keep /stats responses one-shot to avoid lingering keep-alive sockets
+  // retaining output buffers until idle timeout.
+  D->query_flags &= ~QF_KEEPALIVE;
+
   stats_buffer_t sb;
   sb_alloc(&sb, 1 << 20);
   mtfront_prepare_stats(&sb);
