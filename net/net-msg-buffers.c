@@ -83,7 +83,7 @@ int rwm_peak_recovery;
 struct msg_buffers_chunk ChunkHeaders[MAX_BUFFER_SIZE_VALUES];
 __thread struct msg_buffers_chunk *ChunkSave[MAX_BUFFER_SIZE_VALUES];
 
-int default_buffer_sizes[] = { 48, 512, 2048, 16384, 262144 };
+int default_buffer_sizes[] = { 48, 256, 512, 1024, 2048, 4096, 16384, 262144 };
 int default_buffer_sizes_cnt = sizeof (default_buffer_sizes) / 4;
 
 int free_std_msg_buffer (struct msg_buffers_chunk *C, struct msg_buffer *X);
