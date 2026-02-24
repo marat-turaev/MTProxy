@@ -188,6 +188,7 @@ static int max_secret_unique_ips;
 static int max_secret_connections;
 static unsigned long long max_secret_total_octets;
 static int client_handshake_timeout = 3;
+static int tls_fake_ticket_records;
 static int replay_cache_max_entries = 200000;
 static int replay_cache_max_age = 2 * 86400;
 static unsigned long long replay_cache_max_bytes;
@@ -1271,6 +1272,9 @@ int tcp_rpc_proxy_domains_prepare_stat (stats_buffer_t *sb) {
 #define MAX_TLS_RESPONSE_ALLOC (1 << 15)
 #define TLS_CERT_JITTER_MIN 50
 #define TLS_CERT_JITTER_MAX 500
+#define TLS_FAKE_TICKET_MIN_LEN 48
+#define TLS_FAKE_TICKET_MAX_LEN 95
+#define TLS_FAKE_TICKET_MAX_RECORDS 4
 
 static BIGNUM *get_y2 (BIGNUM *x, const BIGNUM *mod, BN_CTX *big_num_context) {
   // returns y^2 = x^3 + 486662 * x^2 + x
@@ -2418,6 +2422,15 @@ void tcp_rpc_set_client_handshake_timeout (int timeout_seconds) {
     timeout_seconds = 60;
   }
   client_handshake_timeout = timeout_seconds;
+}
+
+void tcp_rpc_set_tls_fake_ticket_records (int records_count) {
+  if (records_count < 0) {
+    records_count = 0;
+  } else if (records_count > 4) {
+    records_count = 4;
+  }
+  tls_fake_ticket_records = records_count;
 }
 
 void tcp_rpc_set_replay_cache_max_entries (int limit) {
@@ -3983,7 +3996,21 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         }
 
         int server_hello_rec_len = use_synth ? 127 : selected_template_len;
-        int response_size = server_hello_rec_len + 6 + 5 + encrypted_payload_size;
+        int fake_ticket_count = tls_fake_ticket_records;
+        if (fake_ticket_count > TLS_FAKE_TICKET_MAX_RECORDS) {
+          fake_ticket_count = TLS_FAKE_TICKET_MAX_RECORDS;
+        }
+        int fake_ticket_sizes[TLS_FAKE_TICKET_MAX_RECORDS];
+        int fake_ticket_wire_total = 0;
+        int ti;
+        for (ti = 0; ti < fake_ticket_count; ti++) {
+          unsigned int tr = (unsigned int) lrand48_j ();
+          int tlen = TLS_FAKE_TICKET_MIN_LEN + (int)(tr % (TLS_FAKE_TICKET_MAX_LEN - TLS_FAKE_TICKET_MIN_LEN + 1));
+          fake_ticket_sizes[ti] = tlen;
+          fake_ticket_wire_total += 5 + tlen;
+        }
+
+        int response_size = server_hello_rec_len + 6 + 5 + encrypted_payload_size + fake_ticket_wire_total;
         if (response_size <= 0 || response_size > MAX_TLS_RESPONSE_ALLOC - 32) {
           vkprintf (0, "invalid TLS response size: %d (limit %d)\n", response_size, MAX_TLS_RESPONSE_ALLOC - 32);
           return tls_send_alert_and_close (C, 80 /* internal_error */);
@@ -4064,6 +4091,22 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
           return NEED_MORE_BYTES;
         }
         pos += encrypted_payload_size;
+
+        // Optional opaque records after first encrypted flight (disabled by default).
+        for (ti = 0; ti < fake_ticket_count; ti++) {
+          int tlen = fake_ticket_sizes[ti];
+          memcpy (response_buffer + pos, "\x17\x03\x03", 3);
+          pos += 3;
+          response_buffer[pos++] = (unsigned char)(tlen >> 8);
+          response_buffer[pos++] = (unsigned char)(tlen & 255);
+          if (RAND_bytes (response_buffer + pos, tlen) != 1) {
+            vkprintf (1, "RAND_bytes failed while building extra TLS response records, closing connection\n");
+            free (buffer);
+            connection_write_close (C);
+            return NEED_MORE_BYTES;
+          }
+          pos += tlen;
+        }
         assert (pos == response_size);
 
         unsigned char server_random[32];
