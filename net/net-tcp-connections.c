@@ -260,55 +260,74 @@ int cpu_tcp_aes_crypto_ctr128_encrypt_output (connection_job_t C) /* {{{ */ {
         // but avoid pathological 1-byte records when we have enough buffered data.
         if (max_len > TLS_MAX_RECORD) { max_len = TLS_MAX_RECORD; }
         min_len = (max_len >= 256) ? 256 : max_len;
-        } else {
-        // Steady state: prefer MSS-ish sizes, with occasional smaller/larger records.
+      } else {
+        // Steady state: use a broader, weighted record-size mix.
         if (max_len > TLS_MAX_RECORD) { max_len = TLS_MAX_RECORD; }
 
         unsigned int r = (unsigned int) lrand48_j ();
-        int bucket = r & 255;
-        if (max_len >= 8192) {
-          // If we have lots of buffered plaintext, bias towards larger records.
-          if (bucket >= 160 && bucket < 208) {  // ~18.75%
-            bucket = 200; // map into "small" range [192..239]
-          } else if (bucket < 208) {
-            bucket = 0;   // map into "near-MSS"
-          }
+        int bucket = r & 1023; // 0..1023
+        if (max_len >= 8192 && bucket >= 640 && bucket < 832) {
+          // Under heavy backlog, reduce small-record share.
+          bucket = 448 + (bucket & 127); // map into midsize window
         }
 
-        if (bucket < 192) {
-          // Most of the time: near-MSS to look like typical TLS over the Internet.
-          min_len = 1100;
+        if (bucket < 448) { // 43.75%
+          // Near-MSS baseline.
+          min_len = 1050;
           if (max_len < min_len) { min_len = max_len; }
-          int hi = 1700;
+          int hi = 1650;
           if (hi > max_len) { hi = max_len; }
           max_len = hi;
-        } else if (bucket < 240) {
-          // Sometimes: smaller records.
-          min_len = 600;
+        } else if (bucket < 672) { // 21.875%
+          // Mid-size records.
+          min_len = 1400;
           if (max_len < min_len) { min_len = max_len; }
-          int hi = 1200;
+          int hi = 2800;
           if (hi > max_len) { hi = max_len; }
           max_len = hi;
-      } else {
-          // Rarely (or when heavily buffered): larger records, up to 16KB.
-          if (max_len >= 4096) {
-            if (max_len > 8192) {
-              // Bias towards "almost full" records when we can.
-              int window = 512 + (int)((r >> 8) & 2047); // 512..2559
-              min_len = max_len - window;
-              if (min_len < 4096) { min_len = 4096; }
-            } else {
-              min_len = 4096;
-            }
-            // keep max_len as-is
-          } else {
-            // Not enough data for a "large record", fall back to near-MSS-ish.
-            min_len = 1100;
+        } else if (bucket < 832) { // 15.625%
+          // Smaller records.
+          min_len = 520;
           if (max_len < min_len) { min_len = max_len; }
-            int hi = 1700;
+          int hi = 1100;
+          if (hi > max_len) { hi = max_len; }
+          max_len = hi;
+        } else if (bucket < 928) { // 9.375%
+          // Large records.
+          min_len = 2800;
+          if (max_len < min_len) { min_len = max_len; }
+          int hi = 5200;
+          if (hi > max_len) { hi = max_len; }
+          max_len = hi;
+        } else if (bucket < 992) { // 6.25%
+          // Extra-large records.
+          if (max_len >= 5200) {
+            min_len = 5200;
+            int hi = 9000;
             if (hi > max_len) { hi = max_len; }
             max_len = hi;
-        }
+          } else {
+            min_len = 1050;
+            if (max_len < min_len) { min_len = max_len; }
+            int hi = 1650;
+            if (hi > max_len) { hi = max_len; }
+            max_len = hi;
+          }
+        } else { // 3.125%
+          // Rare near-full records when available.
+          if (max_len >= 9000) {
+            int window = 1024 + (int)((r >> 10) & 2047); // 1024..3071
+            min_len = max_len - window;
+            if (min_len < 9000) { min_len = 9000; }
+          } else if (max_len >= 4096) {
+            min_len = 4096;
+          } else {
+            min_len = 1050;
+            if (max_len < min_len) { min_len = max_len; }
+            int hi = 1650;
+            if (hi > max_len) { hi = max_len; }
+            max_len = hi;
+          }
         }
       }
 
