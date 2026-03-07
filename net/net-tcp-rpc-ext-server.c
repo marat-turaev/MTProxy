@@ -1395,6 +1395,144 @@ static int generate_public_key (unsigned char key[32]) {
   return generate_public_key_slow_bn (key);
 }
 
+unsigned char *tcp_rpc_build_tls_startup_response (
+  const unsigned char *client_hello,
+  int client_hello_len,
+  const unsigned char *client_random,
+  const unsigned char *secret,
+  const unsigned char *selected_template,
+  int selected_template_len,
+  int selected_keyshare_offset,
+  int use_synth,
+  int effective_reversed_order,
+  unsigned char cipher_suite_id,
+  int encrypted_payload_size,
+  int *out_len,
+  struct tcp_rpc_tls_startup_meta *meta
+) {
+  if (out_len == NULL || client_hello == NULL || client_random == NULL || secret == NULL) {
+    return NULL;
+  }
+  if (client_hello_len < 78 || encrypted_payload_size < 1 || encrypted_payload_size > 16384) {
+    return NULL;
+  }
+  if (!use_synth && (selected_template == NULL || selected_template_len <= 0)) {
+    return NULL;
+  }
+
+  const int server_hello_rec_len = use_synth ? 127 : selected_template_len;
+  const int response_size = server_hello_rec_len + 6 + 5 + encrypted_payload_size;
+  if (response_size <= 0 || response_size > MAX_TLS_RESPONSE_ALLOC - 32) {
+    return NULL;
+  }
+
+  unsigned char *response = malloc ((size_t) response_size);
+  if (response == NULL) {
+    return NULL;
+  }
+
+  int pos = 0;
+  if (!use_synth) {
+    memcpy (response, selected_template, (size_t) selected_template_len);
+    if (selected_template_len >= 11 + 32) {
+      memset (response + 11, 0, 32);
+    }
+    if (selected_template_len >= 44 + 32) {
+      response[43] = '\x20';
+      memcpy (response + 44, client_hello + 44, 32);
+    }
+    if (selected_template_len >= 78) {
+      response[76] = 0x13;
+      response[77] = cipher_suite_id;
+    }
+    if (selected_keyshare_offset >= 0 &&
+        selected_keyshare_offset + 32 <= selected_template_len &&
+        !generate_public_key (response + selected_keyshare_offset)) {
+      free (response);
+      return NULL;
+    }
+    pos = selected_template_len;
+  } else {
+    memcpy (response, "\x16\x03\x03\x00\x7a\x02\x00\x00\x76\x03\x03", 11);
+    memset (response + 11, 0, 32);
+    response[43] = '\x20';
+    memcpy (response + 44, client_hello + 44, 32);
+    memcpy (response + 76, "\x13\x01\x00\x00\x2e", 5);
+    response[77] = cipher_suite_id;
+
+    pos = 81;
+    {
+      int tls_server_extensions[3] = {0x33, 0x2b, -1};
+      if (effective_reversed_order) {
+        int t = tls_server_extensions[0];
+        tls_server_extensions[0] = tls_server_extensions[1];
+        tls_server_extensions[1] = t;
+      }
+      int i;
+      for (i = 0; tls_server_extensions[i] != -1; i++) {
+        if (tls_server_extensions[i] == 0x33) {
+          memcpy (response + pos, "\x00\x33\x00\x24\x00\x1d\x00\x20", 8);
+          if (!generate_public_key (response + pos + 8)) {
+            free (response);
+            return NULL;
+          }
+          pos += 40;
+        } else if (tls_server_extensions[i] == 0x2b) {
+          memcpy (response + pos, "\x00\x2b\x00\x02\x03\x04", 6);
+          pos += 6;
+        }
+      }
+    }
+    if (pos != 127) {
+      free (response);
+      return NULL;
+    }
+  }
+
+  memcpy (response + pos, "\x14\x03\x03\x00\x01\x01", 6);
+  pos += 6;
+  memcpy (response + pos, "\x17\x03\x03", 3);
+  pos += 3;
+  response[pos++] = (unsigned char)(encrypted_payload_size >> 8);
+  response[pos++] = (unsigned char)(encrypted_payload_size & 255);
+  if (RAND_bytes (response + pos, encrypted_payload_size) != 1) {
+    free (response);
+    return NULL;
+  }
+  pos += encrypted_payload_size;
+
+  if (pos != response_size) {
+    free (response);
+    return NULL;
+  }
+
+  unsigned char *hmac_input = malloc ((size_t) response_size + 32);
+  if (hmac_input == NULL) {
+    free (response);
+    return NULL;
+  }
+  memcpy (hmac_input, client_random, 32);
+  memcpy (hmac_input + 32, response, (size_t) response_size);
+
+  unsigned char server_random[32];
+  if (sha256_hmac ((unsigned char *)secret, 16, hmac_input, 32 + response_size, server_random) < 0) {
+    free (hmac_input);
+    free (response);
+    return NULL;
+  }
+  memcpy (response + 11, server_random, 32);
+  free (hmac_input);
+
+  if (meta) {
+    meta->encrypted_payload_size = encrypted_payload_size;
+    meta->response_size = response_size;
+    meta->startup_appdata_records = 1;
+    meta->startup_shaping_plan_len = 0;
+  }
+  *out_len = response_size;
+  return response;
+}
+
 static void add_string (unsigned char *str, int *pos, const char *data, int data_len) {
   assert (*pos + data_len <= TLS_REQUEST_LENGTH);
   memcpy (str + (*pos), data, data_len);

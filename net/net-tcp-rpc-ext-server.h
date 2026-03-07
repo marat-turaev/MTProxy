@@ -72,3 +72,28 @@ int tcp_rpc_proxy_domains_prepare_stat (stats_buffer_t *sb);
 
 // Periodic replay cache maintenance for TLS transport mode.
 void tcp_rpc_ext_replay_cache_cleanup (void);
+
+struct tcp_rpc_tls_startup_meta {
+  int encrypted_payload_size;
+  int response_size;
+  int startup_appdata_records;
+  int startup_shaping_plan_len;
+};
+
+// Internal test/build helper: construct a client-compatible fake-TLS startup
+// response from primitive inputs. The returned buffer must be freed by caller.
+unsigned char *tcp_rpc_build_tls_startup_response (
+  const unsigned char *client_hello,
+  int client_hello_len,
+  const unsigned char *client_random,
+  const unsigned char *secret,
+  const unsigned char *selected_template,
+  int selected_template_len,
+  int selected_keyshare_offset,
+  int use_synth,
+  int effective_reversed_order,
+  unsigned char cipher_suite_id,
+  int encrypted_payload_size,
+  int *out_len,
+  struct tcp_rpc_tls_startup_meta *meta
+);

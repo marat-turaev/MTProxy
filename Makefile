@@ -43,7 +43,7 @@ CINCLUDE = -iquote common -iquote .
 
 LIBLIST = ${LIB}/libkdb.a
 
-PROJECTS = common jobs mtproto net crypto engine
+PROJECTS = common jobs mtproto net crypto engine tests
 
 OBJDIRS := ${OBJ} $(addprefix ${OBJ}/,${PROJECTS}) ${EXE} ${LIB}
 DEPDIRS := ${DEP} $(addprefix ${DEP}/,${PROJECTS})
@@ -52,11 +52,13 @@ ALLDIRS := ${DEPDIRS} ${OBJDIRS}
 
 .PHONY:	all clean sanitize tsan
 
-EXELIST	:= ${EXE}/mtproto-proxy
+EXELIST	:= ${EXE}/mtproto-proxy ${EXE}/fake_tls_startup_test
 
 
 OBJECTS	=	\
   ${OBJ}/mtproto/mtproto-proxy.o ${OBJ}/mtproto/mtproto-config.o ${OBJ}/net/net-tcp-rpc-ext-server.o
+
+TEST_OBJECTS = ${OBJ}/tests/fake_tls_startup_test.o
 
 DEPENDENCE_CXX		:=	$(subst ${OBJ}/,${DEP}/,$(patsubst %.o,%.d,${OBJECTS_CXX}))
 DEPENDENCE_STRANGE	:=	$(subst ${OBJ}/,${DEP}/,$(patsubst %.o,%.d,${OBJECTS_STRANGE}))
@@ -108,12 +110,18 @@ ${ALLDIRS}:
 ${OBJECTS}: ${OBJ}/%.o: %.c | create_dirs_and_headers
 	${CC} ${CFLAGS} ${CINCLUDE} -c -MP -MD -MF ${DEP}/$*.d -MQ ${OBJ}/$*.o -o $@ $<
 
+${TEST_OBJECTS}: ${OBJ}/%.o: %.c | create_dirs_and_headers
+	${CC} ${CFLAGS} ${CINCLUDE} -c -MP -MD -MF ${DEP}/$*.d -MQ ${OBJ}/$*.o -o $@ $<
+
 ${LIB_OBJS_NORMAL}: ${OBJ}/%.o: %.c | create_dirs_and_headers
 	${CC} ${CFLAGS} -fpic ${CINCLUDE} -c -MP -MD -MF ${DEP}/$*.d -MQ ${OBJ}/$*.o -o $@ $<
 
 ${EXELIST}: ${LIBLIST}
 
 ${EXE}/mtproto-proxy:	${OBJ}/mtproto/mtproto-proxy.o ${OBJ}/mtproto/mtproto-config.o ${OBJ}/net/net-tcp-rpc-ext-server.o
+	${CC} -o $@ $^ ${LIB}/libkdb.a ${LDFLAGS}
+
+${EXE}/fake_tls_startup_test: ${TEST_OBJECTS} ${OBJ}/net/net-tcp-rpc-ext-server.o
 	${CC} -o $@ $^ ${LIB}/libkdb.a ${LDFLAGS}
 
 ${LIB}/libkdb.a: ${LIB_OBJS}
