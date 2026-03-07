@@ -55,7 +55,6 @@ void tcp_rpc_set_secret_max_unique_ips (int limit);
 void tcp_rpc_set_secret_max_connections (int limit);
 void tcp_rpc_set_secret_max_total_octets (unsigned long long limit);
 void tcp_rpc_set_client_handshake_timeout (int timeout_seconds);
-void tcp_rpc_set_tls_fake_ticket_records (int records_count);
 void tcp_rpc_set_replay_cache_max_entries (int limit);
 void tcp_rpc_set_replay_cache_max_age (int seconds);
 void tcp_rpc_set_replay_cache_max_bytes (unsigned long long bytes_limit);

@@ -188,7 +188,6 @@ static int max_secret_unique_ips;
 static int max_secret_connections;
 static unsigned long long max_secret_total_octets;
 static int client_handshake_timeout = 3;
-static int tls_fake_ticket_records;
 static int replay_cache_max_entries = 200000;
 static int replay_cache_max_age = 2 * 86400;
 static unsigned long long replay_cache_max_bytes;
@@ -2562,15 +2561,6 @@ void tcp_rpc_set_client_handshake_timeout (int timeout_seconds) {
   client_handshake_timeout = timeout_seconds;
 }
 
-void tcp_rpc_set_tls_fake_ticket_records (int records_count) {
-  if (records_count < 0) {
-    records_count = 0;
-  } else if (records_count > 4) {
-    records_count = 4;
-  }
-  tls_fake_ticket_records = records_count;
-}
-
 void tcp_rpc_set_replay_cache_max_entries (int limit) {
   if (limit < 1) {
     limit = 1;
@@ -4133,128 +4123,32 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
           use_synth = 1;
         }
 
-        int server_hello_rec_len = use_synth ? 127 : selected_template_len;
-        int fake_ticket_count = tls_fake_ticket_records;
-        if (fake_ticket_count > TLS_FAKE_TICKET_MAX_RECORDS) {
-          fake_ticket_count = TLS_FAKE_TICKET_MAX_RECORDS;
-        }
-        int fake_ticket_sizes[TLS_FAKE_TICKET_MAX_RECORDS];
-        int fake_ticket_wire_total = 0;
-        int ti;
-        for (ti = 0; ti < fake_ticket_count; ti++) {
-          unsigned int tr = (unsigned int) lrand48_j ();
-          int tlen = TLS_FAKE_TICKET_MIN_LEN + (int)(tr % (TLS_FAKE_TICKET_MAX_LEN - TLS_FAKE_TICKET_MIN_LEN + 1));
-          fake_ticket_sizes[ti] = tlen;
-          fake_ticket_wire_total += 5 + tlen;
-        }
-
-        int response_size = server_hello_rec_len + 6 + 5 + encrypted_payload_size + fake_ticket_wire_total;
-        if (response_size <= 0 || response_size > MAX_TLS_RESPONSE_ALLOC - 32) {
-          vkprintf (0, "invalid TLS response size: %d (limit %d)\n", response_size, MAX_TLS_RESPONSE_ALLOC - 32);
+        int response_size = 0;
+        struct tcp_rpc_tls_startup_meta startup_meta;
+        unsigned char *response_buffer = tcp_rpc_build_tls_startup_response (
+          client_hello,
+          read_len,
+          client_random,
+          ext_secret[secret_id],
+          selected_template,
+          selected_template_len,
+          selected_keyshare_offset,
+          use_synth,
+          effective_reversed_order,
+          cipher_suite_id,
+          encrypted_payload_size,
+          &response_size,
+          &startup_meta
+        );
+        if (response_buffer == NULL) {
+          vkprintf (0, "failed to build TLS startup response\n");
           return tls_send_alert_and_close (C, 80 /* internal_error */);
         }
-        size_t response_alloc = (size_t)32 + (size_t)response_size;
-        unsigned char *buffer = malloc (response_alloc);
-        if (buffer == NULL) {
-          vkprintf (0, "failed to allocate TLS response buffer of %llu bytes\n", (unsigned long long)response_alloc);
-          return tls_send_alert_and_close (C, 80 /* internal_error */);
-        }
-        memcpy (buffer, client_random, 32);
-        unsigned char *response_buffer = buffer + 32;
-        if (!use_synth) {
-          memcpy (response_buffer, selected_template, (size_t)selected_template_len);
-          // Zero server_random before computing our HMAC-based server_random.
-          if (selected_template_len >= 11 + 32) {
-            memset (response_buffer + 11, 0, 32);
-          }
-          // Always mirror the client's session_id (expected by some clients).
-          if (selected_template_len >= 44 + 32) {
-            response_buffer[43] = '\x20';
-            memcpy (response_buffer + 44, client_hello + 44, 32);
-          }
-          // Chosen cipher suite: keep compatible with the client's offered list.
-          if (selected_template_len >= 78) {
-            response_buffer[76] = 0x13;
-            response_buffer[77] = cipher_suite_id;
-          }
-          // Patch keyshare public key to fresh random.
-          if (selected_keyshare_offset >= 0 &&
-              selected_keyshare_offset + 32 <= selected_template_len) {
-            generate_public_key (response_buffer + selected_keyshare_offset);
-          }
-          pos = selected_template_len;
-        } else {
-        memcpy (response_buffer, "\x16\x03\x03\x00\x7a\x02\x00\x00\x76\x03\x03", 11);
-        memset (response_buffer + 11, '\0', 32);
-        response_buffer[43] = '\x20';
-        memcpy (response_buffer + 44, client_hello + 44, 32);
-        memcpy (response_buffer + 76, "\x13\x01\x00\x00\x2e", 5);
-        response_buffer[77] = cipher_suite_id;
+        assert (startup_meta.startup_appdata_records == 1);
+        assert (startup_meta.startup_shaping_plan_len == 0);
 
-        pos = 81;
-        int tls_server_extensions[3] = {0x33, 0x2b, -1};
-        if (effective_reversed_order) {
-          int t = tls_server_extensions[0];
-          tls_server_extensions[0] = tls_server_extensions[1];
-          tls_server_extensions[1] = t;
-        }
-        int i;
-        for (i = 0; tls_server_extensions[i] != -1; i++) {
-          if (tls_server_extensions[i] == 0x33) {
-            assert (pos + 40 <= response_size);
-            memcpy (response_buffer + pos, "\x00\x33\x00\x24\x00\x1d\x00\x20", 8);
-            generate_public_key (response_buffer + pos + 8);
-            pos += 40;
-          } else if (tls_server_extensions[i] == 0x2b) {
-            assert (pos + 5 <= response_size);
-            memcpy (response_buffer + pos, "\x00\x2b\x00\x02\x03\x04", 6);
-            pos += 6;
-          } else {
-            assert (0);
-          }
-        }
-        assert (pos == 127);
-        }
-
-        memcpy (response_buffer + pos, "\x14\x03\x03\x00\x01\x01", 6);
-        pos += 6;
-          memcpy (response_buffer + pos, "\x17\x03\x03", 3);
-          pos += 3;
-        response_buffer[pos++] = encrypted_payload_size / 256;
-        response_buffer[pos++] = encrypted_payload_size % 256;
-        if (RAND_bytes (response_buffer + pos, encrypted_payload_size) != 1) {
-          vkprintf (1, "RAND_bytes failed while building TLS response, closing connection\n");
-          free (buffer);
-          connection_write_close (C);
-          return NEED_MORE_BYTES;
-        }
-        pos += encrypted_payload_size;
-
-        // Optional opaque records after first encrypted flight (disabled by default).
-        for (ti = 0; ti < fake_ticket_count; ti++) {
-          int tlen = fake_ticket_sizes[ti];
-          memcpy (response_buffer + pos, "\x17\x03\x03", 3);
-          pos += 3;
-          response_buffer[pos++] = (unsigned char)(tlen >> 8);
-          response_buffer[pos++] = (unsigned char)(tlen & 255);
-          if (RAND_bytes (response_buffer + pos, tlen) != 1) {
-            vkprintf (1, "RAND_bytes failed while building extra TLS response records, closing connection\n");
-            free (buffer);
-            connection_write_close (C);
-            return NEED_MORE_BYTES;
-          }
-          pos += tlen;
-        }
-        assert (pos == response_size);
-
-        unsigned char server_random[32];
-        if (sha256_hmac (ext_secret[secret_id], 16, buffer, 32 + response_size, server_random) < 0) {
-          vkprintf (0, "sha256_hmac failed while building TLS response\n");
-          free (buffer);
-          return tls_send_alert_and_close (C, 80 /* internal_error */);
-        }
-        memcpy (response_buffer + 11, server_random, 32);
-
+        // Keep the startup envelope byte-for-byte client compatible:
+        // one ServerHello record, one dummy CCS, one startup ApplicationData record.
         struct raw_message *m = rwm_alloc_raw_message ();
         rwm_create (m, response_buffer, response_size);
         mpq_push_w (c->out_queue, m, 0);
@@ -4271,87 +4165,14 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
           job_signal (JOB_REF_CREATE_PASS (C), JS_RUN);
         }
 
-        // Shape TCP segmentation of the first server flight for TLS transport.
-        // This does not change bytes on the wire, only how many bytes we attempt to write per syscall.
-        //
-        // Use measured startup record sizes and split the first flight into matching TCP chunks:
-        //   [Handshake+CCS+AppData(0)] [AppData(1)] [AppData(2)]
-        // Even though we emit one TLS ApplicationData record for client compatibility,
-        // chunking still follows the startup profile layout.
-        int plan_len = 0;
-        if (records_real > 1 && encrypted_wire_total - 5 <= 16384) {
-          int chunk0 = server_hello_rec_len + 6 + 5 + encrypted_sizes[0]; // handshake + CCS + (hdr+payload of first AppData)
-          if (chunk0 > 0 && plan_len < 4) {
-            c->tls_write_shaping_plan[plan_len++] = chunk0;
-          }
-          int ri2;
-          for (ri2 = 1; ri2 < records_real && ri2 < 3 && plan_len < 4; ri2++) {
-            int ch = 5 + encrypted_sizes[ri2]; // (hdr+payload) of subsequent AppData records
-            if (ch > 0) {
-              c->tls_write_shaping_plan[plan_len++] = ch;
-            }
-          }
-        }
-        if (plan_len > 1) {
-          // Add bounded per-connection variation to TCP chunk boundaries while preserving:
-          // - total bytes (sum of chunks)
-          // - number of chunks
-          // - sane minimum chunk sizes
-          enum { TLS_SHAPE_MIN_CHUNK = 64, TLS_SHAPE_MAX_DELTA = 256 };
-          int pi;
-          for (pi = 0; pi + 1 < plan_len; pi++) {
-            int a = c->tls_write_shaping_plan[pi];
-            int b = c->tls_write_shaping_plan[pi + 1];
-            int max_delta = (a < b ? a : b) >> 3; // up to 12.5%
-            if (max_delta > TLS_SHAPE_MAX_DELTA) {
-              max_delta = TLS_SHAPE_MAX_DELTA;
-            }
-            if (max_delta < 8) {
-              continue;
-            }
-
-            int from_a = a - TLS_SHAPE_MIN_CHUNK;
-            int from_b = b - TLS_SHAPE_MIN_CHUNK;
-            if (from_a < 0) { from_a = 0; }
-            if (from_b < 0) { from_b = 0; }
-            if (from_a == 0 && from_b == 0) {
-              continue;
-            }
-
-            unsigned int r = (unsigned int) lrand48_j ();
-            int move_a_to_b = (int)(r & 1);
-            int can_move = move_a_to_b ? from_a : from_b;
-            if (can_move <= 0) {
-              move_a_to_b ^= 1;
-              can_move = move_a_to_b ? from_a : from_b;
-              if (can_move <= 0) {
-                continue;
-              }
-            }
-
-            int delta = 1 + (int)((r >> 1) % (unsigned int)max_delta);
-            if (delta > can_move) {
-              delta = can_move;
-            }
-            if (delta <= 0) {
-              continue;
-            }
-
-            if (move_a_to_b) {
-              c->tls_write_shaping_plan[pi] -= delta;
-              c->tls_write_shaping_plan[pi + 1] += delta;
-            } else {
-              c->tls_write_shaping_plan[pi] += delta;
-              c->tls_write_shaping_plan[pi + 1] -= delta;
-            }
-          }
-        }
-        __atomic_store_n (&c->tls_write_shaping_plan_len, plan_len, __ATOMIC_RELAXED);
+        // Startup fake-TLS shaping stays disabled. Compatibility-sensitive
+        // packetization experiments belong only to post-startup bulk traffic.
+        __atomic_store_n (&c->tls_write_shaping_plan_len, 0, __ATOMIC_RELAXED);
         __atomic_store_n (&c->tls_write_shaping_plan_pos, 0, __ATOMIC_RELAXED);
         __atomic_store_n (&c->tls_write_shaping_chunk_left, 0, __ATOMIC_RELAXED);
-        __atomic_store_n (&c->tls_write_shaping_left, response_size, __ATOMIC_RELEASE);
+        __atomic_store_n (&c->tls_write_shaping_left, 0, __ATOMIC_RELEASE);
 
-        free (buffer);
+        free (response_buffer);
         return 11; // waiting for dummy ChangeCipherSpec and first packet
       }
 
