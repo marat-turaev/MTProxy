@@ -233,6 +233,92 @@ int cpu_tcp_aes_crypto_needed_output_bytes (connection_job_t C) /* {{{ */ {
 }
 /* }}} */
 
+enum {
+  TLS_LONG_FLOW_PHASE_BULK = 1,
+  TLS_LONG_FLOW_PHASE_MIXED = 2,
+  TLS_LONG_FLOW_PHASE_SPARSE = 3
+};
+
+static void tls_choose_long_flow_phase (struct connection_info *c) {
+  unsigned int r = (unsigned int) lrand48_j ();
+  int phase;
+  int budget;
+
+  if ((r & 1023) < 640) {  // ~62.5%
+    phase = TLS_LONG_FLOW_PHASE_BULK;
+    budget = 32768 + (int)((r >> 10) % 98305);  // 32KB..128KB
+  } else if ((r & 1023) < 896) {  // ~25%
+    phase = TLS_LONG_FLOW_PHASE_MIXED;
+    budget = 16384 + (int)((r >> 10) % 49153);  // 16KB..64KB
+  } else {  // ~12.5%
+    phase = TLS_LONG_FLOW_PHASE_SPARSE;
+    budget = 8192 + (int)((r >> 10) % 24577);  // 8KB..32KB
+  }
+
+  c->tls_long_flow_phase = phase;
+  c->tls_long_flow_phase_bytes_left = budget;
+}
+
+static void tls_choose_long_flow_record_len (struct connection_info *c, int max_len, int *min_len_out, int *max_len_out) {
+  int min_len = 1;
+  int hi = max_len;
+
+  if (c->tls_long_flow_phase_bytes_left <= 0 || c->tls_long_flow_phase <= 0) {
+    tls_choose_long_flow_phase (c);
+  }
+
+  switch (c->tls_long_flow_phase) {
+    case TLS_LONG_FLOW_PHASE_BULK:
+      if (max_len >= 12288) {
+        min_len = 8192;
+        hi = max_len < 16384 ? max_len : 16384;
+      } else if (max_len >= 6144) {
+        min_len = 4096;
+        hi = max_len;
+      } else {
+        min_len = max_len >= 2048 ? 2048 : max_len;
+        hi = max_len;
+      }
+      break;
+    case TLS_LONG_FLOW_PHASE_MIXED:
+      if (max_len >= 6144) {
+        unsigned int r = (unsigned int) lrand48_j ();
+        if ((r & 3) != 0) {
+          min_len = 1400;
+          hi = max_len < 4096 ? max_len : 4096;
+        } else {
+          min_len = 4096;
+          hi = max_len < 8192 ? max_len : 8192;
+        }
+      } else {
+        min_len = max_len >= 1200 ? 1200 : max_len;
+        hi = max_len;
+      }
+      break;
+    case TLS_LONG_FLOW_PHASE_SPARSE:
+    default:
+      if (max_len >= 4096) {
+        unsigned int r = (unsigned int) lrand48_j ();
+        if ((r & 7) == 0) {
+          min_len = 4096;
+          hi = max_len < 6144 ? max_len : 6144;
+        } else {
+          min_len = 700;
+          hi = max_len < 2200 ? max_len : 2200;
+        }
+      } else {
+        min_len = max_len >= 700 ? 700 : max_len;
+        hi = max_len;
+      }
+      break;
+  }
+
+  if (min_len < 1) { min_len = 1; }
+  if (hi < min_len) { hi = min_len; }
+  *min_len_out = min_len;
+  *max_len_out = hi;
+}
+
 int cpu_tcp_aes_crypto_ctr128_encrypt_output (connection_job_t C) /* {{{ */ {
   assert_net_cpu_thread ();
   struct connection_info *c = CONN_INFO (C);
@@ -261,74 +347,10 @@ int cpu_tcp_aes_crypto_ctr128_encrypt_output (connection_job_t C) /* {{{ */ {
         if (max_len > TLS_MAX_RECORD) { max_len = TLS_MAX_RECORD; }
         min_len = (max_len >= 256) ? 256 : max_len;
       } else {
-        // Steady state: use a broader, weighted record-size mix.
+        // Steady state: keep each connection in a sizing phase for a while so
+        // long transfers look bursty rather than sampled from a fixed histogram.
         if (max_len > TLS_MAX_RECORD) { max_len = TLS_MAX_RECORD; }
-
-        unsigned int r = (unsigned int) lrand48_j ();
-        int bucket = r & 1023; // 0..1023
-        if (max_len >= 8192 && bucket >= 640 && bucket < 832) {
-          // Under heavy backlog, reduce small-record share.
-          bucket = 448 + (bucket & 127); // map into midsize window
-        }
-
-        if (bucket < 448) { // 43.75%
-          // Near-MSS baseline.
-          min_len = 1050;
-          if (max_len < min_len) { min_len = max_len; }
-          int hi = 1650;
-          if (hi > max_len) { hi = max_len; }
-          max_len = hi;
-        } else if (bucket < 672) { // 21.875%
-          // Mid-size records.
-          min_len = 1400;
-          if (max_len < min_len) { min_len = max_len; }
-          int hi = 2800;
-          if (hi > max_len) { hi = max_len; }
-          max_len = hi;
-        } else if (bucket < 832) { // 15.625%
-          // Smaller records.
-          min_len = 520;
-          if (max_len < min_len) { min_len = max_len; }
-          int hi = 1100;
-          if (hi > max_len) { hi = max_len; }
-          max_len = hi;
-        } else if (bucket < 928) { // 9.375%
-          // Large records.
-          min_len = 2800;
-          if (max_len < min_len) { min_len = max_len; }
-          int hi = 5200;
-          if (hi > max_len) { hi = max_len; }
-          max_len = hi;
-        } else if (bucket < 992) { // 6.25%
-          // Extra-large records.
-          if (max_len >= 5200) {
-            min_len = 5200;
-            int hi = 9000;
-            if (hi > max_len) { hi = max_len; }
-            max_len = hi;
-          } else {
-            min_len = 1050;
-            if (max_len < min_len) { min_len = max_len; }
-            int hi = 1650;
-            if (hi > max_len) { hi = max_len; }
-            max_len = hi;
-          }
-        } else { // 3.125%
-          // Rare near-full records when available.
-          if (max_len >= 9000) {
-            int window = 1024 + (int)((r >> 10) & 2047); // 1024..3071
-            min_len = max_len - window;
-            if (min_len < 9000) { min_len = 9000; }
-          } else if (max_len >= 4096) {
-            min_len = 4096;
-          } else {
-            min_len = 1050;
-            if (max_len < min_len) { min_len = max_len; }
-            int hi = 1650;
-            if (hi > max_len) { hi = max_len; }
-            max_len = hi;
-          }
-        }
+        tls_choose_long_flow_record_len (c, max_len, &min_len, &max_len);
       }
 
       if (min_len < 1) { min_len = 1; }
@@ -338,6 +360,10 @@ int cpu_tcp_aes_crypto_ctr128_encrypt_output (connection_job_t C) /* {{{ */ {
       if (max_len > min_len) {
         unsigned int rlen = (unsigned int) lrand48_j ();
         len = min_len + (int)(rlen % (unsigned int)(max_len - min_len + 1));
+      }
+
+      if (records_sent >= EARLY_RECORDS && c->tls_long_flow_phase_bytes_left > 0) {
+        c->tls_long_flow_phase_bytes_left -= len;
       }
 
       unsigned char *hdr = rwm_postpone_alloc (&c->out_p, 5);

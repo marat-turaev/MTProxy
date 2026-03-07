@@ -273,6 +273,10 @@ struct connection_info {
   // Count of synthetic TLS ApplicationData records emitted on this connection.
   // Used for post-handshake TLS record sizing heuristics (traffic shaping).
   int tls_out_records_sent;
+  // Long-flow TLS shaping state used after the early post-handshake window.
+  int tls_long_flow_phase;
+  int tls_long_flow_phase_bytes_left;
+  int tls_write_noise_rearm_after;
 
   struct raw_message in_u, in, out, out_p;
 
