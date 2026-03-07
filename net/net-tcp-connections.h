@@ -35,3 +35,8 @@ int cpu_tcp_aes_crypto_needed_output_bytes (connection_job_t c);
 int cpu_tcp_aes_crypto_ctr128_decrypt_input (connection_job_t c);
 int cpu_tcp_aes_crypto_ctr128_encrypt_output (connection_job_t c);
 int cpu_tcp_aes_crypto_ctr128_needed_output_bytes (connection_job_t c);
+
+extern unsigned long long tls_bulk_small_record_delays;
+extern unsigned long long tls_bulk_small_record_flushes;
+extern unsigned long long tls_long_flow_phase_transitions;
+extern unsigned long long tls_long_flow_bulk_bytes_shaped;
