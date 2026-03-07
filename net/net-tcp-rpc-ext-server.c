@@ -1124,6 +1124,61 @@ static int jitter_profile_encrypted_size (const struct domain_info *info, const 
   return out;
 }
 
+static int choose_tls_startup_payload_size (int base_payload_size) {
+  enum {
+    TLS_STARTUP_SIZE_JITTER_MIN = 50,
+    TLS_STARTUP_SIZE_JITTER_MAX = 500
+  };
+  int families[3];
+  int families_n = 0;
+  int size;
+  int room;
+  unsigned int jr;
+  int size_jitter;
+
+  if (base_payload_size < 1) {
+    base_payload_size = 1;
+  } else if (base_payload_size > 16384) {
+    base_payload_size = 16384;
+  }
+
+  families[families_n++] = base_payload_size;
+  if (base_payload_size <= 16000) {
+    int step1 = base_payload_size + ((base_payload_size >= 4096) ? 96 : 64);
+    if (step1 > 16384) {
+      step1 = 16384;
+    }
+    if (step1 > base_payload_size) {
+      families[families_n++] = step1;
+    }
+  }
+  if (base_payload_size <= 15872) {
+    int step2 = base_payload_size + ((base_payload_size >= 4096) ? 224 : 160);
+    if (step2 > 16384) {
+      step2 = 16384;
+    }
+    if (step2 > families[families_n - 1]) {
+      families[families_n++] = step2;
+    }
+  }
+
+  size = families[(unsigned int) lrand48_j () % (unsigned int) families_n];
+  if (size < 16384) {
+    jr = (unsigned int) lrand48_j ();
+    if ((jr & 7) != 0) {
+      room = 16384 - size;
+      size_jitter = TLS_STARTUP_SIZE_JITTER_MIN + (int)(jr % (TLS_STARTUP_SIZE_JITTER_MAX - TLS_STARTUP_SIZE_JITTER_MIN + 1));
+      if (size_jitter > room) {
+        size_jitter = room;
+      }
+      if (size_jitter > 0) {
+        size += size_jitter;
+      }
+    }
+  }
+  return size;
+}
+
 int tcp_rpc_proxy_domains_prepare_stat (stats_buffer_t *sb) {
   sb_printf (sb, ">>>>>>tls_transport>>>>>>\tstart\n");
   sb_printf (sb, "tls_transport_only\t%d\n", allow_only_tls ? 1 : 0);
@@ -1269,11 +1324,6 @@ int tcp_rpc_proxy_domains_prepare_stat (stats_buffer_t *sb) {
 
 #define TLS_REQUEST_LENGTH 517
 #define MAX_TLS_RESPONSE_ALLOC (1 << 15)
-#define TLS_CERT_JITTER_MIN 50
-#define TLS_CERT_JITTER_MAX 500
-#define TLS_FAKE_TICKET_MIN_LEN 48
-#define TLS_FAKE_TICKET_MAX_LEN 95
-#define TLS_FAKE_TICKET_MAX_RECORDS 4
 
 static BIGNUM *get_y2 (BIGNUM *x, const BIGNUM *mod, BN_CTX *big_num_context) {
   // returns y^2 = x^3 + 486662 * x^2 + x
@@ -4058,25 +4108,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         if (encrypted_payload_size <= 0) {
           encrypted_payload_size = 1;
         }
-        // TLS record length is 16-bit and normally limited to 16384 bytes.
-        if (encrypted_payload_size > 16384) {
-          encrypted_payload_size = 16384;
-        }
-        // Add per-connection jitter to the encrypted first flight size to avoid
-        // a fixed cert-chain-like length fingerprint per domain.
-        if (encrypted_payload_size < 16384) {
-          unsigned int jr = (unsigned int) lrand48_j ();
-          if ((jr & 7) != 0) { // usually on
-            int room = 16384 - encrypted_payload_size;
-            int cert_jitter = TLS_CERT_JITTER_MIN + (int)(jr % (TLS_CERT_JITTER_MAX - TLS_CERT_JITTER_MIN + 1));
-            if (cert_jitter > room) {
-              cert_jitter = room;
-            }
-            if (cert_jitter > 0) {
-              encrypted_payload_size += cert_jitter;
-            }
-          }
-        }
+        encrypted_payload_size = choose_tls_startup_payload_size (encrypted_payload_size);
 
         int have_profile_tpl = profile && profile->server_hello_template && profile->server_hello_template_len > 0;
         int have_info_tpl = info->server_hello_template && info->server_hello_template_len > 0;
