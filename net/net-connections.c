@@ -1161,13 +1161,12 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
       }
     }
 
-    // Occasionally delay very small writes for a couple of milliseconds
-    // to give the connection a chance to coalesce bursts into a single TCP write.
-    // This is probabilistic and should not affect steady-state throughput.
+    // Occasionally delay very small writes for a couple of milliseconds, but
+    // only well after the startup fake-TLS envelope has completed.
     if (ci && (ci->flags & C_IS_TLS) && !job_timer_active (C)) {
       int shape_left = tls_shape_load_i32 (&ci->tls_write_shaping_left, __ATOMIC_RELAXED, tls_fastpath);
       if (shape_left <= 0 && out->total_bytes > 0 && out->total_bytes < 1200 &&
-          tls_shape_load_i32 (&ci->tls_out_records_sent, __ATOMIC_RELAXED, tls_fastpath) > 3) {
+          tls_shape_load_i32 (&ci->tls_out_records_sent, __ATOMIC_RELAXED, tls_fastpath) > 32) {
         unsigned int r = (unsigned int) lrand48_j ();
         if ((r & 15) == 0) { // ~1/16
           if (tls_corked) {
@@ -1221,7 +1220,8 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
         write_limit = tls_shape_chunk_left;
       }
     } else if (ci && (ci->flags & C_IS_TLS)) {
-      // Post-handshake write variation for TLS transport: shape TCP chunk sizes for a small amount of bytes.
+      // Post-startup write variation for TLS transport: shape TCP chunk sizes
+      // only after the startup fake-TLS grammar is long finished.
       // This is separate from TLS record sizing and can split records across packets.
       //
       // Re-arm windows by transferred volume so long downloads do not settle
