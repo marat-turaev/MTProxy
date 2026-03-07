@@ -1224,18 +1224,23 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
       // Post-handshake write variation for TLS transport: shape TCP chunk sizes for a small amount of bytes.
       // This is separate from TLS record sizing and can split records across packets.
       //
-      // Re-arm small variation windows occasionally later in the connection.
+      // Re-arm windows by transferred volume so long downloads do not settle
+      // into one stable packetization pattern.
       tls_noise_left = tls_shape_load_i32 (&ci->tls_write_noise_left, __ATOMIC_RELAXED, tls_fastpath);
       if (tls_noise_left <= 0) {
-        // Low-probability re-arm when we have enough pending bytes to make it meaningful.
-        // Out is a socket-level buffer (already encrypted for TLS transport here).
-        if (out->total_bytes >= 4096) {
-          unsigned int r = (unsigned int) lrand48_j ();
-          if ((r & 511) == 0) { // ~1/512
-            int budget = 1024 + (int)((r >> 9) % 4097); // 1024..5120 bytes
+        int rearm_after = tls_shape_load_i32 (&ci->tls_write_noise_rearm_after, __ATOMIC_RELAXED, tls_fastpath);
+        if (rearm_after <= 0) {
+          if (tls_shape_load_i32 (&ci->tls_out_records_sent, __ATOMIC_RELAXED, tls_fastpath) <= 40) {
+            unsigned int r = (unsigned int) lrand48_j ();
+            rearm_after = 32768 + (int)((r >> 9) % 32769); // 32KB..64KB
+            tls_shape_store_i32 (&ci->tls_write_noise_rearm_after, rearm_after, __ATOMIC_RELAXED, tls_fastpath);
+          } else if (out->total_bytes >= 4096) {
+            unsigned int r = (unsigned int) lrand48_j ();
+            int budget = 8192 + (int)((r >> 9) % 24577); // 8KB..32KB
             tls_shape_store_i32 (&ci->tls_write_noise_left, budget, __ATOMIC_RELAXED, tls_fastpath);
             tls_shape_store_i32 (&ci->tls_write_noise_chunk_left, 0, __ATOMIC_RELAXED, tls_fastpath);
             tls_noise_left = budget;
+            tls_shape_store_i32 (&ci->tls_write_noise_rearm_after, 32768 + (int)((r >> 3) % 32769), __ATOMIC_RELAXED, tls_fastpath);
           }
         }
       }
@@ -1256,10 +1261,11 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
         tls_noise_chunk_left = tls_shape_load_i32 (&ci->tls_write_noise_chunk_left, __ATOMIC_RELAXED, tls_fastpath);
         if (tls_noise_chunk_left <= 0) {
           unsigned int r = (unsigned int) lrand48_j ();
-          int chunk = 1100 + (int)(r % 401); // 1100..1500 (near MSS)
-          // Occasionally use a smaller chunk to avoid rigid segmentation patterns.
-          if ((r & 7) == 0) { // ~12.5%
-            chunk = 600 + (int)((r >> 3) % 701); // 600..1300
+          int chunk = 900 + (int)(r % 701); // 900..1600
+          if ((r & 3) == 0) { // ~25%
+            chunk = 512 + (int)((r >> 3) % 769); // 512..1280
+          } else if ((r & 15) == 0) { // rare coalesced write
+            chunk = 1600 + (int)((r >> 5) % 1201); // 1600..2800
           }
           if (chunk < 256) { chunk = 256; }
           if (chunk > tls_noise_left) { chunk = tls_noise_left; }
@@ -1354,6 +1360,14 @@ int net_server_socket_writer (socket_connection_job_t C) /* {{{ */{
           int new_chunk_left = tls_noise_chunk_left - r;
           if (new_chunk_left < 0) { new_chunk_left = 0; }
           tls_shape_store_i32 (&ci->tls_write_noise_chunk_left, new_chunk_left, __ATOMIC_RELAXED, tls_fastpath);
+        }
+      }
+      if (ci && (ci->flags & C_IS_TLS) && !tls_shape_active) {
+        int rearm_after = tls_shape_load_i32 (&ci->tls_write_noise_rearm_after, __ATOMIC_RELAXED, tls_fastpath);
+        if (rearm_after > 0) {
+          rearm_after -= r;
+          if (rearm_after < 0) { rearm_after = 0; }
+          tls_shape_store_i32 (&ci->tls_write_noise_rearm_after, rearm_after, __ATOMIC_RELAXED, tls_fastpath);
         }
       }
       if (c->type->data_sent) {
