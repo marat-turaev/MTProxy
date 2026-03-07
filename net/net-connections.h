@@ -277,6 +277,8 @@ struct connection_info {
   int tls_long_flow_phase;
   int tls_long_flow_phase_bytes_left;
   int tls_write_noise_rearm_after;
+  // One-shot hold used to coalesce tiny post-startup TLS plaintext before encrypting it.
+  int tls_bulk_small_record_delay_pending;
 
   struct raw_message in_u, in, out, out_p;
 

@@ -667,7 +667,11 @@ int do_connection_job (job_t job, int op, struct job_thread *JT) /* {{{ */ {
       return 0;
     }
     if (!(c->flags & C_ERROR)) {
-      c->type->alarm (C);
+      if (c->tls_bulk_small_record_delay_pending) {
+        c->type->read_write (C);
+      } else {
+        c->type->alarm (C);
+      }
     }
     return 0;
   }

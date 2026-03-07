@@ -30,6 +30,7 @@
 #include <stdio.h>
 #include <unistd.h>
 
+#include "common/precise-time.h"
 #include "net/net-connections.h"
 #include "net/net-msg.h"
 #include "net/net-msg-buffers.h"
@@ -37,6 +38,32 @@
 #include "net/net-crypto-aes.h"
 #include "kprintf.h"
 
+unsigned long long tls_bulk_small_record_delays;
+unsigned long long tls_bulk_small_record_flushes;
+unsigned long long tls_long_flow_phase_transitions;
+unsigned long long tls_long_flow_bulk_bytes_shaped;
+
+enum {
+  TLS_BULK_SMALL_RECORD_FLOOR = 256,
+  TLS_BULK_SMALL_RECORD_DELAYABLE_MAX = 384
+};
+
+static int tls_can_delay_bulk_small_record (struct connection_info *c) {
+  int buffered = c->out.total_bytes;
+  if (!(c->flags & C_IS_TLS)) {
+    return 0;
+  }
+  if (__atomic_load_n (&c->tls_out_records_sent, __ATOMIC_RELAXED) <= 32) {
+    return 0;
+  }
+  if (buffered <= 0 || buffered >= TLS_BULK_SMALL_RECORD_FLOOR || buffered > TLS_BULK_SMALL_RECORD_DELAYABLE_MAX) {
+    return 0;
+  }
+  if (c->out_p.total_bytes > 0) {
+    return 0;
+  }
+  return 1;
+}
 
 int cpu_tcp_free_connection_buffers (connection_job_t C) /* {{{ */ {
   struct connection_info *c = CONN_INFO (C);
@@ -69,6 +96,34 @@ int cpu_tcp_server_writer (connection_job_t C) /* {{{ */ {
   }
   
   c->type->flush (C);
+
+  if (c->type->crypto_encrypt_output && c->crypto) {
+    if (tls_can_delay_bulk_small_record (c)) {
+      if (!c->tls_bulk_small_record_delay_pending) {
+        double delay_until = precise_now + 0.001 * (double)(1 + (lrand48_j () % 3)); // 1..3 ms
+        c->tls_bulk_small_record_delay_pending = 1;
+        __atomic_fetch_add (&tls_bulk_small_record_delays, 1, __ATOMIC_RELAXED);
+        job_timer_insert (C, delay_until);
+        return 0;
+      }
+      if (c->out.total_bytes < TLS_BULK_SMALL_RECORD_FLOOR &&
+          job_timer_active (C) &&
+          job_timer_wakeup_time (C) > precise_now) {
+        return 0;
+      }
+      c->tls_bulk_small_record_delay_pending = 0;
+      if (job_timer_active (C)) {
+        job_timer_remove (C);
+      }
+      __atomic_fetch_add (&tls_bulk_small_record_flushes, 1, __ATOMIC_RELAXED);
+    } else if (c->tls_bulk_small_record_delay_pending) {
+      c->tls_bulk_small_record_delay_pending = 0;
+      if (job_timer_active (C)) {
+        job_timer_remove (C);
+      }
+      __atomic_fetch_add (&tls_bulk_small_record_flushes, 1, __ATOMIC_RELAXED);
+    }
+  }
 
   struct raw_message *raw = rwm_alloc_raw_message ();
 
@@ -246,17 +301,18 @@ static void tls_choose_long_flow_phase (struct connection_info *c) {
 
   if ((r & 1023) < 640) {  // ~62.5%
     phase = TLS_LONG_FLOW_PHASE_BULK;
-    budget = 32768 + (int)((r >> 10) % 98305);  // 32KB..128KB
+    budget = 65536 + (int)((r >> 10) % 131073);  // 64KB..192KB
   } else if ((r & 1023) < 896) {  // ~25%
     phase = TLS_LONG_FLOW_PHASE_MIXED;
-    budget = 16384 + (int)((r >> 10) % 49153);  // 16KB..64KB
+    budget = 32768 + (int)((r >> 10) % 65537);  // 32KB..96KB
   } else {  // ~12.5%
     phase = TLS_LONG_FLOW_PHASE_SPARSE;
-    budget = 8192 + (int)((r >> 10) % 24577);  // 8KB..32KB
+    budget = 16384 + (int)((r >> 10) % 32769);  // 16KB..48KB
   }
 
   c->tls_long_flow_phase = phase;
   c->tls_long_flow_phase_bytes_left = budget;
+  __atomic_fetch_add (&tls_long_flow_phase_transitions, 1, __ATOMIC_RELAXED);
 }
 
 static void tls_choose_long_flow_record_len (struct connection_info *c, int max_len, int *min_len_out, int *max_len_out) {
@@ -269,9 +325,12 @@ static void tls_choose_long_flow_record_len (struct connection_info *c, int max_
 
   switch (c->tls_long_flow_phase) {
     case TLS_LONG_FLOW_PHASE_BULK:
-      if (max_len >= 12288) {
-        min_len = 8192;
+      if (max_len >= 14336) {
+        min_len = 12288;
         hi = max_len < 16384 ? max_len : 16384;
+      } else if (max_len >= 8192) {
+        min_len = 8192;
+        hi = max_len < 14336 ? max_len : 14336;
       } else if (max_len >= 6144) {
         min_len = 4096;
         hi = max_len;
@@ -283,15 +342,18 @@ static void tls_choose_long_flow_record_len (struct connection_info *c, int max_
     case TLS_LONG_FLOW_PHASE_MIXED:
       if (max_len >= 6144) {
         unsigned int r = (unsigned int) lrand48_j ();
-        if ((r & 3) != 0) {
-          min_len = 1400;
-          hi = max_len < 4096 ? max_len : 4096;
-        } else {
+        if ((r & 7) < 5) {
+          min_len = 2048;
+          hi = max_len < 6144 ? max_len : 6144;
+        } else if ((r & 7) < 7) {
           min_len = 4096;
           hi = max_len < 8192 ? max_len : 8192;
+        } else {
+          min_len = 8192;
+          hi = max_len < 12288 ? max_len : 12288;
         }
       } else {
-        min_len = max_len >= 1200 ? 1200 : max_len;
+        min_len = max_len >= 1400 ? 1400 : max_len;
         hi = max_len;
       }
       break;
@@ -299,20 +361,26 @@ static void tls_choose_long_flow_record_len (struct connection_info *c, int max_
     default:
       if (max_len >= 4096) {
         unsigned int r = (unsigned int) lrand48_j ();
-        if ((r & 7) == 0) {
-          min_len = 4096;
+        if ((r & 15) < 2) {
+          min_len = 3072;
           hi = max_len < 6144 ? max_len : 6144;
-        } else {
-          min_len = 700;
+        } else if ((r & 15) < 10) {
+          min_len = 900;
           hi = max_len < 2200 ? max_len : 2200;
+        } else {
+          min_len = 1400;
+          hi = max_len < 4096 ? max_len : 4096;
         }
       } else {
-        min_len = max_len >= 700 ? 700 : max_len;
+        min_len = max_len >= 900 ? 900 : max_len;
         hi = max_len;
       }
       break;
   }
 
+  if (max_len >= TLS_BULK_SMALL_RECORD_FLOOR && min_len < TLS_BULK_SMALL_RECORD_FLOOR) {
+    min_len = TLS_BULK_SMALL_RECORD_FLOOR;
+  }
   if (min_len < 1) { min_len = 1; }
   if (hi < min_len) { hi = min_len; }
   *min_len_out = min_len;
@@ -364,6 +432,7 @@ int cpu_tcp_aes_crypto_ctr128_encrypt_output (connection_job_t C) /* {{{ */ {
 
       if (records_sent >= EARLY_RECORDS && c->tls_long_flow_phase_bytes_left > 0) {
         c->tls_long_flow_phase_bytes_left -= len;
+        __atomic_fetch_add (&tls_long_flow_bulk_bytes_shaped, (unsigned long long)len, __ATOMIC_RELAXED);
       }
 
       unsigned char *hdr = rwm_postpone_alloc (&c->out_p, 5);
