@@ -192,6 +192,8 @@ struct conn_target_info {
   int ready_outbound_connections;
   double next_reconnect, reconnect_timeout, next_reconnect_timeout;
   int custom_field;
+  int warm_blocked_until;
+  int warm_skip_accounted_until;
   conn_target_job_t next_target, prev_target;
   conn_target_job_t hnext;
 

@@ -1803,6 +1803,7 @@ static void target_route_note_success (conn_target_job_t S, double rtt_ms) {
   if (!e) {
     return;
   }
+  struct conn_target_info *CT = CONN_TARGET_INFO (S);
   if (rtt_ms > 0) {
     if (rtt_ms < 1) { rtt_ms = 1; }
     if (rtt_ms > 20000) { rtt_ms = 20000; }
@@ -1815,6 +1816,8 @@ static void target_route_note_success (conn_target_job_t S, double rtt_ms) {
   e->fail_streak = 0;
   e->unhealthy_until = 0;
   e->last_seen = now;
+  CT->warm_blocked_until = 0;
+  CT->warm_skip_accounted_until = 0;
 }
 
 static void target_route_note_failure (conn_target_job_t S) {
@@ -1822,6 +1825,7 @@ static void target_route_note_failure (conn_target_job_t S) {
   if (!e) {
     return;
   }
+  struct conn_target_info *CT = CONN_TARGET_INFO (S);
   if (e->fail_streak < 1000) {
     e->fail_streak++;
   }
@@ -1834,6 +1838,8 @@ static void target_route_note_failure (conn_target_job_t S) {
   }
   if (penalty > 0) {
     e->unhealthy_until = now + penalty;
+    CT->warm_blocked_until = e->unhealthy_until;
+    CT->warm_skip_accounted_until = 0;
   }
   e->last_seen = now;
 }

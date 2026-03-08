@@ -101,6 +101,7 @@ long long outbound_connections_created, inbound_connections_accepted;
 int ready_targets;
 
 long long netw_queries, netw_update_queries, total_failed_connections, total_connect_failures, unused_connections_closed;
+long long target_pool_warm_refills, target_pool_warm_skips_unhealthy;
 
 int allocated_targets, active_targets, inactive_targets, free_targets;
 int allocated_connections, allocated_socket_connections;
@@ -133,6 +134,8 @@ MODULE_STAT_FUNCTION
 
   SB_SUM_ONE_I (listening_connections);
   SB_SUM_ONE_LL (unused_connections_closed);
+  SB_SUM_ONE_LL (target_pool_warm_refills);
+  SB_SUM_ONE_LL (target_pool_warm_skips_unhealthy);
   SB_SUM_ONE_I (ready_targets);
   SB_SUM_ONE_I (allocated_targets);
   SB_SUM_ONE_I (active_targets);
@@ -2093,7 +2096,23 @@ int create_new_connections (conn_target_job_t CTJ) /* {{{ */ {
   }
 
   int reconnect_hint = __sync_lock_test_and_set (&CT->reconnect_hint, 0);
-  if (precise_now >= CT->next_reconnect || CT->active_outbound_connections || reconnect_hint) {
+  int warm_mode = 0;
+  if (!reconnect_hint &&
+      precise_now < CT->next_reconnect &&
+      CT->active_outbound_connections > 0 &&
+      CT->outbound_connections < CT->min_connections) {
+    // Keep a warm floor while the target is healthy, but do not override route quarantine.
+    if (CT->warm_blocked_until > now) {
+      if (CT->warm_skip_accounted_until != CT->warm_blocked_until) {
+        CT->warm_skip_accounted_until = CT->warm_blocked_until;
+        MODULE_STAT->target_pool_warm_skips_unhealthy++;
+      }
+      return 0;
+    }
+    warm_mode = 1;
+  }
+
+  if (precise_now >= CT->next_reconnect || reconnect_hint || warm_mode) {
     struct tree_connection *T = CT->conn_tree;  
     if (T) {
       __sync_fetch_and_add (&T->refcnt, 1);
@@ -2137,6 +2156,10 @@ int create_new_connections (conn_target_job_t CTJ) /* {{{ */ {
       CT->conn_tree = T;
       __sync_synchronize ();
       free_tree_ptr_connection (old);
+    }
+
+    if (warm_mode && count > 0) {
+      MODULE_STAT->target_pool_warm_refills += count;
     }
   
     compute_next_reconnect (CTJ);
