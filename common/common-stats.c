@@ -200,14 +200,25 @@ void sb_init (stats_buffer_t *sb, char *buff, int size) {
 }
 
 void sb_alloc (stats_buffer_t *sb, int size) {
+  int r = sb_try_alloc (sb, size);
+  assert (!r);
+}
+
+int sb_try_alloc (stats_buffer_t *sb, int size) {
   if (size < 16) {
     size = 16;
   }
   sb->buff = malloc (size);
-  assert (sb->buff);
+  if (!sb->buff) {
+    sb->pos = 0;
+    sb->size = 0;
+    sb->flags = 0;
+    return -1;
+  }
   sb->pos = 0;
   sb->size = size;
   sb->flags = 1;
+  return 0;
 }
 
 void sb_release (stats_buffer_t *sb) {

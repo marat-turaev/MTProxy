@@ -1475,7 +1475,7 @@ int hts_stats_execute (connection_job_t c, struct raw_message *msg, int op) {
     D->query_flags &= ~QF_KEEPALIVE;
     return -501;
   }
-  if (CONN_INFO(c)->remote_ip != 0x7f000001) {
+  if (!conn_is_loopback (c)) {
     return -404;
   }
 
@@ -1497,7 +1497,9 @@ int hts_stats_execute (connection_job_t c, struct raw_message *msg, int op) {
   D->query_flags &= ~QF_KEEPALIVE;
 
   stats_buffer_t sb;
-  sb_alloc(&sb, 1 << 20);
+  if (sb_try_alloc (&sb, 1 << 20) < 0) {
+    return -500;
+  }
   mtfront_prepare_stats(&sb);
 
   struct raw_message *raw = calloc (sizeof (*raw), 1);

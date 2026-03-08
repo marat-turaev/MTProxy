@@ -76,6 +76,7 @@ typedef struct stats_buffer {
 
 void sb_init (stats_buffer_t *sb, char *buff, int size);
 void sb_alloc (stats_buffer_t *sb, int size);
+int sb_try_alloc (stats_buffer_t *sb, int size);
 void sb_release (stats_buffer_t *sb);
 
 void sb_prepare (stats_buffer_t *sb);

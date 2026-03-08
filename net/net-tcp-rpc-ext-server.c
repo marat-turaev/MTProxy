@@ -1183,16 +1183,13 @@ int tcp_rpc_proxy_domains_prepare_stat (stats_buffer_t *sb) {
   sb_printf (sb, ">>>>>>tls_transport>>>>>>\tstart\n");
   sb_printf (sb, "tls_transport_only\t%d\n", allow_only_tls ? 1 : 0);
 
-  if (default_domain_info && default_domain_info->domain) {
-    sb_printf (sb, "tls_default_domain\t%s\n", default_domain_info->domain);
-  } else {
-    sb_printf (sb, "tls_default_domain\t-\n");
-  }
+  sb_printf (sb, "tls_default_domain\t%s\n",
+             (default_domain_info && default_domain_info->domain) ? "[redacted]" : "-");
 
   sb_printf (sb, "tls_fallback_backend_enabled\t%d\n", fallback_backend_enabled ? 1 : 0);
   sb_printf (sb, "tls_fallback_relay_enabled\t%d\n", fallback_relay_enabled ? 1 : 0);
   if (fallback_backend_enabled) {
-    sb_printf (sb, "tls_fallback_backend\t%s\n", fallback_backend_printable[0] ? fallback_backend_printable : "-");
+    sb_printf (sb, "tls_fallback_backend\t%s\n", fallback_backend_printable[0] ? "[redacted]" : "-");
     sb_printf (sb, "tls_fallback_backend_is_ipv6\t%d\n", fallback_backend_is_ipv6 ? 1 : 0);
     sb_printf (sb, "tls_fallback_backend_port\t%d\n", fallback_backend_port);
   }
@@ -1221,11 +1218,11 @@ int tcp_rpc_proxy_domains_prepare_stat (stats_buffer_t *sb) {
   pthread_rwlock_unlock (&ip_acl_lock);
 
   sb_printf (sb, "tls_ip_acl_refresh_interval_sec\t%d\n", ip_acl_refresh_interval);
-  sb_printf (sb, "tls_ip_allowlist_file\t%s\n", allow_path);
+  sb_printf (sb, "tls_ip_allowlist_file\t%s\n", strcmp (allow_path, "-") ? "[configured]" : "-");
   sb_printf (sb, "tls_ip_allowlist_loaded_at\t%d\n", allow_loaded);
   sb_printf (sb, "tls_ip_allowlist_ranges_v4\t%d\n", allow_v4);
   sb_printf (sb, "tls_ip_allowlist_ranges_v6\t%d\n", allow_v6);
-  sb_printf (sb, "tls_ip_blocklist_file\t%s\n", block_path);
+  sb_printf (sb, "tls_ip_blocklist_file\t%s\n", strcmp (block_path, "-") ? "[configured]" : "-");
   sb_printf (sb, "tls_ip_blocklist_loaded_at\t%d\n", block_loaded);
   sb_printf (sb, "tls_ip_blocklist_ranges_v4\t%d\n", block_v4);
   sb_printf (sb, "tls_ip_blocklist_ranges_v6\t%d\n", block_v6);
