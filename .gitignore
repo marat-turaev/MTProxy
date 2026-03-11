@@ -2,3 +2,4 @@ objs
 dep
 deploy.sh
 .DS_Store
+AGENTS.md
