@@ -42,14 +42,26 @@ unsigned long long tls_bulk_small_record_delays;
 unsigned long long tls_bulk_small_record_flushes;
 unsigned long long tls_long_flow_phase_transitions;
 unsigned long long tls_long_flow_bulk_bytes_shaped;
+unsigned long long tls_encrypt_len_overrun_events;
+unsigned long long tls_encrypt_short_encrypt_events;
+unsigned long long tls_encrypt_short_encrypt_requested_bytes;
+unsigned long long tls_encrypt_short_encrypt_available_bytes;
+
+static const int tls_enable_bulk_small_record_delay = 1;
+static const int tls_enable_long_flow_phase_sizing = 1;
 
 enum {
   TLS_BULK_SMALL_RECORD_FLOOR = 256,
-  TLS_BULK_SMALL_RECORD_DELAYABLE_MAX = 384
+  TLS_BULK_SMALL_RECORD_DELAYABLE_MAX = 384,
+  TLS_ERR_ENCRYPT_LEN_OVERRUN = -43,
+  TLS_ERR_ENCRYPT_SHORT = -44
 };
 
 static int tls_can_delay_bulk_small_record (struct connection_info *c) {
   int buffered = c->out.total_bytes;
+  if (!tls_enable_bulk_small_record_delay) {
+    return 0;
+  }
   if (!(c->flags & C_IS_TLS)) {
     return 0;
   }
@@ -63,6 +75,77 @@ static int tls_can_delay_bulk_small_record (struct connection_info *c) {
     return 0;
   }
   return 1;
+}
+
+static int tls_rwm_check_soft (struct raw_message *raw) {
+  if (raw->magic != RM_INIT_MAGIC && raw->magic != RM_TMP_MAGIC) {
+    return -1;
+  }
+  if (!raw->first) {
+    return raw->total_bytes ? -2 : 0;
+  }
+  if (!raw->last || raw->first_offset < raw->first->offset || raw->last_offset > raw->last->data_end) {
+    return -3;
+  }
+
+  int total_size = 0;
+  struct msg_part *mp = raw->first;
+  while (mp != 0) {
+    if (!mp->part || !mp->part->chunk) {
+      return -4;
+    }
+    if (mp->offset < 0 || mp->data_end > mp->part->chunk->buffer_size || mp->data_end < mp->offset) {
+      return -5;
+    }
+    int left = (mp == raw->first ? raw->first_offset : mp->offset);
+    int right = (mp == raw->last ? raw->last_offset : mp->data_end);
+    if (right < left) {
+      return -6;
+    }
+    total_size += right - left;
+    if (mp == raw->last) {
+      break;
+    }
+    mp = mp->next;
+  }
+  if (mp != raw->last) {
+    return -7;
+  }
+  return total_size == raw->total_bytes ? 0 : -8;
+}
+
+static void tls_fail_encrypt_output (connection_job_t C, const char *reason, int err, int len, int available, int encrypted) {
+  struct connection_info *c = CONN_INFO (C);
+  int out_check = tls_rwm_check_soft (&c->out);
+  int out_p_check = tls_rwm_check_soft (&c->out_p);
+  vkprintf (0,
+            "TLS encrypt output violation: reason=%s fd=%d gen=%d basic_type=%d status=%d flags=0x%x len=%d available=%d out_p=%d records_sent=%d delay_pending=%d long_flow_phase=%d timer_active=%d encrypted=%d out_check=%d out_p_check=%d\n",
+            reason,
+            c->fd,
+            c->generation,
+            c->basic_type,
+            c->status,
+            c->flags,
+            len,
+            available,
+            c->out_p.total_bytes,
+            __atomic_load_n (&c->tls_out_records_sent, __ATOMIC_RELAXED),
+            c->tls_bulk_small_record_delay_pending,
+            c->tls_long_flow_phase,
+            job_timer_active (C),
+            encrypted,
+            out_check,
+            out_p_check);
+
+  if (job_timer_active (C)) {
+    job_timer_remove (C);
+  }
+  c->tls_bulk_small_record_delay_pending = 0;
+  rwm_free (&c->out);
+  rwm_free (&c->out_p);
+  rwm_init (&c->out, 0);
+  rwm_init (&c->out_p, 0);
+  fail_connection (C, err);
 }
 
 int cpu_tcp_free_connection_buffers (connection_job_t C) /* {{{ */ {
@@ -414,11 +497,14 @@ int cpu_tcp_aes_crypto_ctr128_encrypt_output (connection_job_t C) /* {{{ */ {
         // but avoid pathological 1-byte records when we have enough buffered data.
         if (max_len > TLS_MAX_RECORD) { max_len = TLS_MAX_RECORD; }
         min_len = (max_len >= 256) ? 256 : max_len;
-      } else {
+      } else if (tls_enable_long_flow_phase_sizing) {
         // Steady state: keep each connection in a sizing phase for a while so
         // long transfers look bursty rather than sampled from a fixed histogram.
         if (max_len > TLS_MAX_RECORD) { max_len = TLS_MAX_RECORD; }
         tls_choose_long_flow_record_len (c, max_len, &min_len, &max_len);
+      } else {
+        if (max_len > TLS_MAX_RECORD) { max_len = TLS_MAX_RECORD; }
+        min_len = (max_len >= TLS_BULK_SMALL_RECORD_FLOOR) ? TLS_BULK_SMALL_RECORD_FLOOR : max_len;
       }
 
       if (min_len < 1) { min_len = 1; }
@@ -430,7 +516,7 @@ int cpu_tcp_aes_crypto_ctr128_encrypt_output (connection_job_t C) /* {{{ */ {
         len = min_len + (int)(rlen % (unsigned int)(max_len - min_len + 1));
       }
 
-      if (records_sent >= EARLY_RECORDS && c->tls_long_flow_phase_bytes_left > 0) {
+      if (tls_enable_long_flow_phase_sizing && records_sent >= EARLY_RECORDS && c->tls_long_flow_phase_bytes_left > 0) {
         c->tls_long_flow_phase_bytes_left -= len;
         __atomic_fetch_add (&tls_long_flow_bulk_bytes_shaped, (unsigned long long)len, __ATOMIC_RELAXED);
       }
@@ -450,7 +536,23 @@ int cpu_tcp_aes_crypto_ctr128_encrypt_output (connection_job_t C) /* {{{ */ {
       vkprintf (2, "Send TLS-packet of length %d (records_sent=%d)\n", len, records_sent);
     }
 
-    assert (rwm_encrypt_decrypt_to (&c->out, &c->out_p, len, T->write_aeskey, 1) == len);
+    int available = c->out.total_bytes;
+    if (len > available) {
+      __atomic_fetch_add (&tls_encrypt_len_overrun_events, 1, __ATOMIC_RELAXED);
+      __atomic_fetch_add (&tls_encrypt_short_encrypt_requested_bytes, (unsigned long long)len, __ATOMIC_RELAXED);
+      __atomic_fetch_add (&tls_encrypt_short_encrypt_available_bytes, (unsigned long long)available, __ATOMIC_RELAXED);
+      tls_fail_encrypt_output (C, "len_overrun", TLS_ERR_ENCRYPT_LEN_OVERRUN, len, available, -1);
+      return -1;
+    }
+
+    int encrypted = rwm_encrypt_decrypt_to (&c->out, &c->out_p, len, T->write_aeskey, 1);
+    if (encrypted != len) {
+      __atomic_fetch_add (&tls_encrypt_short_encrypt_events, 1, __ATOMIC_RELAXED);
+      __atomic_fetch_add (&tls_encrypt_short_encrypt_requested_bytes, (unsigned long long)len, __ATOMIC_RELAXED);
+      __atomic_fetch_add (&tls_encrypt_short_encrypt_available_bytes, (unsigned long long)available, __ATOMIC_RELAXED);
+      tls_fail_encrypt_output (C, "short_encrypt", TLS_ERR_ENCRYPT_SHORT, len, available, encrypted);
+      return -1;
+    }
   }
 
   return 0;

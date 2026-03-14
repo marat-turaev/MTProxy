@@ -1464,6 +1464,10 @@ int tcp_rpc_proxy_domains_prepare_stat (stats_buffer_t *sb) {
   sb_printf (sb, "tls_bulk_small_record_flushes\t%llu\n", __atomic_load_n (&tls_bulk_small_record_flushes, __ATOMIC_RELAXED));
   sb_printf (sb, "tls_long_flow_phase_transitions\t%llu\n", __atomic_load_n (&tls_long_flow_phase_transitions, __ATOMIC_RELAXED));
   sb_printf (sb, "tls_long_flow_bulk_bytes_shaped\t%llu\n", __atomic_load_n (&tls_long_flow_bulk_bytes_shaped, __ATOMIC_RELAXED));
+  sb_printf (sb, "tls_encrypt_len_overrun_events\t%llu\n", __atomic_load_n (&tls_encrypt_len_overrun_events, __ATOMIC_RELAXED));
+  sb_printf (sb, "tls_encrypt_short_encrypt_events\t%llu\n", __atomic_load_n (&tls_encrypt_short_encrypt_events, __ATOMIC_RELAXED));
+  sb_printf (sb, "tls_encrypt_short_encrypt_requested_bytes\t%llu\n", __atomic_load_n (&tls_encrypt_short_encrypt_requested_bytes, __ATOMIC_RELAXED));
+  sb_printf (sb, "tls_encrypt_short_encrypt_available_bytes\t%llu\n", __atomic_load_n (&tls_encrypt_short_encrypt_available_bytes, __ATOMIC_RELAXED));
 
   int idx = 0;
   int i;

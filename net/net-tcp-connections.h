@@ -40,3 +40,7 @@ extern unsigned long long tls_bulk_small_record_delays;
 extern unsigned long long tls_bulk_small_record_flushes;
 extern unsigned long long tls_long_flow_phase_transitions;
 extern unsigned long long tls_long_flow_bulk_bytes_shaped;
+extern unsigned long long tls_encrypt_len_overrun_events;
+extern unsigned long long tls_encrypt_short_encrypt_events;
+extern unsigned long long tls_encrypt_short_encrypt_requested_bytes;
+extern unsigned long long tls_encrypt_short_encrypt_available_bytes;
