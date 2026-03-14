@@ -421,6 +421,7 @@ struct worker_stats {
   long long dropped_queries, dropped_responses;
   long long tot_forwarded_simple_acks, dropped_simple_acks;
   long long mtproto_proxy_errors;
+  long long target_pool_stale_discards, target_pool_reuse_attempts;
 
   long long connections_failed_lru, connections_failed_flood;
   long long relay_backpressure_pauses, relay_backpressure_resumes, relay_conn_buffer_peak_bytes;
@@ -442,6 +443,7 @@ long long tot_forwarded_queries, expired_forwarded_queries, dropped_queries;
 long long tot_forwarded_responses, dropped_responses;
 long long tot_forwarded_simple_acks, dropped_simple_acks;
 long long mtproto_proxy_errors;
+long long target_pool_stale_discards, target_pool_reuse_attempts;
 
 char proxy_tag[16];
 int proxy_tag_set;
@@ -489,6 +491,8 @@ static void update_local_stats_copy (struct worker_stats *S) {
   UPD (tot_forwarded_simple_acks);
   UPD (dropped_simple_acks);
   UPD (mtproto_proxy_errors);
+  UPD (target_pool_stale_discards);
+  UPD (target_pool_reuse_attempts);
   UPD (connections_failed_lru);
   UPD (connections_failed_flood);
   UPD (relay_backpressure_pauses);
@@ -565,6 +569,8 @@ static inline void add_stats (struct worker_stats *W) {
   UPD (tot_forwarded_simple_acks);
   UPD (dropped_simple_acks);
   UPD (mtproto_proxy_errors);
+  UPD (target_pool_stale_discards);
+  UPD (target_pool_reuse_attempts);
   UPD (connections_failed_lru);
   UPD (connections_failed_flood);
   UPD (relay_backpressure_pauses);
@@ -687,6 +693,8 @@ void mtfront_prepare_stats (stats_buffer_t *sb) {
 		     "mtproto_proxy_errors\t%lld\n"
 		     "connections_failed_lru\t%lld\n"
 		     "connections_failed_flood\t%lld\n"
+		     "target_pool_stale_discards\t%lld\n"
+		     "target_pool_reuse_attempts\t%lld\n"
 		     "relay_backpressure_pauses\t%lld\n"
 		     "relay_backpressure_resumes\t%lld\n"
 		     "relay_conn_buffer_peak_bytes\t%lld\n"
@@ -756,6 +764,8 @@ void mtfront_prepare_stats (stats_buffer_t *sb) {
 		     S(mtproto_proxy_errors),
 		     S(connections_failed_lru),
 		     S(connections_failed_flood),
+		     S(target_pool_stale_discards),
+		     S(target_pool_reuse_attempts),
 		     S(relay_backpressure_pauses),
 		     S(relay_backpressure_resumes),
 		     SW(relay_conn_buffer_peak_bytes),
@@ -1877,19 +1887,55 @@ static double target_route_rank (conn_target_job_t S) {
   return rank;
 }
 
+static int target_connection_is_stale (connection_job_t C) {
+  struct connection_info *c = CONN_INFO (C);
+  if (!c->target || (c->flags & (C_ERROR | C_FAILED | C_NET_FAILED)) || c->error || c->status != conn_working) {
+    return 1;
+  }
+  char ch;
+  ssize_t r = recv (c->fd, &ch, 1, MSG_PEEK | MSG_DONTWAIT);
+  if (r > 0) {
+    return 0;
+  }
+  if (r == 0) {
+    return 1;
+  }
+  return errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR;
+}
+
+static connection_job_t choose_live_target_connection (conn_target_job_t S, int attempts) {
+  while (S && attempts-- > 0) {
+    connection_job_t C = 0;
+    rpc_target_choose_random_connections (S, 0, 1, &C);
+    if (!C) {
+      return 0;
+    }
+    target_pool_reuse_attempts++;
+    if (TCP_RPC_DATA(C)->extra_int != get_conn_tag (C)) {
+      job_decref (JOB_REF_PASS (C));
+      continue;
+    }
+    if (target_connection_is_stale (C)) {
+      target_pool_stale_discards++;
+      fail_connection (C, -41);
+      conn_target_request_reconnect (S);
+      job_decref (JOB_REF_PASS (C));
+      continue;
+    }
+    return C;
+  }
+  return 0;
+}
+
 static void target_route_probe_one (conn_target_job_t S) {
   if (!S) {
     return;
   }
-  connection_job_t C = 0;
-  rpc_target_choose_random_connections (S, 0, 1, &C);
-  if (C && TCP_RPC_DATA(C)->extra_int == get_conn_tag (C)) {
+  connection_job_t C = choose_live_target_connection (S, 2);
+  if (C) {
     job_decref (JOB_REF_PASS (C));
     target_route_note_success (S, -1);
     return;
-  }
-  if (C) {
-    job_decref (JOB_REF_PASS (C));
   }
   target_route_note_failure (S);
 }
@@ -1961,15 +2007,11 @@ conn_target_job_t choose_proxy_target (int target_dc) {
     used[best_idx] = 1;
 
     conn_target_job_t S = MFC->cluster_targets[best_idx];
-    connection_job_t C = 0;
-    rpc_target_choose_random_connections (S, 0, 1, &C);
-    if (C && TCP_RPC_DATA(C)->extra_int == get_conn_tag (C)) {
+    connection_job_t C = choose_live_target_connection (S, 5);
+    if (C) {
       job_decref (JOB_REF_PASS (C));
       target_route_note_success (S, -1);
       return S;
-    }
-    if (C) {
-      job_decref (JOB_REF_PASS (C));
     }
     conn_target_request_reconnect (S);
     target_route_note_failure (S);
@@ -1982,15 +2024,11 @@ conn_target_job_t choose_proxy_target (int target_dc) {
     if (!S) {
       continue;
     }
-    connection_job_t C = 0;
-    rpc_target_choose_random_connections (S, 0, 1, &C);
-    if (C && TCP_RPC_DATA(C)->extra_int == get_conn_tag (C)) {
+    connection_job_t C = choose_live_target_connection (S, 5);
+    if (C) {
       job_decref (JOB_REF_PASS (C));
       target_route_note_success (S, -1);
       return S;
-    }
-    if (C) {
-      job_decref (JOB_REF_PASS (C));
     }
     conn_target_request_reconnect (S);
     target_route_note_failure (S);
@@ -2080,17 +2118,7 @@ int forward_tcp_query (struct tl_in_state *tlio_in, connection_job_t c, conn_tar
   }
 
   if (!d) {
-    int attempts = 5;
-    while (S && attempts --> 0) {
-      rpc_target_choose_random_connections (S, 0, 1, &d);
-      if (d) {
-	if (TCP_RPC_DATA(d)->extra_int == get_conn_tag (d)) {
-	  break;
-	} else {
-	  job_decref (JOB_REF_PASS (d));
-	}
-      }
-    }
+    d = choose_live_target_connection (S, 5);
     if (!d) {
       vkprintf (2, "nowhere to forward user query from connection %d, dropping\n", CONN_INFO(c)->fd);
       target_route_note_failure (S);
