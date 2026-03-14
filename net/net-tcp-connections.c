@@ -461,6 +461,12 @@ static void tls_choose_long_flow_record_len (struct connection_info *c, int max_
       break;
   }
 
+  // The chooser must never ask for more plaintext than is actually buffered.
+  // Mixed/sparse phase bands can otherwise promote min_len above max_len near
+  // a bucket boundary (for example 8192 with only 7.x KB available).
+  if (min_len > max_len) {
+    min_len = max_len;
+  }
   if (max_len >= TLS_BULK_SMALL_RECORD_FLOOR && min_len < TLS_BULK_SMALL_RECORD_FLOOR) {
     min_len = TLS_BULK_SMALL_RECORD_FLOOR;
   }
