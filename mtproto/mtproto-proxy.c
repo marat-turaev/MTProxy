@@ -1820,6 +1820,7 @@ static void target_route_note_success (conn_target_job_t S, double rtt_ms) {
   e->last_seen = now;
   CT->warm_blocked_until = 0;
   CT->warm_skip_accounted_until = 0;
+  conn_target_note_reliable_response (S);
 }
 
 static void target_route_note_failure (conn_target_job_t S) {

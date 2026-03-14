@@ -194,6 +194,10 @@ struct conn_target_info {
   int custom_field;
   int warm_blocked_until;
   int warm_skip_accounted_until;
+  int warm_quarantine_until;
+  int warm_quarantine_skip_accounted_until;
+  int warm_flap_failures;
+  int warm_flap_window_until;
   conn_target_job_t next_target, prev_target;
   conn_target_job_t hnext;
 
@@ -242,6 +246,7 @@ struct connection_info {
   unsigned our_port, remote_port;
   unsigned char our_ipv6[16], remote_ipv6[16];
   double query_start_time;
+  double connected_at;
   double last_query_time;
   double last_query_sent_time;
   double last_response_time;
@@ -443,6 +448,7 @@ void assert_net_net_thread (void);
 void assert_engine_thread (void);
 
 connection_job_t conn_target_get_connection (conn_target_job_t CT, int allow_stopped);
+void conn_target_note_reliable_response (conn_target_job_t CTJ);
       
 void insert_connection_into_target (conn_target_job_t SS, connection_job_t C);
 struct tree_connection *get_connection_tree (conn_target_job_t SS);

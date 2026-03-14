@@ -102,6 +102,7 @@ int ready_targets;
 
 long long netw_queries, netw_update_queries, total_failed_connections, total_connect_failures, unused_connections_closed;
 long long target_pool_warm_refills, target_pool_warm_skips_unhealthy;
+long long target_pool_quarantine_hits, target_pool_quarantine_entries, target_pool_quarantine_clears;
 
 int allocated_targets, active_targets, inactive_targets, free_targets;
 int allocated_connections, allocated_socket_connections;
@@ -136,6 +137,9 @@ MODULE_STAT_FUNCTION
   SB_SUM_ONE_LL (unused_connections_closed);
   SB_SUM_ONE_LL (target_pool_warm_refills);
   SB_SUM_ONE_LL (target_pool_warm_skips_unhealthy);
+  SB_SUM_ONE_LL (target_pool_quarantine_hits);
+  SB_SUM_ONE_LL (target_pool_quarantine_entries);
+  SB_SUM_ONE_LL (target_pool_quarantine_clears);
   SB_SUM_ONE_I (ready_targets);
   SB_SUM_ONE_I (allocated_targets);
   SB_SUM_ONE_I (active_targets);
@@ -209,6 +213,66 @@ void fetch_connections_stat (struct connections_stat *st) {
 }
 
 void connection_event_incref (int fd, long long val);
+
+#define TARGET_FLAP_SHORT_UPTIME 8.0
+#define TARGET_FLAP_WINDOW 30
+#define TARGET_FLAP_THRESHOLD 3
+#define TARGET_FLAP_QUARANTINE_MIN 15
+#define TARGET_FLAP_QUARANTINE_MAX 60
+
+static void conn_target_clear_quarantine (conn_target_job_t CTJ, int count_clear) {
+  if (!CTJ) {
+    return;
+  }
+  struct conn_target_info *CT = CONN_TARGET_INFO (CTJ);
+  int had_state = CT->warm_quarantine_until || CT->warm_quarantine_skip_accounted_until ||
+                  CT->warm_flap_failures || CT->warm_flap_window_until;
+  CT->warm_quarantine_until = 0;
+  CT->warm_quarantine_skip_accounted_until = 0;
+  CT->warm_flap_failures = 0;
+  CT->warm_flap_window_until = 0;
+  if (count_clear && had_state) {
+    MODULE_STAT->target_pool_quarantine_clears++;
+  }
+}
+
+void conn_target_note_reliable_response (conn_target_job_t CTJ) {
+  conn_target_clear_quarantine (CTJ, 1);
+}
+
+static void conn_target_note_short_failure (connection_job_t C) {
+  struct connection_info *c = CONN_INFO (C);
+  if (c->basic_type != ct_outbound || !c->target || c->error == -17 || c->connected_at <= 0) {
+    return;
+  }
+  double uptime = precise_now - c->connected_at;
+  if (uptime <= 0 || uptime > TARGET_FLAP_SHORT_UPTIME) {
+    return;
+  }
+
+  struct conn_target_info *CT = CONN_TARGET_INFO (c->target);
+  if (now >= CT->warm_flap_window_until) {
+    CT->warm_flap_failures = 0;
+  }
+  if (CT->warm_flap_failures < 1000000) {
+    CT->warm_flap_failures++;
+  }
+  CT->warm_flap_window_until = now + TARGET_FLAP_WINDOW;
+  if (CT->warm_flap_failures < TARGET_FLAP_THRESHOLD) {
+    return;
+  }
+
+  int penalty = TARGET_FLAP_QUARANTINE_MIN + (CT->warm_flap_failures - TARGET_FLAP_THRESHOLD) * 5;
+  if (penalty > TARGET_FLAP_QUARANTINE_MAX) {
+    penalty = TARGET_FLAP_QUARANTINE_MAX;
+  }
+  int until = now + penalty;
+  if (until > CT->warm_quarantine_until) {
+    CT->warm_quarantine_until = until;
+    CT->warm_quarantine_skip_accounted_until = 0;
+    MODULE_STAT->target_pool_quarantine_entries++;
+  }
+}
 
 void tcp_set_max_accept_rate (int rate) {
   max_accept_rate = rate;
@@ -595,6 +659,15 @@ int cpu_server_close_connection (connection_job_t C, int who) /* {{{ */ {
     __sync_fetch_and_and (&c->flags, ~C_ISDH);
   }
 
+  if (c->basic_type == ct_outbound && c->target && connection_is_active (c->flags) && c->connected_at > 0) {
+    double uptime = precise_now - c->connected_at;
+    if (c->error != -17 && uptime > 0 && uptime <= TARGET_FLAP_SHORT_UPTIME) {
+      conn_target_note_short_failure (C);
+    } else if (uptime >= TARGET_FLAP_WINDOW) {
+      conn_target_clear_quarantine (c->target, 1);
+    }
+  }
+
   assert (c->io_conn);
   job_signal (JOB_REF_PASS (c->io_conn), JS_ABORT);
 
@@ -649,6 +722,7 @@ int do_connection_job (job_t job, int op, struct job_thread *JT) /* {{{ */ {
       if (c->flags & C_READY_PENDING) {
         assert (c->flags & C_CONNECTED);
         __sync_fetch_and_and (&c->flags, ~C_READY_PENDING);
+        c->connected_at = precise_now;
         MODULE_STAT->active_outbound_connections ++;        
         MODULE_STAT->active_connections ++;
         if (c->target) {
@@ -2101,7 +2175,14 @@ int create_new_connections (conn_target_job_t CTJ) /* {{{ */ {
       precise_now < CT->next_reconnect &&
       CT->active_outbound_connections > 0 &&
       CT->outbound_connections < CT->min_connections) {
-    // Keep a warm floor while the target is healthy, but do not override route quarantine.
+    // Keep a warm floor while the target is healthy, but do not override route or flap quarantine.
+    if (CT->warm_quarantine_until > now) {
+      if (CT->warm_quarantine_skip_accounted_until != CT->warm_quarantine_until) {
+        CT->warm_quarantine_skip_accounted_until = CT->warm_quarantine_until;
+        MODULE_STAT->target_pool_quarantine_hits++;
+      }
+      return 0;
+    }
     if (CT->warm_blocked_until > now) {
       if (CT->warm_skip_accounted_until != CT->warm_blocked_until) {
         CT->warm_skip_accounted_until = CT->warm_blocked_until;
