@@ -422,10 +422,61 @@ static void run_negative_cases (void) {
   free (response);
 }
 
+static void run_payload_family_cases (void) {
+  {
+    int sizes[3] = {1200, 1500, 1700};
+    int collapsed = tcp_rpc_collapse_startup_payload_size (3, sizes);
+    if (collapsed != (1200 + 1500 + 1700 + 10)) {
+      fail ("payload family: collapsed size mismatch");
+    }
+  }
+
+  {
+    short families[2] = {2048, 4096};
+    unsigned short weights[2] = {1, 1};
+    int i;
+    int seen_low = 0;
+    int seen_high = 0;
+    for (i = 0; i < 256; i++) {
+      int chosen = tcp_rpc_choose_startup_payload_size_from_families (families, weights, 2, 3000);
+      if (chosen >= 1984 && chosen <= 2112) {
+        seen_low = 1;
+      } else if (chosen >= 4032 && chosen <= 4160) {
+        seen_high = 1;
+      } else {
+        fail ("payload family: chosen size escaped expected family band");
+      }
+    }
+    if (!seen_low || !seen_high) {
+      fail ("payload family: both family bands were not exercised");
+    }
+  }
+
+  {
+    short family[1] = {3072};
+    unsigned short weight[1] = {5};
+    int i;
+    for (i = 0; i < 64; i++) {
+      int chosen = tcp_rpc_choose_startup_payload_size_from_families (family, weight, 1, 2048);
+      if (chosen < 3008 || chosen > 3136) {
+        fail ("payload family: single-family jitter out of bounds");
+      }
+    }
+  }
+
+  {
+    int chosen = tcp_rpc_choose_startup_payload_size_from_families (NULL, NULL, 0, 2048);
+    if (chosen < 1 || chosen > 16384) {
+      fail ("payload family: fallback size out of range");
+    }
+  }
+}
+
 int main (void) {
   run_case (1);
   run_case (0);
   run_negative_cases ();
+  run_payload_family_cases ();
   puts ("fake_tls_startup_test: ok");
   return 0;
 }

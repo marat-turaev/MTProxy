@@ -79,6 +79,15 @@ struct tcp_rpc_tls_startup_meta {
   int startup_shaping_plan_len;
 };
 
+// Internal test/build helpers for startup payload-family selection.
+int tcp_rpc_choose_startup_payload_size_from_families (
+  const short *families,
+  const unsigned short *weights,
+  int families_num,
+  int fallback_base
+);
+int tcp_rpc_collapse_startup_payload_size (int encrypted_records, const int *encrypted_sizes);
+
 // Internal test/build helper: construct a client-compatible fake-TLS startup
 // response from primitive inputs. The returned buffer must be freed by caller.
 unsigned char *tcp_rpc_build_tls_startup_response (

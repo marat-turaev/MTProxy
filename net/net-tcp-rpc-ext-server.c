@@ -919,6 +919,7 @@ static void undetermined_conn_leave (connection_job_t C) {
 }
 
 #define DOMAIN_PROFILE_MAX 8
+#define DOMAIN_PROFILE_PAYLOAD_FAMILY_MAX 4
 #define MAX_PROBE_SERVER_HELLO_PAYLOAD 8192
 #define MAX_PROBE_ENCRYPTED_RECORD_PAYLOAD 16384
 #define MAX_SERVER_HELLO_TEMPLATE_LEN 2048
@@ -931,6 +932,9 @@ struct domain_profile {
   unsigned char *server_hello_template;
   int server_hello_template_len;
   int server_hello_keyshare_offset;
+  short startup_payload_families[DOMAIN_PROFILE_PAYLOAD_FAMILY_MAX];
+  unsigned short startup_payload_family_weights[DOMAIN_PROFILE_PAYLOAD_FAMILY_MAX];
+  unsigned char startup_payload_families_num;
 };
 
 struct domain_info {
@@ -989,6 +993,7 @@ static void free_domain_profiles (struct domain_info *info) {
     info->profiles[i].server_hello_template_len = 0;
     info->profiles[i].server_hello_keyshare_offset = -1;
     info->profiles[i].weight = 0;
+    info->profiles[i].startup_payload_families_num = 0;
   }
   info->profiles_num = 0;
 }
@@ -1177,6 +1182,175 @@ static int choose_tls_startup_payload_size (int base_payload_size) {
     }
   }
   return size;
+}
+
+int tcp_rpc_collapse_startup_payload_size (int encrypted_records, const int *encrypted_sizes) {
+  int i;
+  int encrypted_wire_total = 0;
+
+  if (encrypted_records < 1) {
+    encrypted_records = 1;
+  } else if (encrypted_records > 3) {
+    encrypted_records = 3;
+  }
+
+  for (i = 0; i < encrypted_records; i++) {
+    int sz = encrypted_sizes[i];
+    if (sz <= 0) {
+      sz = 1;
+    }
+    encrypted_wire_total += 5 + sz;
+  }
+
+  if (encrypted_wire_total <= 5) {
+    return 1;
+  }
+  return encrypted_wire_total - 5;
+}
+
+static void domain_profile_note_startup_payload_family (struct domain_profile *profile, int payload_size) {
+  int i;
+  int best_idx = -1;
+  int best_dist = 0x7fffffff;
+  int weakest_idx = -1;
+  unsigned short weakest_weight = 0xffff;
+
+  if (profile == NULL) {
+    return;
+  }
+
+  if (payload_size < 1) {
+    payload_size = 1;
+  } else if (payload_size > 16384) {
+    payload_size = 16384;
+  }
+
+  for (i = 0; i < profile->startup_payload_families_num; i++) {
+    int dist = abs ((int) profile->startup_payload_families[i] - payload_size);
+    if (dist == 0) {
+      if (profile->startup_payload_family_weights[i] < 65535) {
+        profile->startup_payload_family_weights[i]++;
+      }
+      return;
+    }
+    if (dist <= 96 && dist < best_dist) {
+      best_dist = dist;
+      best_idx = i;
+    }
+    if (profile->startup_payload_family_weights[i] < weakest_weight) {
+      weakest_weight = profile->startup_payload_family_weights[i];
+      weakest_idx = i;
+    }
+  }
+
+  if (best_idx >= 0) {
+    short cur = profile->startup_payload_families[best_idx];
+    unsigned short weight = profile->startup_payload_family_weights[best_idx];
+    int blended = ((int) cur * (int) weight + payload_size) / ((int) weight + 1);
+    profile->startup_payload_families[best_idx] = (short) blended;
+    if (profile->startup_payload_family_weights[best_idx] < 65535) {
+      profile->startup_payload_family_weights[best_idx]++;
+    }
+    return;
+  }
+
+  if (profile->startup_payload_families_num < DOMAIN_PROFILE_PAYLOAD_FAMILY_MAX) {
+    i = profile->startup_payload_families_num++;
+    profile->startup_payload_families[i] = (short) payload_size;
+    profile->startup_payload_family_weights[i] = 1;
+    return;
+  }
+
+  if (weakest_idx >= 0 && weakest_weight <= 1) {
+    profile->startup_payload_families[weakest_idx] = (short) payload_size;
+    profile->startup_payload_family_weights[weakest_idx] = 1;
+  }
+}
+
+int tcp_rpc_choose_startup_payload_size_from_families (
+  const short *families,
+  const unsigned short *weights,
+  int families_num,
+  int fallback_base
+) {
+  int i;
+  int total = 0;
+  int pick;
+  int base;
+  int minv = 0;
+  int maxv = 0;
+  int max_delta;
+  unsigned int r;
+  int delta;
+
+  if (families == NULL || weights == NULL || families_num <= 0) {
+    return choose_tls_startup_payload_size (fallback_base);
+  }
+  if (families_num > DOMAIN_PROFILE_PAYLOAD_FAMILY_MAX) {
+    families_num = DOMAIN_PROFILE_PAYLOAD_FAMILY_MAX;
+  }
+
+  for (i = 0; i < families_num; i++) {
+    int w = weights[i] > 0 ? weights[i] : 1;
+    total += w;
+  }
+  if (total <= 0) {
+    return choose_tls_startup_payload_size (fallback_base);
+  }
+
+  pick = (int)((unsigned int) lrand48_j () % (unsigned int) total);
+  base = families[0];
+  for (i = 0; i < families_num; i++) {
+    int w = weights[i] > 0 ? weights[i] : 1;
+    if (pick < w) {
+      base = families[i];
+      break;
+    }
+    pick -= w;
+  }
+
+  if (base < 1) {
+    base = 1;
+  } else if (base > 16384) {
+    base = 16384;
+  }
+
+  minv = maxv = base;
+  for (i = 0; i < families_num; i++) {
+    int v = families[i];
+    if (v <= 0) {
+      continue;
+    }
+    if (v < minv) { minv = v; }
+    if (v > maxv) { maxv = v; }
+  }
+
+  max_delta = (maxv - minv) / 2;
+  if ((base >> 7) > max_delta) {
+    max_delta = base >> 7;
+  }
+  if (max_delta < 16) {
+    max_delta = 16;
+  }
+  if (max_delta > 64) {
+    max_delta = 64;
+  }
+  if (max_delta > base - 1) {
+    max_delta = base - 1;
+  }
+  if (max_delta <= 0) {
+    return base;
+  }
+
+  r = (unsigned int) lrand48_j ();
+  delta = (int)(r % (unsigned int)(2 * max_delta + 1)) - max_delta;
+  base += delta;
+  if (base < 1) {
+    base = 1;
+  } else if (base > 16384) {
+    base = 16384;
+  }
+  return base;
 }
 
 int tcp_rpc_proxy_domains_prepare_stat (stats_buffer_t *sb) {
@@ -1857,6 +2031,9 @@ static int extract_server_hello_template (const unsigned char *resp, int rlen,
   return 1;
 }
 
+static void domain_profile_note_startup_payload_family (struct domain_profile *profile, int payload_size);
+static void domain_profile_merge_startup_payload_families (struct domain_profile *dst, const struct domain_profile *src);
+
 static int domain_profile_equals (const struct domain_profile *a, const struct domain_profile *b) {
   if (a->encrypted_records != b->encrypted_records ||
       a->is_reversed_extension_order != b->is_reversed_extension_order ||
@@ -1870,6 +2047,20 @@ static int domain_profile_equals (const struct domain_profile *a, const struct d
     return 1;
   }
   return !memcmp (a->server_hello_template, b->server_hello_template, (size_t)a->server_hello_template_len);
+}
+
+static void domain_profile_merge_startup_payload_families (struct domain_profile *dst, const struct domain_profile *src) {
+  int i;
+  if (dst == NULL || src == NULL) {
+    return;
+  }
+  for (i = 0; i < src->startup_payload_families_num; i++) {
+    int j;
+    int reps = src->startup_payload_family_weights[i] > 0 ? src->startup_payload_family_weights[i] : 1;
+    for (j = 0; j < reps; j++) {
+      domain_profile_note_startup_payload_family (dst, src->startup_payload_families[i]);
+    }
+  }
 }
 
 static int update_domain_info (struct domain_info *info) {
@@ -2180,6 +2371,11 @@ static int update_domain_info (struct domain_info *info) {
       cand.encrypted_size[2] = (short)try_encrypted_application_data_lengths[i][2];
       cand.weight = 1;
       cand.server_hello_keyshare_offset = -1;
+      cand.startup_payload_families_num = 0;
+      domain_profile_note_startup_payload_family (
+        &cand,
+        tcp_rpc_collapse_startup_payload_size (cand.encrypted_records, try_encrypted_application_data_lengths[i])
+      );
 
       if (extract_server_hello_template (responses[i], response_len[i], &cand.server_hello_template,
                                          &cand.server_hello_template_len, &cand.server_hello_keyshare_offset)) {
@@ -2190,6 +2386,7 @@ static int update_domain_info (struct domain_info *info) {
             if (info->profiles[p].weight < 65535) {
               info->profiles[p].weight++;
             }
+            domain_profile_merge_startup_payload_families (&info->profiles[p], &cand);
             free (cand.server_hello_template);
             cand.server_hello_template = NULL;
             merged = 1;
@@ -4109,7 +4306,16 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         if (encrypted_payload_size <= 0) {
           encrypted_payload_size = 1;
         }
-        encrypted_payload_size = choose_tls_startup_payload_size (encrypted_payload_size);
+        if (profile && profile->startup_payload_families_num > 0) {
+          encrypted_payload_size = tcp_rpc_choose_startup_payload_size_from_families (
+            profile->startup_payload_families,
+            profile->startup_payload_family_weights,
+            profile->startup_payload_families_num,
+            encrypted_payload_size
+          );
+        } else {
+          encrypted_payload_size = choose_tls_startup_payload_size (encrypted_payload_size);
+        }
 
         int have_profile_tpl = profile && profile->server_hello_template && profile->server_hello_template_len > 0;
         int have_info_tpl = info->server_hello_template && info->server_hello_template_len > 0;
