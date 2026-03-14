@@ -208,6 +208,7 @@ struct ext_connection *InExtConnectionHash[EXT_CONN_HASH_SIZE];
 struct ext_connection ExtConnectionHead[MAX_CONNECTIONS];
 
 void lru_delete_ext_conn (struct ext_connection *Ext);
+static void refresh_upstream_idle_timeout (connection_job_t C);
 
 static inline void check_engine_class (void) {
   check_thread_class (JC_ENGINE);
@@ -349,6 +350,8 @@ struct ext_connection *create_ext_connection (connection_job_t CI, long long in_
     H->o_prev = Ex;
     Ex->out_fd = CONN_INFO(CO)->fd;
     Ex->out_gen = CONN_INFO(CO)->generation;
+    __sync_fetch_and_add (&CONN_INFO(CO)->active_relay_mappings, 1);
+    refresh_upstream_idle_timeout (CO);
   }
   Ex->auth_key_id = auth_key_id;
   return Ex;
@@ -363,11 +366,16 @@ void remove_ext_connection (struct ext_connection *Ex, int send_notifications) {
   if (Ex->out_fd) {
     assert ((unsigned) Ex->out_fd < MAX_CONNECTIONS);
     assert (Ex->o_next);
+    connection_job_t CO = connection_get_by_fd_generation (Ex->out_fd, Ex->out_gen);
     if (send_notifications & 1) {
-      connection_job_t CO = connection_get_by_fd_generation (Ex->out_fd, Ex->out_gen);
       if (CO) {
 	_notify_remote_closed (JOB_REF_PASS (CO), Ex->out_conn_id);
       }
+    }
+    if (CO) {
+      __sync_fetch_and_add (&CONN_INFO(CO)->active_relay_mappings, -1);
+      refresh_upstream_idle_timeout (CO);
+      job_decref (JOB_REF_PASS (CO));
     }
   }
   if (Ex->in_fd) {
@@ -422,6 +430,7 @@ struct worker_stats {
   long long tot_forwarded_simple_acks, dropped_simple_acks;
   long long mtproto_proxy_errors;
   long long target_pool_stale_discards, target_pool_reuse_attempts;
+  long long upstream_idle_timeouts;
 
   long long connections_failed_lru, connections_failed_flood;
   long long relay_backpressure_pauses, relay_backpressure_resumes, relay_conn_buffer_peak_bytes;
@@ -444,6 +453,7 @@ long long tot_forwarded_responses, dropped_responses;
 long long tot_forwarded_simple_acks, dropped_simple_acks;
 long long mtproto_proxy_errors;
 long long target_pool_stale_discards, target_pool_reuse_attempts;
+long long upstream_idle_timeouts;
 
 char proxy_tag[16];
 int proxy_tag_set;
@@ -493,6 +503,7 @@ static void update_local_stats_copy (struct worker_stats *S) {
   UPD (mtproto_proxy_errors);
   UPD (target_pool_stale_discards);
   UPD (target_pool_reuse_attempts);
+  UPD (upstream_idle_timeouts);
   UPD (connections_failed_lru);
   UPD (connections_failed_flood);
   UPD (relay_backpressure_pauses);
@@ -571,6 +582,7 @@ static inline void add_stats (struct worker_stats *W) {
   UPD (mtproto_proxy_errors);
   UPD (target_pool_stale_discards);
   UPD (target_pool_reuse_attempts);
+  UPD (upstream_idle_timeouts);
   UPD (connections_failed_lru);
   UPD (connections_failed_flood);
   UPD (relay_backpressure_pauses);
@@ -695,6 +707,7 @@ void mtfront_prepare_stats (stats_buffer_t *sb) {
 		     "connections_failed_flood\t%lld\n"
 		     "target_pool_stale_discards\t%lld\n"
 		     "target_pool_reuse_attempts\t%lld\n"
+		     "upstream_idle_timeouts\t%lld\n"
 		     "relay_backpressure_pauses\t%lld\n"
 		     "relay_backpressure_resumes\t%lld\n"
 		     "relay_conn_buffer_peak_bytes\t%lld\n"
@@ -766,6 +779,7 @@ void mtfront_prepare_stats (stats_buffer_t *sb) {
 		     S(connections_failed_flood),
 		     S(target_pool_stale_discards),
 		     S(target_pool_reuse_attempts),
+		     S(upstream_idle_timeouts),
 		     S(relay_backpressure_pauses),
 		     S(relay_backpressure_resumes),
 		     SW(relay_conn_buffer_peak_bytes),
@@ -1026,6 +1040,7 @@ int client_packet_job_run (job_t job, int op, struct job_thread *JT) {
 int rpcc_execute (connection_job_t C, int op, struct raw_message *msg) {
   vkprintf (2, "rpcc_execute: fd=%d, op=%08x, len=%d\n", CONN_INFO(C)->fd, op, msg->total_bytes);
   CONN_INFO(C)->last_response_time = precise_now;
+  refresh_upstream_idle_timeout (C);
 
   switch (op) {
   case RPC_PONG:
@@ -1049,6 +1064,62 @@ int rpcc_execute (connection_job_t C, int op, struct raw_message *msg) {
 
 static inline int get_conn_tag (connection_job_t C) {
   return 1 + (CONN_INFO(C)->generation & 0xffffff);
+}
+
+#define UPSTREAM_IDLE_TIMEOUT 60.0
+
+static void refresh_upstream_idle_timeout (connection_job_t C) {
+  struct connection_info *c = CONN_INFO (C);
+  if (c->basic_type != ct_outbound || c->type != &ct_tcp_rpc_client_mtfront || (c->flags & C_ERROR)) {
+    return;
+  }
+  if (__sync_fetch_and_add (&c->active_relay_mappings, 0) <= 0) {
+    clear_connection_timeout (C);
+    return;
+  }
+  double baseline = c->last_response_time;
+  if (baseline < c->last_query_sent_time) {
+    baseline = c->last_query_sent_time;
+  }
+  if (baseline < c->connected_at) {
+    baseline = c->connected_at;
+  }
+  if (baseline <= 0) {
+    baseline = precise_now;
+  }
+  double delay = baseline + UPSTREAM_IDLE_TIMEOUT - precise_now;
+  if (delay < 0.001) {
+    delay = 0.001;
+  }
+  set_connection_timeout (C, delay);
+}
+
+static int mtfront_upstream_alarm (connection_job_t C) {
+  struct connection_info *c = CONN_INFO (C);
+  if (c->flags & C_ERROR) {
+    return 0;
+  }
+  if (__sync_fetch_and_add (&c->active_relay_mappings, 0) <= 0) {
+    clear_connection_timeout (C);
+    return 0;
+  }
+  double baseline = c->last_response_time;
+  if (baseline < c->last_query_sent_time) {
+    baseline = c->last_query_sent_time;
+  }
+  if (baseline < c->connected_at) {
+    baseline = c->connected_at;
+  }
+  if (baseline <= 0) {
+    baseline = precise_now;
+  }
+  if (baseline + UPSTREAM_IDLE_TIMEOUT <= precise_now) {
+    upstream_idle_timeouts++;
+    fail_connection (C, -42);
+    return 0;
+  }
+  refresh_upstream_idle_timeout (C);
+  return 0;
 }
 
 int mtfront_client_ready (connection_job_t C) {
@@ -2158,6 +2229,7 @@ int forward_tcp_query (struct tl_in_state *tlio_in, connection_job_t c, conn_tar
   }
 
   int len = 0;
+  connection_job_t d_for_timeout = job_incref (d);
   TLS_START (JOB_REF_PASS (d)); // open tlio_out context
 
   tl_store_int (RPC_PROXY_REQ);
@@ -2217,6 +2289,9 @@ int forward_tcp_query (struct tl_in_state *tlio_in, connection_job_t c, conn_tar
     assert (CONN_INFO(c)->pending_queries == 1);
     set_connection_timeout (c, HTTP_MAX_WAIT_TIMEOUT);
   }
+
+  refresh_upstream_idle_timeout (d_for_timeout);
+  job_decref (JOB_REF_PASS (d_for_timeout));
 
   return 1;
 }
@@ -2390,6 +2465,7 @@ void init_ct_server_mtfront (void) {
   ct_http_server_mtfront.data_sent = &mtfront_data_sent;
   ct_tcp_rpc_ext_server_mtfront.data_sent = &mtfront_data_sent;
   ct_tcp_rpc_server_mtfront.data_sent = &mtfront_data_sent;
+  ct_tcp_rpc_client_mtfront.alarm = &mtfront_upstream_alarm;
 }
 
 /*

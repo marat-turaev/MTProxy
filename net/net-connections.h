@@ -239,6 +239,7 @@ struct connection_info {
   int unread_res_bytes;
   int skip_bytes;
   int pending_queries;
+  int active_relay_mappings;
   int queries_ok;
   // Keep per-connection protocol payload aligned for structs with pointers/doubles.
   char custom_data[CONN_CUSTOM_DATA_BYTES] __attribute__((aligned(16)));
