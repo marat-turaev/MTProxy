@@ -2084,6 +2084,7 @@ static int update_domain_info (struct domain_info *info) {
   FD_ZERO(&except_fd);
 
 #define TRIES 20
+#define MIN_PROBE_SUCCESSES 5
   int sockets[TRIES];
   unsigned char *requests[TRIES] = {};
   unsigned char *responses[TRIES] = {};
@@ -2093,20 +2094,26 @@ static int update_domain_info (struct domain_info *info) {
   int have_error = 0;
   int ok = 0;
   int i;
+  int completed_count = 0;
   for (i = 0; i < TRIES; i++) {
     sockets[i] = -1;
   }
+  int is_failed[TRIES] = {};
   for (i = 0; i < TRIES; i++) {
     sockets[i] = socket (host->h_addrtype, SOCK_STREAM, IPPROTO_TCP);
     if (sockets[i] < 0) {
       kprintf ("Failed to open socket for %s: %s\n", domain, strerror (errno));
-      have_error = 1;
-      goto cleanup;
+      is_failed[i] = 1;
+      completed_count++;
+      continue;
     }
     if (fcntl (sockets[i], F_SETFL, O_NONBLOCK) == -1) {
       kprintf ("Failed to make socket non-blocking: %s\n", strerror (errno));
-      have_error = 1;
-      goto cleanup;
+      close (sockets[i]);
+      sockets[i] = -1;
+      is_failed[i] = 1;
+      completed_count++;
+      continue;
     }
 
     int e_connect;
@@ -2137,17 +2144,27 @@ static int update_domain_info (struct domain_info *info) {
 
     if (e_connect == -1 && errno != EINPROGRESS) {
       kprintf ("Failed to connect to %s: %s\n", domain, strerror (errno));
-      have_error = 1;
-      goto cleanup;
+      close (sockets[i]);
+      sockets[i] = -1;
+      is_failed[i] = 1;
+      completed_count++;
+      continue;
     }
   }
 
   for (i = 0; i < TRIES; i++) {
+    if (is_failed[i]) {
+      continue;
+    }
     requests[i] = create_request (domain);
     if (requests[i] == NULL) {
       kprintf ("Failed to build probe request for checking domain %s\n", domain);
-      have_error = 1;
-      break;
+      if (sockets[i] >= 0) {
+        close (sockets[i]);
+        sockets[i] = -1;
+      }
+      is_failed[i] = 1;
+      completed_count++;
     }
   }
 
@@ -2161,14 +2178,15 @@ static int update_domain_info (struct domain_info *info) {
   int try_encrypted_application_data_lengths[TRIES][3] = {{0}};
   int is_reversed_extension_order_min = 0;
   int is_reversed_extension_order_max = 0;
-  while (get_utime_monotonic() < finish_time && finished_count < TRIES && !have_error) {
+  while (get_utime_monotonic() < finish_time && finished_count < MIN_PROBE_SUCCESSES &&
+         completed_count < TRIES && !have_error) {
     struct timeval timeout_data;
     timeout_data.tv_sec = (int)(finish_time - precise_now + 1);
     timeout_data.tv_usec = 0;
 
     int max_fd = 0;
     for (i = 0; i < TRIES; i++) {
-      if (is_finished[i]) {
+      if (is_finished[i] || is_failed[i]) {
         continue;
       }
       if (is_written[i]) {
@@ -2187,7 +2205,7 @@ static int update_domain_info (struct domain_info *info) {
     select (max_fd + 1, &read_fd, &write_fd, &except_fd, &timeout_data);
 
     for (i = 0; i < TRIES; i++) {
-      if (is_finished[i]) {
+      if (is_finished[i] || is_failed[i]) {
         continue;
       }
       if (FD_ISSET(sockets[i], &read_fd)) {
@@ -2198,27 +2216,31 @@ static int update_domain_info (struct domain_info *info) {
           ssize_t read_res = read (sockets[i], header, sizeof (header));
           if (read_res != sizeof (header)) {
             kprintf ("Failed to read response header for checking domain %s: %s\n", domain, read_res == -1 ? strerror (errno) : "Read less bytes than expected");
-            have_error = 1;
-            break;
+            is_failed[i] = 1;
+            completed_count++;
+            continue;
           }
           if (memcmp (header, "\x16\x03\x03", 3) != 0) {
             kprintf ("Non-TLS response, or TLS <= 1.1, or unsuccessful request to %s: receive \\x%02x\\x%02x\\x%02x\\x%02x\\x%02x...\n",
                      domain, header[0], header[1], header[2], header[3], header[4]);
-            have_error = 1;
-            break;
+            is_failed[i] = 1;
+            completed_count++;
+            continue;
           }
           int sh_len = header[3] * 256 + header[4];
           if (sh_len <= 0 || sh_len > MAX_PROBE_SERVER_HELLO_PAYLOAD) {
             kprintf ("Unreasonable ServerHello record length from %s: %d\n", domain, sh_len);
-            have_error = 1;
-            break;
+            is_failed[i] = 1;
+            completed_count++;
+            continue;
           }
           response_len[i] = 5 + sh_len + 6 + 5;
           responses[i] = malloc (response_len[i]);
           if (responses[i] == NULL) {
             kprintf ("Failed to allocate %d bytes for domain probe response (%s)\n", response_len[i], domain);
-            have_error = 1;
-            break;
+            is_failed[i] = 1;
+            completed_count++;
+            continue;
           }
           memcpy (responses[i], header, sizeof (header));
           read_pos[i] = 5;
@@ -2226,8 +2248,9 @@ static int update_domain_info (struct domain_info *info) {
           ssize_t read_res = read (sockets[i], responses[i] + read_pos[i], response_len[i] - read_pos[i]);
           if (read_res == -1) {
             kprintf ("Failed to read response from %s: %s\n", domain, strerror (errno));
-            have_error = 1;
-            break;
+            is_failed[i] = 1;
+            completed_count++;
+            continue;
           }
           read_pos[i] += read_res;
 
@@ -2235,23 +2258,26 @@ static int update_domain_info (struct domain_info *info) {
             if (!is_encrypted_application_data_length_read[i]) {
               if (memcmp (responses[i] + response_len[i] - 11, "\x14\x03\x03\x00\x01\x01\x17\x03\x03", 9) != 0) {
                 kprintf ("Not found TLS 1.3 support on domain %s\n", domain);
-                have_error = 1;
-                break;
+                is_failed[i] = 1;
+                completed_count++;
+                continue;
               }
 
               is_encrypted_application_data_length_read[i] = 1;
               int encrypted_application_data_length = responses[i][response_len[i] - 2] * 256 + responses[i][response_len[i] - 1];
               if (encrypted_application_data_length <= 0 || encrypted_application_data_length > MAX_PROBE_ENCRYPTED_RECORD_PAYLOAD) {
                 kprintf ("Unreasonable TLS ApplicationData record length from %s: %d\n", domain, encrypted_application_data_length);
-                have_error = 1;
-                break;
+                is_failed[i] = 1;
+                completed_count++;
+                continue;
               }
               response_len[i] += encrypted_application_data_length;
               unsigned char *new_buffer = realloc (responses[i], response_len[i]);
               if (new_buffer == NULL) {
                 kprintf ("Failed to grow domain probe buffer to %d bytes (%s)\n", response_len[i], domain);
-                have_error = 1;
-                break;
+                is_failed[i] = 1;
+                completed_count++;
+                continue;
               }
               responses[i] = new_buffer;
               continue;
@@ -2273,8 +2299,9 @@ static int update_domain_info (struct domain_info *info) {
                   unsigned char *new_buffer = realloc (responses[i], response_len[i]);
                   if (new_buffer == NULL) {
                     kprintf ("Failed to grow domain probe buffer to %d bytes (%s)\n", response_len[i], domain);
-                    have_error = 1;
-                    break;
+                    is_failed[i] = 1;
+                    completed_count++;
+                    continue;
                   }
                   responses[i] = new_buffer;
                   continue;
@@ -2305,9 +2332,11 @@ static int update_domain_info (struct domain_info *info) {
               FD_CLR(sockets[i], &except_fd);
               is_finished[i] = 1;
               finished_count++;
+              completed_count++;
             } else {
-              have_error = 1;
-              break;
+              is_failed[i] = 1;
+              completed_count++;
+              continue;
             }
           }
         }
@@ -2317,22 +2346,29 @@ static int update_domain_info (struct domain_info *info) {
         ssize_t write_res = write (sockets[i], requests[i], TLS_REQUEST_LENGTH);
         if (write_res != TLS_REQUEST_LENGTH) {
           kprintf ("Failed to write request for checking domain %s: %s", domain, write_res == -1 ? strerror (errno) : "Written less bytes than expected");
-          have_error = 1;
-          break;
+          is_failed[i] = 1;
+          completed_count++;
+          continue;
         }
         is_written[i] = 1;
       }
       if (FD_ISSET(sockets[i], &except_fd)) {
         kprintf ("Failed to check domain %s: %s\n", domain, strerror (errno));
-        have_error = 1;
-        break;
+        is_failed[i] = 1;
+        completed_count++;
+        continue;
+      }
+      if (is_failed[i] && sockets[i] >= 0) {
+        close (sockets[i]);
+        sockets[i] = -1;
       }
     }
   }
 
-  if (finished_count != TRIES) {
+  if (finished_count < MIN_PROBE_SUCCESSES) {
     if (!have_error) {
-      kprintf ("Failed to check domain %s in 5 seconds\n", domain);
+      kprintf ("Failed to check domain %s in 5 seconds: only %d/%d successful probe samples\n",
+               domain, finished_count, TRIES);
     }
     goto cleanup;
   }
@@ -2358,51 +2394,52 @@ static int update_domain_info (struct domain_info *info) {
   int rev_first = 0;
   int have_rev = 0;
   for (i = 0; i < TRIES; i++) {
+    if (try_encrypted_application_data_records[i] <= 0) {
+      continue;
+    }
     int rc = try_encrypted_application_data_records[i];
     if (rc < 0) { rc = 0; }
     if (rc > 7) { rc = 7; }
     records_cnt_hist[rc]++;
 
-    if (try_encrypted_application_data_records[i] > 0) {
-      struct domain_profile cand;
-      memset (&cand, 0, sizeof (cand));
-      cand.encrypted_records = (char)try_encrypted_application_data_records[i];
-      if (cand.encrypted_records < 1) { cand.encrypted_records = 1; }
-      if (cand.encrypted_records > 3) { cand.encrypted_records = 3; }
-      cand.is_reversed_extension_order = (char)try_is_reversed_extension_order[i];
-      cand.encrypted_size[0] = (short)try_encrypted_application_data_lengths[i][0];
-      cand.encrypted_size[1] = (short)try_encrypted_application_data_lengths[i][1];
-      cand.encrypted_size[2] = (short)try_encrypted_application_data_lengths[i][2];
-      cand.weight = 1;
-      cand.server_hello_keyshare_offset = -1;
-      cand.startup_payload_families_num = 0;
-      domain_profile_note_startup_payload_family (
-        &cand,
-        tcp_rpc_collapse_startup_payload_size (cand.encrypted_records, try_encrypted_application_data_lengths[i])
-      );
+    struct domain_profile cand;
+    memset (&cand, 0, sizeof (cand));
+    cand.encrypted_records = (char)try_encrypted_application_data_records[i];
+    if (cand.encrypted_records < 1) { cand.encrypted_records = 1; }
+    if (cand.encrypted_records > 3) { cand.encrypted_records = 3; }
+    cand.is_reversed_extension_order = (char)try_is_reversed_extension_order[i];
+    cand.encrypted_size[0] = (short)try_encrypted_application_data_lengths[i][0];
+    cand.encrypted_size[1] = (short)try_encrypted_application_data_lengths[i][1];
+    cand.encrypted_size[2] = (short)try_encrypted_application_data_lengths[i][2];
+    cand.weight = 1;
+    cand.server_hello_keyshare_offset = -1;
+    cand.startup_payload_families_num = 0;
+    domain_profile_note_startup_payload_family (
+      &cand,
+      tcp_rpc_collapse_startup_payload_size (cand.encrypted_records, try_encrypted_application_data_lengths[i])
+    );
 
-      if (extract_server_hello_template (responses[i], response_len[i], &cand.server_hello_template,
-                                         &cand.server_hello_template_len, &cand.server_hello_keyshare_offset)) {
-        int merged = 0;
-        int p;
-        for (p = 0; p < info->profiles_num; p++) {
-          if (domain_profile_equals (&cand, &info->profiles[p])) {
-            if (info->profiles[p].weight < 65535) {
-              info->profiles[p].weight++;
-            }
-            domain_profile_merge_startup_payload_families (&info->profiles[p], &cand);
-            free (cand.server_hello_template);
-            cand.server_hello_template = NULL;
-            merged = 1;
-            break;
+    if (extract_server_hello_template (responses[i], response_len[i], &cand.server_hello_template,
+                                       &cand.server_hello_template_len, &cand.server_hello_keyshare_offset)) {
+      int merged = 0;
+      int p;
+      for (p = 0; p < info->profiles_num; p++) {
+        if (domain_profile_equals (&cand, &info->profiles[p])) {
+          if (info->profiles[p].weight < 65535) {
+            info->profiles[p].weight++;
           }
-        }
-        if (!merged && info->profiles_num < DOMAIN_PROFILE_MAX) {
-          info->profiles[info->profiles_num++] = cand;
+          domain_profile_merge_startup_payload_families (&info->profiles[p], &cand);
+          free (cand.server_hello_template);
           cand.server_hello_template = NULL;
+          merged = 1;
+          break;
         }
-        free (cand.server_hello_template);
       }
+      if (!merged && info->profiles_num < DOMAIN_PROFILE_MAX) {
+        info->profiles[info->profiles_num++] = cand;
+        cand.server_hello_template = NULL;
+      }
+      free (cand.server_hello_template);
     }
 
     int rev = try_is_reversed_extension_order[i];
@@ -2470,8 +2507,9 @@ static int update_domain_info (struct domain_info *info) {
     info->use_random_encrypted_size = 1;
   }
 
-  vkprintf (0, "Successfully checked domain %s in %.3lf seconds: is_reversed_extension_order = %d, records = %d, size = %d,%d,%d\n",
-            domain, get_utime_monotonic() - (finish_time - 5.0), info->is_reversed_extension_order, (int)info->server_hello_encrypted_records,
+  vkprintf (0, "Successfully checked domain %s in %.3lf seconds using %d/%d probe samples: is_reversed_extension_order = %d, records = %d, size = %d,%d,%d\n",
+            domain, get_utime_monotonic() - (finish_time - 5.0), finished_count, TRIES,
+            info->is_reversed_extension_order, (int)info->server_hello_encrypted_records,
             info->server_hello_encrypted_size, info->server_hello_encrypted_size2, info->server_hello_encrypted_size3);
 
   ok = 1;
@@ -2485,6 +2523,7 @@ cleanup:
   }
   return ok;
 #undef TRIES
+#undef MIN_PROBE_SUCCESSES
 }
 
 #undef TLS_REQUEST_LENGTH
