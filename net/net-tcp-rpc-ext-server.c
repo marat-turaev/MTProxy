@@ -40,6 +40,7 @@
 #include <netdb.h>
 
 #include <openssl/bn.h>
+#include <openssl/ec.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 
@@ -1623,6 +1624,26 @@ static int generate_public_key (unsigned char key[32]) {
   return generate_public_key_slow_bn (key);
 }
 
+static int generate_probe_public_key_p521 (unsigned char key[133]) {
+  int ok = 0;
+  EC_KEY *ec = EC_KEY_new_by_curve_name (NID_secp521r1);
+  if (ec == NULL) {
+    return 0;
+  }
+  if (EC_KEY_generate_key (ec) != 1) {
+    EC_KEY_free (ec);
+    return 0;
+  }
+  const EC_GROUP *group = EC_KEY_get0_group (ec);
+  const EC_POINT *point = EC_KEY_get0_public_key (ec);
+  if (group != NULL && point != NULL) {
+    size_t len = EC_POINT_point2oct (group, point, POINT_CONVERSION_UNCOMPRESSED, key, 133, NULL);
+    ok = (len == 133);
+  }
+  EC_KEY_free (ec);
+  return ok;
+}
+
 unsigned char *tcp_rpc_build_tls_startup_response (
   const unsigned char *client_hello,
   int client_hello_len,
@@ -1799,6 +1820,21 @@ static int add_public_key (unsigned char *str, int *pos) {
   return 1;
 }
 
+static int add_probe_keyshares (unsigned char *str, int *pos, const unsigned char *greases) {
+  assert (*pos + 5 + 36 + 137 <= TLS_REQUEST_LENGTH);
+  add_grease (str, pos, greases, 4);
+  add_string (str, pos, "\x00\x01\x00\x00\x1d\x00\x20", 7);
+  if (!add_public_key (str, pos)) {
+    return 0;
+  }
+  add_string (str, pos, "\x00\x19\x00\x85", 4);
+  if (!generate_probe_public_key_p521 (str + (*pos))) {
+    return 0;
+  }
+  (*pos) += 133;
+  return 1;
+}
+
 static unsigned char *create_request (const char *domain) {
   unsigned char *result = malloc (TLS_REQUEST_LENGTH);
   if (result == NULL) {
@@ -1852,10 +1888,8 @@ static unsigned char *create_request (const char *domain) {
                             "\x00\x0e\x00\x0c\x02\x68\x32\x08\x68\x74\x74\x70\x2f\x31\x2e\x31\x00\x05"
                             "\x00\x05\x01\x00\x00\x00\x00\x00\x0d\x00\x14\x00\x12\x04\x03\x08\x04\x04"
                             "\x01\x05\x03\x08\x05\x05\x01\x08\x06\x06\x01\x02\x01\x00\x12\x00\x00\x00"
-                            "\x33\x00\x2b\x00\x29", 77);
-  add_grease (result, &pos, greases, 4);
-  add_string (result, &pos, "\x00\x01\x00\x00\x1d\x00\x20", 7);
-  if (!add_public_key (result, &pos)) {
+                            "\x33\x00\xb4\x00\xb2", 77);
+  if (!add_probe_keyshares (result, &pos, greases)) {
     free (result);
     return NULL;
   }
@@ -1956,7 +1990,11 @@ static int check_response (const unsigned char *response, int len, const unsigne
     if (pos + extension_length > 5 + server_hello_length) {
       FAIL("Receive wrong extension length");
     }
-    if (extension_length != (extension_id == 0x33 ? 36 : 2)) {
+    if (extension_id == 0x33) {
+      if (extension_length < 4) {
+        FAIL("Unexpected key_share extension length");
+      }
+    } else if (extension_length != 2) {
       FAIL("Unexpected extension length");
     }
     pos += extension_length;
