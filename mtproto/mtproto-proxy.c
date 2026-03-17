@@ -358,6 +358,7 @@ struct ext_connection *create_ext_connection (connection_job_t CI, long long in_
 }
 
 static int _notify_remote_closed (JOB_REF_ARG(C), long long out_conn_id);
+static int max_media_part_bytes;
 
 void remove_ext_connection (struct ext_connection *Ex, int send_notifications) {
   assert (Ex);
@@ -396,6 +397,10 @@ void remove_ext_connection (struct ext_connection *Ex, int send_notifications) {
   assert (get_ext_connection_by_in_conn_id (Ex->in_fd, Ex->in_gen, Ex->in_conn_id, 1, 0) == (void *) -1L);
 }
 
+static inline int oversized_encrypted_payload (int payload_bytes) {
+  return max_media_part_bytes > 0 && payload_bytes > max_media_part_bytes;
+}
+
 /*
  *
  *	MULTIPROCESS STATISTICS
@@ -431,6 +436,9 @@ struct worker_stats {
   long long mtproto_proxy_errors;
   long long target_pool_stale_discards, target_pool_reuse_attempts;
   long long upstream_idle_timeouts;
+  long long limited_queries, limited_responses;
+  long long media_part_limit_upload_blocks, media_part_limit_download_blocks;
+  long long media_part_limit_upload_blocked_bytes, media_part_limit_download_blocked_bytes;
 
   long long connections_failed_lru, connections_failed_flood;
   long long relay_backpressure_pauses, relay_backpressure_resumes, relay_conn_buffer_peak_bytes;
@@ -454,6 +462,9 @@ long long tot_forwarded_simple_acks, dropped_simple_acks;
 long long mtproto_proxy_errors;
 long long target_pool_stale_discards, target_pool_reuse_attempts;
 long long upstream_idle_timeouts;
+long long limited_queries, limited_responses;
+long long media_part_limit_upload_blocks, media_part_limit_download_blocks;
+long long media_part_limit_upload_blocked_bytes, media_part_limit_download_blocked_bytes;
 
 char proxy_tag[16];
 int proxy_tag_set;
@@ -504,6 +515,12 @@ static void update_local_stats_copy (struct worker_stats *S) {
   UPD (target_pool_stale_discards);
   UPD (target_pool_reuse_attempts);
   UPD (upstream_idle_timeouts);
+  UPD (limited_queries);
+  UPD (limited_responses);
+  UPD (media_part_limit_upload_blocks);
+  UPD (media_part_limit_download_blocks);
+  UPD (media_part_limit_upload_blocked_bytes);
+  UPD (media_part_limit_download_blocked_bytes);
   UPD (connections_failed_lru);
   UPD (connections_failed_flood);
   UPD (relay_backpressure_pauses);
@@ -583,6 +600,12 @@ static inline void add_stats (struct worker_stats *W) {
   UPD (target_pool_stale_discards);
   UPD (target_pool_reuse_attempts);
   UPD (upstream_idle_timeouts);
+  UPD (limited_queries);
+  UPD (limited_responses);
+  UPD (media_part_limit_upload_blocks);
+  UPD (media_part_limit_download_blocks);
+  UPD (media_part_limit_upload_blocked_bytes);
+  UPD (media_part_limit_download_blocked_bytes);
   UPD (connections_failed_lru);
   UPD (connections_failed_flood);
   UPD (relay_backpressure_pauses);
@@ -708,6 +731,13 @@ void mtfront_prepare_stats (stats_buffer_t *sb) {
 		     "target_pool_stale_discards\t%lld\n"
 		     "target_pool_reuse_attempts\t%lld\n"
 		     "upstream_idle_timeouts\t%lld\n"
+		     "limited_queries\t%lld\n"
+		     "limited_responses\t%lld\n"
+		     "media_part_limit_upload_blocks\t%lld\n"
+		     "media_part_limit_download_blocks\t%lld\n"
+		     "media_part_limit_upload_blocked_bytes\t%lld\n"
+		     "media_part_limit_download_blocked_bytes\t%lld\n"
+		     "media_part_limit_current_bytes\t%d\n"
 		     "relay_backpressure_pauses\t%lld\n"
 		     "relay_backpressure_resumes\t%lld\n"
 		     "relay_conn_buffer_peak_bytes\t%lld\n"
@@ -780,6 +810,13 @@ void mtfront_prepare_stats (stats_buffer_t *sb) {
 		     S(target_pool_stale_discards),
 		     S(target_pool_reuse_attempts),
 		     S(upstream_idle_timeouts),
+		     S(limited_queries),
+		     S(limited_responses),
+		     S(media_part_limit_upload_blocks),
+		     S(media_part_limit_download_blocks),
+		     S(media_part_limit_upload_blocked_bytes),
+		     S(media_part_limit_download_blocked_bytes),
+		     max_media_part_bytes,
 		     S(relay_backpressure_pauses),
 		     S(relay_backpressure_resumes),
 		     SW(relay_conn_buffer_peak_bytes),
@@ -931,8 +968,9 @@ int process_client_packet (struct tl_in_state *tlio_in, int op, connection_job_t
     if (len >= 16) {
       int flags = tl_fetch_int ();
       long long out_conn_id = tl_fetch_long ();
-      assert (tl_fetch_unread () == len - 16);
-      vkprintf (2, "got RPC_PROXY_ANS from connection %d:%llx, data size = %d, flags = %d\n", CONN_INFO(C)->fd, out_conn_id, tl_fetch_unread (), flags);
+      int payload_bytes = tl_fetch_unread ();
+      assert (payload_bytes == len - 16);
+      vkprintf (2, "got RPC_PROXY_ANS from connection %d:%llx, data size = %d, flags = %d\n", CONN_INFO(C)->fd, out_conn_id, payload_bytes, flags);
       struct ext_connection *Ex = find_ext_connection_by_out_conn_id (out_conn_id);
       connection_job_t D = 0;
       if (Ex && Ex->out_fd == CONN_INFO(C)->fd && Ex->out_gen == CONN_INFO(C)->generation) {
@@ -945,6 +983,13 @@ int process_client_packet (struct tl_in_state *tlio_in, int op, connection_job_t
           rtt_ms = (get_utime_monotonic () - CONN_INFO(D)->query_start_time) * 1000.0;
         }
         target_route_note_success (CONN_INFO(C)->target, rtt_ms);
+        if (Ex->auth_key_id && oversized_encrypted_payload (payload_bytes)) {
+          limited_responses++;
+          media_part_limit_download_blocks++;
+          media_part_limit_download_blocked_bytes += payload_bytes;
+          job_decref (JOB_REF_PASS (D));
+          return 1;
+        }
 	tot_forwarded_responses++;
 	client_send_message (JOB_REF_PASS(D), Ex->in_conn_id, tlio_in, flags);
       } else {
@@ -2113,6 +2158,12 @@ static int forward_mtproto_enc_packet (struct tl_in_state *tlio_in, connection_j
     return 0;
   }
   vkprintf (2, "received mtproto encrypted packet of %d bytes from connection %p (#%d~%d), key=%016llx\n", len, C, CONN_INFO(C)->fd, CONN_INFO(C)->generation, auth_key_id);
+  if (oversized_encrypted_payload (len)) {
+    limited_queries++;
+    media_part_limit_upload_blocks++;
+    media_part_limit_upload_blocked_bytes += len;
+    return 0;
+  }
 
   CONN_INFO(C)->query_start_time = get_utime_monotonic ();
 
@@ -2941,6 +2992,18 @@ int f_parse_option (int val) {
     tcp_rpc_set_undetermined_conns_per_ip_limit (x);
     break;
   }
+  case 2018: {
+    char *end = 0;
+    errno = 0;
+    long x = strtol (optarg, &end, 10);
+    if (errno || !end || *end || x < 0 || x > MAX_POST_SIZE || (x > 0 && x < 4096)) {
+      kprintf ("'--max-media-part-bytes' must be 0 or in range [4096, %d], got '%s'\n", MAX_POST_SIZE, optarg);
+      usage ();
+      return 2;
+    }
+    max_media_part_bytes = x;
+    break;
+  }
   default:
     return -1;
   }
@@ -2966,6 +3029,7 @@ void mtfront_prepare_parse_options (void) {
   parse_option ("undetermined-buffer-bytes-limit", required_argument, 0, 2015, "max buffered bytes per undetermined connection");
   parse_option ("undetermined-bytes-global-limit", required_argument, 0, 2016, "max buffered bytes across all undetermined connections");
   parse_option ("undetermined-conns-per-ip-limit", required_argument, 0, 2017, "max undetermined connections per source IP (0 disables)");
+  parse_option ("max-media-part-bytes", required_argument, 0, 2018, "cap proxied encrypted MTProto payload size; useful to suppress large media transfers");
   parse_option ("mtproto-secret", required_argument, 0, 'S', "16-byte secret in hex mode");
   parse_option ("proxy-tag", required_argument, 0, 'P', "16-byte proxy tag in hex mode to be passed along with all forwarded queries");
   parse_option ("domain", required_argument, 0, 'D', "adds allowed domain for TLS-transport mode, disables other transports; can be specified more than once");
