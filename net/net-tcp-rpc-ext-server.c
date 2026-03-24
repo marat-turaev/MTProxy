@@ -34,6 +34,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <pthread.h>
+#include <poll.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -2468,15 +2469,10 @@ static int update_domain_info (struct domain_info *info) {
   }
   assert (host->h_addrtype == AF_INET || host->h_addrtype == AF_INET6);
 
-  fd_set read_fd;
-  fd_set write_fd;
-  fd_set except_fd;
-  FD_ZERO(&read_fd);
-  FD_ZERO(&write_fd);
-  FD_ZERO(&except_fd);
-
 #define TRIES 20
 #define MIN_PROBE_SUCCESSES 5
+#define PROBE_LAUNCH_SPACING_MS 100
+#define PROBE_LAUNCH_JITTER_MS 50
   int sockets[TRIES];
   unsigned char *requests[TRIES] = {};
   int request_len[TRIES] = {};
@@ -2488,74 +2484,18 @@ static int update_domain_info (struct domain_info *info) {
   int ok = 0;
   int i;
   int completed_count = 0;
+  int is_started[TRIES] = {};
+  double launch_at[TRIES];
+  double start_time = get_utime_monotonic ();
   for (i = 0; i < TRIES; i++) {
     sockets[i] = -1;
+    launch_at[i] = start_time + 0.001 * (PROBE_LAUNCH_SPACING_MS * i + (lrand48_j () % (PROBE_LAUNCH_JITTER_MS + 1)));
   }
   int is_failed[TRIES] = {};
   for (i = 0; i < TRIES; i++) {
-    sockets[i] = socket (host->h_addrtype, SOCK_STREAM, IPPROTO_TCP);
-    if (sockets[i] < 0) {
-      kprintf ("Failed to open socket for %s: %s\n", domain, strerror (errno));
-      is_failed[i] = 1;
-      completed_count++;
-      continue;
-    }
-    if (fcntl (sockets[i], F_SETFL, O_NONBLOCK) == -1) {
-      kprintf ("Failed to make socket non-blocking: %s\n", strerror (errno));
-      close (sockets[i]);
-      sockets[i] = -1;
-      is_failed[i] = 1;
-      completed_count++;
-      continue;
-    }
-
-    int e_connect;
-    if (host->h_addrtype == AF_INET) {
-      info->target = *((struct in_addr *) host->h_addr);
-      memset (info->target_ipv6, 0, sizeof (info->target_ipv6));
-
-      struct sockaddr_in addr;
-      memset (&addr, 0, sizeof (addr));
-      addr.sin_family = AF_INET;
-      addr.sin_port = htons (443);
-      memcpy (&addr.sin_addr, host->h_addr, sizeof (struct in_addr));
-
-      e_connect = connect (sockets[i], &addr, sizeof (addr));
-    } else {
-      assert (sizeof (struct in6_addr) == sizeof (info->target_ipv6));
-      info->target.s_addr = 0;
-      memcpy (info->target_ipv6, host->h_addr, sizeof (struct in6_addr));
-
-      struct sockaddr_in6 addr;
-      memset (&addr, 0, sizeof (addr));
-      addr.sin6_family = AF_INET6;
-      addr.sin6_port = htons (443);
-      memcpy (&addr.sin6_addr, host->h_addr, sizeof (struct in6_addr));
-
-      e_connect = connect (sockets[i], &addr, sizeof (addr));
-    }
-
-    if (e_connect == -1 && errno != EINPROGRESS) {
-      kprintf ("Failed to connect to %s: %s\n", domain, strerror (errno));
-      close (sockets[i]);
-      sockets[i] = -1;
-      is_failed[i] = 1;
-      completed_count++;
-      continue;
-    }
-  }
-
-  for (i = 0; i < TRIES; i++) {
-    if (is_failed[i]) {
-      continue;
-    }
     requests[i] = create_request (domain, &request_len[i]);
     if (requests[i] == NULL || request_len[i] <= 0) {
       kprintf ("Failed to build probe request for checking domain %s\n", domain);
-      if (sockets[i] >= 0) {
-        close (sockets[i]);
-        sockets[i] = -1;
-      }
       is_failed[i] = 1;
       completed_count++;
     }
@@ -2573,35 +2513,112 @@ static int update_domain_info (struct domain_info *info) {
   int is_reversed_extension_order_max = 0;
   while (get_utime_monotonic() < finish_time && finished_count < MIN_PROBE_SUCCESSES &&
          completed_count < TRIES && !have_error) {
-    struct timeval timeout_data;
-    timeout_data.tv_sec = (int)(finish_time - precise_now + 1);
-    timeout_data.tv_usec = 0;
-
-    int max_fd = 0;
+    double now_mono = get_utime_monotonic ();
     for (i = 0; i < TRIES; i++) {
-      if (is_finished[i] || is_failed[i]) {
+      if (is_started[i] || is_failed[i]) {
         continue;
       }
-      if (is_written[i]) {
-        FD_SET(sockets[i], &read_fd);
-        FD_CLR(sockets[i], &write_fd);
+      if (launch_at[i] > now_mono) {
+        continue;
+      }
+
+      sockets[i] = socket (host->h_addrtype, SOCK_STREAM, IPPROTO_TCP);
+      if (sockets[i] < 0) {
+        kprintf ("Failed to open socket for %s: %s\n", domain, strerror (errno));
+        is_failed[i] = 1;
+        completed_count++;
+        continue;
+      }
+      if (fcntl (sockets[i], F_SETFL, O_NONBLOCK) == -1) {
+        kprintf ("Failed to make socket non-blocking: %s\n", strerror (errno));
+        close (sockets[i]);
+        sockets[i] = -1;
+        is_failed[i] = 1;
+        completed_count++;
+        continue;
+      }
+
+      int e_connect;
+      if (host->h_addrtype == AF_INET) {
+        info->target = *((struct in_addr *) host->h_addr);
+        memset (info->target_ipv6, 0, sizeof (info->target_ipv6));
+
+        struct sockaddr_in addr;
+        memset (&addr, 0, sizeof (addr));
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons (443);
+        memcpy (&addr.sin_addr, host->h_addr, sizeof (struct in_addr));
+
+        e_connect = connect (sockets[i], &addr, sizeof (addr));
       } else {
-        FD_CLR(sockets[i], &read_fd);
-        FD_SET(sockets[i], &write_fd);
+        assert (sizeof (struct in6_addr) == sizeof (info->target_ipv6));
+        info->target.s_addr = 0;
+        memcpy (info->target_ipv6, host->h_addr, sizeof (struct in6_addr));
+
+        struct sockaddr_in6 addr;
+        memset (&addr, 0, sizeof (addr));
+        addr.sin6_family = AF_INET6;
+        addr.sin6_port = htons (443);
+        memcpy (&addr.sin6_addr, host->h_addr, sizeof (struct in6_addr));
+
+        e_connect = connect (sockets[i], &addr, sizeof (addr));
       }
-      FD_SET(sockets[i], &except_fd);
-      if (sockets[i] > max_fd) {
-        max_fd = sockets[i];
+
+      if (e_connect == -1 && errno != EINPROGRESS) {
+        kprintf ("Failed to connect to %s: %s\n", domain, strerror (errno));
+        close (sockets[i]);
+        sockets[i] = -1;
+        is_failed[i] = 1;
+        completed_count++;
+        continue;
       }
+      is_started[i] = 1;
     }
 
-    select (max_fd + 1, &read_fd, &write_fd, &except_fd, &timeout_data);
+    double timeout_limit = finish_time;
+    for (i = 0; i < TRIES; i++) {
+      if (!is_started[i] && !is_failed[i] && launch_at[i] < timeout_limit) {
+        timeout_limit = launch_at[i];
+      }
+    }
+    double timeout_secs = timeout_limit - now_mono;
+    if (timeout_secs < 0) {
+      timeout_secs = 0;
+    }
+    int timeout_ms = (int)(timeout_secs * 1000.0);
+    if (timeout_ms < 0) {
+      timeout_ms = 0;
+    }
+
+    struct pollfd pfds[TRIES];
+    int pfd_index[TRIES];
+    int nfds = 0;
+    for (i = 0; i < TRIES; i++) {
+      pfd_index[i] = -1;
+      if (!is_started[i] || is_finished[i] || is_failed[i]) {
+        continue;
+      }
+      pfd_index[i] = nfds;
+      pfds[nfds].fd = sockets[i];
+      pfds[nfds].events = (short)(is_written[i] ? POLLIN : POLLOUT);
+      pfds[nfds].events |= POLLERR | POLLHUP | POLLNVAL;
+      pfds[nfds].revents = 0;
+      nfds++;
+    }
+
+    if (nfds == 0) {
+      poll (NULL, 0, timeout_ms);
+      continue;
+    }
+    poll (pfds, (nfds_t)nfds, timeout_ms);
 
     for (i = 0; i < TRIES; i++) {
       if (is_finished[i] || is_failed[i]) {
         continue;
       }
-      if (FD_ISSET(sockets[i], &read_fd)) {
+      int pi = pfd_index[i];
+      short revents = (pi >= 0 ? pfds[pi].revents : 0);
+      if (revents & POLLIN) {
         assert (is_written[i]);
 
         unsigned char header[5];
@@ -2720,9 +2737,6 @@ static int update_domain_info (struct domain_info *info) {
                 }
               }
 
-              FD_CLR(sockets[i], &write_fd);
-              FD_CLR(sockets[i], &read_fd);
-              FD_CLR(sockets[i], &except_fd);
               is_finished[i] = 1;
               finished_count++;
               completed_count++;
@@ -2734,7 +2748,7 @@ static int update_domain_info (struct domain_info *info) {
           }
         }
       }
-      if (FD_ISSET(sockets[i], &write_fd)) {
+      if (revents & POLLOUT) {
         assert (!is_written[i]);
         ssize_t write_res = write (sockets[i], requests[i], (size_t)request_len[i]);
         if (write_res != request_len[i]) {
@@ -2745,7 +2759,7 @@ static int update_domain_info (struct domain_info *info) {
         }
         is_written[i] = 1;
       }
-      if (FD_ISSET(sockets[i], &except_fd)) {
+      if (revents & (POLLERR | POLLHUP | POLLNVAL)) {
         kprintf ("Failed to check domain %s: %s\n", domain, strerror (errno));
         is_failed[i] = 1;
         completed_count++;
