@@ -1502,7 +1502,7 @@ int tcp_rpc_proxy_domains_prepare_stat (stats_buffer_t *sb) {
   return sb->pos;
 }
 
-#define TLS_REQUEST_LENGTH 517
+#define TLS_PROBE_REQUEST_MAX_LENGTH 4096
 #define MAX_TLS_RESPONSE_ALLOC (1 << 15)
 
 static BIGNUM *get_y2 (BIGNUM *x, const BIGNUM *mod, BN_CTX *big_num_context) {
@@ -1634,11 +1634,13 @@ static int generate_probe_public_key_p521 (unsigned char key[133]) {
     EC_KEY_free (ec);
     return 0;
   }
-  const EC_GROUP *group = EC_KEY_get0_group (ec);
-  const EC_POINT *point = EC_KEY_get0_public_key (ec);
-  if (group != NULL && point != NULL) {
-    size_t len = EC_POINT_point2oct (group, point, POINT_CONVERSION_UNCOMPRESSED, key, 133, NULL);
-    ok = (len == 133);
+  {
+    const EC_GROUP *group = EC_KEY_get0_group (ec);
+    const EC_POINT *point = EC_KEY_get0_public_key (ec);
+    if (group != NULL && point != NULL) {
+      size_t len = EC_POINT_point2oct (group, point, POINT_CONVERSION_UNCOMPRESSED, key, 133, NULL);
+      ok = (len == 133);
+    }
   }
   EC_KEY_free (ec);
   return ok;
@@ -1782,128 +1784,480 @@ unsigned char *tcp_rpc_build_tls_startup_response (
   return response;
 }
 
-static void add_string (unsigned char *str, int *pos, const char *data, int data_len) {
-  assert (*pos + data_len <= TLS_REQUEST_LENGTH);
-  memcpy (str + (*pos), data, data_len);
-  (*pos) += data_len;
+struct tls_probe_builder {
+  unsigned char *data;
+  int pos;
+  int cap;
+  int failed;
+  int scope_stack[16];
+  int scope_depth;
+  unsigned char greases[8];
+};
+
+static void tls_probe_fail (struct tls_probe_builder *b) {
+  b->failed = 1;
 }
 
-static int add_random (unsigned char *str, int *pos, int random_len) {
-  assert (*pos + random_len <= TLS_REQUEST_LENGTH);
-  if (RAND_bytes (str + (*pos), random_len) != 1) {
+static int tls_probe_need (struct tls_probe_builder *b, int add) {
+  if (b->failed || add < 0 || b->pos + add > b->cap) {
+    tls_probe_fail (b);
     return 0;
   }
-  (*pos) += random_len;
   return 1;
 }
 
-static void add_length (unsigned char *str, int *pos, int length) {
-  assert (*pos + 2 <= TLS_REQUEST_LENGTH);
-  str[*pos + 0] = (unsigned char)(length / 256);
-  str[*pos + 1] = (unsigned char)(length % 256);
-  (*pos) += 2;
+static void tls_probe_add_u8 (struct tls_probe_builder *b, unsigned char value) {
+  if (!tls_probe_need (b, 1)) {
+    return;
+  }
+  b->data[b->pos++] = value;
 }
 
-static void add_grease (unsigned char *str, int *pos, const unsigned char *greases, int num) {
-  assert (*pos + 2 <= TLS_REQUEST_LENGTH);
-  str[*pos + 0] = greases[num];
-  str[*pos + 1] = greases[num];
-  (*pos) += 2;
+static void tls_probe_add_u16 (struct tls_probe_builder *b, int value) {
+  if (!tls_probe_need (b, 2)) {
+    return;
+  }
+  b->data[b->pos++] = (unsigned char)((value >> 8) & 0xff);
+  b->data[b->pos++] = (unsigned char)(value & 0xff);
 }
 
-static int add_public_key (unsigned char *str, int *pos) {
-  assert (*pos + 32 <= TLS_REQUEST_LENGTH);
-  if (!generate_public_key (str + (*pos))) {
+static void tls_probe_add_bytes (struct tls_probe_builder *b, const unsigned char *data, int len) {
+  if (!tls_probe_need (b, len)) {
+    return;
+  }
+  memcpy (b->data + b->pos, data, (size_t)len);
+  b->pos += len;
+}
+
+static void tls_probe_add_zeros (struct tls_probe_builder *b, int len) {
+  if (!tls_probe_need (b, len)) {
+    return;
+  }
+  memset (b->data + b->pos, 0, (size_t)len);
+  b->pos += len;
+}
+
+static int tls_probe_add_random (struct tls_probe_builder *b, int len) {
+  if (!tls_probe_need (b, len)) {
     return 0;
   }
-  (*pos) += 32;
+  if (RAND_bytes (b->data + b->pos, len) != 1) {
+    tls_probe_fail (b);
+    return 0;
+  }
+  b->pos += len;
   return 1;
 }
 
-static int add_probe_keyshares (unsigned char *str, int *pos, const unsigned char *greases) {
-  assert (*pos + 5 + 36 + 137 <= TLS_REQUEST_LENGTH);
-  add_grease (str, pos, greases, 4);
-  add_string (str, pos, "\x00\x01\x00\x00\x1d\x00\x20", 7);
-  if (!add_public_key (str, pos)) {
+static void tls_probe_add_grease (struct tls_probe_builder *b, int idx) {
+  tls_probe_add_u8 (b, b->greases[idx]);
+  tls_probe_add_u8 (b, b->greases[idx]);
+}
+
+static int tls_probe_open_scope (struct tls_probe_builder *b) {
+  if (b->scope_depth >= (int)(sizeof (b->scope_stack) / sizeof (b->scope_stack[0]))) {
+    tls_probe_fail (b);
     return 0;
   }
-  add_string (str, pos, "\x00\x19\x00\x85", 4);
-  if (!generate_probe_public_key_p521 (str + (*pos))) {
+  if (!tls_probe_need (b, 2)) {
     return 0;
   }
-  (*pos) += 133;
+  b->scope_stack[b->scope_depth++] = b->pos;
+  b->pos += 2;
   return 1;
 }
 
-static unsigned char *create_request (const char *domain) {
-  unsigned char *result = malloc (TLS_REQUEST_LENGTH);
+static void tls_probe_close_scope (struct tls_probe_builder *b) {
+  if (b->failed || b->scope_depth <= 0) {
+    tls_probe_fail (b);
+    return;
+  }
+  int begin = b->scope_stack[--b->scope_depth];
+  int len = b->pos - begin - 2;
+  if (len < 0 || len > 0xffff) {
+    tls_probe_fail (b);
+    return;
+  }
+  b->data[begin] = (unsigned char)((len >> 8) & 0xff);
+  b->data[begin + 1] = (unsigned char)(len & 0xff);
+}
+
+static uint32_t read_le_u32 (const unsigned char *data) {
+  return ((uint32_t)data[0]) |
+         ((uint32_t)data[1] << 8) |
+         ((uint32_t)data[2] << 16) |
+         ((uint32_t)data[3] << 24);
+}
+
+static int generate_probe_hybrid_keyshare (unsigned char key[1216]) {
+  unsigned char random[384 * 8 + 32];
+  int i;
+  if (RAND_bytes (random, (int)sizeof (random)) != 1) {
+    return 0;
+  }
+  for (i = 0; i < 384; i++) {
+    int a = (int)(read_le_u32 (random + i * 8) % 3329u);
+    int b = (int)(read_le_u32 (random + i * 8 + 4) % 3329u);
+    key[i * 3 + 0] = (unsigned char)(a & 0xff);
+    key[i * 3 + 1] = (unsigned char)(((a >> 8) & 0x0f) + ((b & 0x0f) << 4));
+    key[i * 3 + 2] = (unsigned char)((b >> 4) & 0xff);
+  }
+  return RAND_bytes (key + 384 * 3, 32) == 1;
+}
+
+static int tls_probe_add_x25519_key (struct tls_probe_builder *b) {
+  if (!tls_probe_need (b, 32)) {
+    return 0;
+  }
+  if (!generate_public_key (b->data + b->pos)) {
+    tls_probe_fail (b);
+    return 0;
+  }
+  b->pos += 32;
+  return 1;
+}
+
+static int tls_probe_add_hybrid_key (struct tls_probe_builder *b) {
+  if (!tls_probe_need (b, 1216)) {
+    return 0;
+  }
+  if (!generate_probe_hybrid_keyshare (b->data + b->pos)) {
+    tls_probe_fail (b);
+    return 0;
+  }
+  b->pos += 1216;
+  return 1;
+}
+
+static int tls_probe_add_p521_key (struct tls_probe_builder *b) {
+  if (!tls_probe_need (b, 133)) {
+    return 0;
+  }
+  if (!generate_probe_public_key_p521 (b->data + b->pos)) {
+    tls_probe_fail (b);
+    return 0;
+  }
+  b->pos += 133;
+  return 1;
+}
+
+static int tls_probe_add_variable_e (struct tls_probe_builder *b) {
+  static const int lengths[4] = {144, 176, 208, 240};
+  int idx = 0;
+  if (RAND_bytes ((unsigned char *)&idx, sizeof (idx)) != 1) {
+    tls_probe_fail (b);
+    return 0;
+  }
+  idx = ((unsigned)idx) % 4;
+  return tls_probe_add_random (b, lengths[idx]);
+}
+
+static void tls_probe_shuffle_ints (int *values, int count) {
+  int i;
+  for (i = 0; i + 1 < count; i++) {
+    unsigned int r = 0;
+    int j;
+    if (RAND_bytes ((unsigned char *)&r, sizeof (r)) != 1) {
+      return;
+    }
+    j = i + (int)(r % (unsigned)(count - i));
+    if (i != j) {
+      int t = values[i];
+      values[i] = values[j];
+      values[j] = t;
+    }
+  }
+}
+
+static void tls_probe_add_extension_server_name (struct tls_probe_builder *b, const char *domain, int domain_len) {
+  tls_probe_add_u16 (b, 0x0000);
+  tls_probe_open_scope (b);
+  tls_probe_open_scope (b);
+  tls_probe_add_u8 (b, 0x00);
+  tls_probe_open_scope (b);
+  tls_probe_add_bytes (b, (const unsigned char *)domain, domain_len);
+  tls_probe_close_scope (b);
+  tls_probe_close_scope (b);
+  tls_probe_close_scope (b);
+}
+
+static void tls_probe_add_extension_status_request (struct tls_probe_builder *b) {
+  static const unsigned char ext[] = "\x00\x05\x00\x05\x01\x00\x00\x00\x00";
+  tls_probe_add_bytes (b, ext, (int)sizeof (ext) - 1);
+}
+
+static void tls_probe_add_extension_supported_groups (struct tls_probe_builder *b) {
+  static const unsigned char prefix[] = "\x00\x0a\x00\x0e\x00\x0c";
+  static const unsigned char suffix[] = "\x11\xec\x00\x1d\x00\x17\x00\x18\x00\x19";
+  tls_probe_add_bytes (b, prefix, (int)sizeof (prefix) - 1);
+  tls_probe_add_grease (b, 4);
+  tls_probe_add_bytes (b, suffix, (int)sizeof (suffix) - 1);
+}
+
+static void tls_probe_add_extension_ec_point_formats (struct tls_probe_builder *b) {
+  static const unsigned char ext[] = "\x00\x0b\x00\x02\x01\x00";
+  tls_probe_add_bytes (b, ext, (int)sizeof (ext) - 1);
+}
+
+static void tls_probe_add_extension_signature_algorithms (struct tls_probe_builder *b) {
+  static const unsigned char ext[] = "\x00\x0d\x00\x12\x00\x10\x04\x03\x08\x04\x04\x01\x05\x03\x08\x05\x05\x01\x08\x06\x06\x01";
+  tls_probe_add_bytes (b, ext, (int)sizeof (ext) - 1);
+}
+
+static void tls_probe_add_extension_alpn (struct tls_probe_builder *b) {
+  static const unsigned char ext[] = "\x00\x10\x00\x0e\x00\x0c\x02\x68\x32\x08\x68\x74\x74\x70\x2f\x31\x2e\x31";
+  tls_probe_add_bytes (b, ext, (int)sizeof (ext) - 1);
+}
+
+static void tls_probe_add_extension_sct (struct tls_probe_builder *b) {
+  static const unsigned char ext[] = "\x00\x12\x00\x00";
+  tls_probe_add_bytes (b, ext, (int)sizeof (ext) - 1);
+}
+
+static void tls_probe_add_extension_extended_master_secret (struct tls_probe_builder *b) {
+  static const unsigned char ext[] = "\x00\x17\x00\x00";
+  tls_probe_add_bytes (b, ext, (int)sizeof (ext) - 1);
+}
+
+static void tls_probe_add_extension_compress_certificate (struct tls_probe_builder *b) {
+  static const unsigned char ext[] = "\x00\x1b\x00\x03\x02\x00\x02";
+  tls_probe_add_bytes (b, ext, (int)sizeof (ext) - 1);
+}
+
+static void tls_probe_add_extension_session_ticket (struct tls_probe_builder *b) {
+  static const unsigned char ext[] = "\x00\x23\x00\x00";
+  tls_probe_add_bytes (b, ext, (int)sizeof (ext) - 1);
+}
+
+static void tls_probe_add_extension_supported_versions (struct tls_probe_builder *b) {
+  static const unsigned char prefix[] = "\x00\x2b\x00\x07\x06";
+  static const unsigned char suffix[] = "\x03\x04\x03\x03";
+  tls_probe_add_bytes (b, prefix, (int)sizeof (prefix) - 1);
+  tls_probe_add_grease (b, 6);
+  tls_probe_add_bytes (b, suffix, (int)sizeof (suffix) - 1);
+}
+
+static void tls_probe_add_extension_psk_key_exchange_modes (struct tls_probe_builder *b) {
+  static const unsigned char ext[] = "\x00\x2d\x00\x02\x01\x01";
+  tls_probe_add_bytes (b, ext, (int)sizeof (ext) - 1);
+}
+
+static void tls_probe_add_extension_key_share (struct tls_probe_builder *b) {
+  tls_probe_add_u16 (b, 0x0033);
+  tls_probe_open_scope (b);
+  tls_probe_open_scope (b);
+  tls_probe_add_grease (b, 4);
+  tls_probe_add_u16 (b, 0x0001);
+  tls_probe_add_u8 (b, 0x00);
+  tls_probe_add_u16 (b, 0x11ec);
+  tls_probe_add_u16 (b, 1216);
+  tls_probe_add_hybrid_key (b);
+  tls_probe_add_u16 (b, 0x001d);
+  tls_probe_add_u16 (b, 32);
+  tls_probe_add_x25519_key (b);
+  tls_probe_add_u16 (b, 0x0019);
+  tls_probe_add_u16 (b, 133);
+  tls_probe_add_p521_key (b);
+  tls_probe_close_scope (b);
+  tls_probe_close_scope (b);
+}
+
+static void tls_probe_add_extension_44cd (struct tls_probe_builder *b) {
+  static const unsigned char ext[] = "\x44\xcd\x00\x05\x00\x03\x02\x68\x32";
+  tls_probe_add_bytes (b, ext, (int)sizeof (ext) - 1);
+}
+
+static void tls_probe_add_extension_fe02 (struct tls_probe_builder *b) {
+  static const unsigned char prefix[] = "\xfe\x02";
+  static const unsigned char middle[] = "\x00\x00\x01\x00\x01";
+  static const unsigned char sep[] = "\x00\x20";
+  tls_probe_add_bytes (b, prefix, (int)sizeof (prefix) - 1);
+  tls_probe_open_scope (b);
+  tls_probe_add_bytes (b, middle, (int)sizeof (middle) - 1);
+  tls_probe_add_random (b, 1);
+  tls_probe_add_bytes (b, sep, (int)sizeof (sep) - 1);
+  tls_probe_add_random (b, 20);
+  tls_probe_open_scope (b);
+  tls_probe_add_variable_e (b);
+  tls_probe_close_scope (b);
+  tls_probe_close_scope (b);
+}
+
+static void tls_probe_add_extension_renegotiation_info (struct tls_probe_builder *b) {
+  static const unsigned char ext[] = "\xff\x01\x00\x01\x00";
+  tls_probe_add_bytes (b, ext, (int)sizeof (ext) - 1);
+}
+
+static void tls_probe_add_extension_padding (struct tls_probe_builder *b) {
+  int length = b->pos;
+  if (b->failed) {
+    return;
+  }
+  tls_probe_add_u16 (b, 0x0015);
+  tls_probe_open_scope (b);
+  if (length <= 513) {
+    tls_probe_add_zeros (b, 513 - length);
+  }
+  tls_probe_close_scope (b);
+}
+
+static void tls_probe_add_permuted_extension (struct tls_probe_builder *b, int idx, const char *domain, int domain_len) {
+  switch (idx) {
+    case 0:
+      tls_probe_add_extension_server_name (b, domain, domain_len);
+      break;
+    case 1:
+      tls_probe_add_extension_status_request (b);
+      break;
+    case 2:
+      tls_probe_add_extension_supported_groups (b);
+      break;
+    case 3:
+      tls_probe_add_extension_ec_point_formats (b);
+      break;
+    case 4:
+      tls_probe_add_extension_signature_algorithms (b);
+      break;
+    case 5:
+      tls_probe_add_extension_alpn (b);
+      break;
+    case 6:
+      tls_probe_add_extension_sct (b);
+      break;
+    case 7:
+      tls_probe_add_extension_extended_master_secret (b);
+      break;
+    case 8:
+      tls_probe_add_extension_compress_certificate (b);
+      break;
+    case 9:
+      tls_probe_add_extension_session_ticket (b);
+      break;
+    case 10:
+      tls_probe_add_extension_supported_versions (b);
+      break;
+    case 11:
+      tls_probe_add_extension_psk_key_exchange_modes (b);
+      break;
+    case 12:
+      tls_probe_add_extension_key_share (b);
+      break;
+    case 13:
+      tls_probe_add_extension_44cd (b);
+      break;
+    case 14:
+      tls_probe_add_extension_fe02 (b);
+      break;
+    case 15:
+      tls_probe_add_extension_renegotiation_info (b);
+      break;
+    default:
+      tls_probe_fail (b);
+      break;
+  }
+}
+
+unsigned char *tcp_rpc_build_tls_probe_request (const char *domain, int *out_len) {
+  static const unsigned char prefix[] = "\x16\x03\x01\x00\x00\x01\x00\x00\x00\x03\x03";
+  static const unsigned char cipher_suites[] =
+    "\x13\x01\x13\x02\x13\x03\xc0\x2b\xc0\x2f\xc0\x2c\xc0\x30\xcc\xa9\xcc\xa8"
+    "\xc0\x13\xc0\x14\x00\x9c\x00\x9d\x00\x2f\x00\x35";
+  unsigned char *result;
+  struct tls_probe_builder b;
+  int permuted[16];
+  int i;
+  int domain_len;
+  int handshake_len;
+  int record_len;
+
+  if (domain == NULL || out_len == NULL) {
+    return NULL;
+  }
+  domain_len = (int)strlen (domain);
+  if (domain_len <= 0) {
+    return NULL;
+  }
+  if (domain_len > 253) {
+    domain_len = 253;
+  }
+
+  result = malloc (TLS_PROBE_REQUEST_MAX_LENGTH);
   if (result == NULL) {
     return NULL;
   }
-  int pos = 0;
 
-#define MAX_GREASE 7
-  unsigned char greases[MAX_GREASE];
-  if (RAND_bytes (greases, MAX_GREASE) != 1) {
+  memset (&b, 0, sizeof (b));
+  b.data = result;
+  b.cap = TLS_PROBE_REQUEST_MAX_LENGTH;
+
+  if (RAND_bytes (b.greases, (int)sizeof (b.greases)) != 1) {
     free (result);
     return NULL;
   }
-  int i;
-  for (i = 0; i < MAX_GREASE; i++) {
-    greases[i] = (unsigned char)((greases[i] & 0xF0) + 0x0A);
+  for (i = 0; i < (int)sizeof (b.greases); i++) {
+    b.greases[i] = (unsigned char)((b.greases[i] & 0xF0) + 0x0A);
   }
-  for (i = 1; i < MAX_GREASE; i += 2) {
-    if (greases[i] == greases[i - 1]) {
-      greases[i] = (unsigned char)(0x10 ^ greases[i]);
+  for (i = 1; i < (int)sizeof (b.greases); i += 2) {
+    if (b.greases[i] == b.greases[i - 1]) {
+      b.greases[i] ^= 0x10;
     }
   }
-#undef MAX_GREASE
 
-  int domain_length = (int)strlen (domain);
+  tls_probe_add_bytes (&b, prefix, (int)sizeof (prefix) - 1);
+  tls_probe_add_random (&b, 32);
+  tls_probe_add_u8 (&b, 0x20);
+  tls_probe_add_random (&b, 32);
+  tls_probe_add_u16 (&b, 32);
+  tls_probe_add_grease (&b, 0);
+  tls_probe_add_bytes (&b, cipher_suites, (int)sizeof (cipher_suites) - 1);
+  tls_probe_add_u8 (&b, 0x01);
+  tls_probe_add_u8 (&b, 0x00);
 
-  add_string (result, &pos, "\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03", 11);
-  if (!add_random (result, &pos, 32)) {
+  tls_probe_open_scope (&b);
+  tls_probe_add_grease (&b, 2);
+  tls_probe_add_u16 (&b, 0);
+
+  for (i = 0; i < 16; i++) {
+    permuted[i] = i;
+  }
+  tls_probe_shuffle_ints (permuted, 16);
+  for (i = 0; i < 16; i++) {
+    tls_probe_add_permuted_extension (&b, permuted[i], domain, domain_len);
+  }
+
+  tls_probe_add_grease (&b, 3);
+  tls_probe_add_u16 (&b, 1);
+  tls_probe_add_u8 (&b, 0x00);
+  tls_probe_add_extension_padding (&b);
+  tls_probe_close_scope (&b);
+
+  if (b.failed || b.scope_depth != 0) {
     free (result);
     return NULL;
   }
-  add_string (result, &pos, "\x20", 1);
-  if (!add_random (result, &pos, 32)) {
-    free (result);
-    return NULL;
-  }
-  add_string (result, &pos, "\x00\x22", 2);
-  add_grease (result, &pos, greases, 0);
-  add_string (result, &pos, "\x13\x01\x13\x02\x13\x03\xc0\x2b\xc0\x2f\xc0\x2c\xc0\x30\xcc\xa9\xcc\xa8"
-                            "\xc0\x13\xc0\x14\x00\x9c\x00\x9d\x00\x2f\x00\x35\x00\x0a\x01\x00\x01\x91", 36);
-  add_grease (result, &pos, greases, 2);
-  add_string (result, &pos, "\x00\x00\x00\x00", 4);
-  add_length (result, &pos, domain_length + 5);
-  add_length (result, &pos, domain_length + 3);
-  add_string (result, &pos, "\x00", 1);
-  add_length (result, &pos, domain_length);
-  add_string (result, &pos, domain, domain_length);
-  add_string (result, &pos, "\x00\x17\x00\x00\xff\x01\x00\x01\x00\x00\x0a\x00\x0c\x00\x0a", 15);
-  add_grease (result, &pos, greases, 4);
-  add_string (result, &pos, "\x00\x1d\x00\x17\x00\x18\x00\x19\x00\x0b\x00\x02\x01\x00\x00\x23\x00\x00\x00\x10"
-                            "\x00\x0e\x00\x0c\x02\x68\x32\x08\x68\x74\x74\x70\x2f\x31\x2e\x31\x00\x05"
-                            "\x00\x05\x01\x00\x00\x00\x00\x00\x0d\x00\x14\x00\x12\x04\x03\x08\x04\x04"
-                            "\x01\x05\x03\x08\x05\x05\x01\x08\x06\x06\x01\x02\x01\x00\x12\x00\x00\x00"
-                            "\x33\x00\xb4\x00\xb2", 79);
-  if (!add_probe_keyshares (result, &pos, greases)) {
-    free (result);
-    return NULL;
-  }
-  add_string (result, &pos, "\x00\x2d\x00\x02\x01\x01\x00\x2b\x00\x0b\x0a", 11);
-  add_grease (result, &pos, greases, 6);
-  add_string (result, &pos, "\x03\x04\x03\x03\x03\x02\x03\x01\x00\x1b\x00\x03\x02\x00\x02", 15);
-  add_grease (result, &pos, greases, 3);
-  add_string (result, &pos, "\x00\x01\x00\x00\x15", 5);
 
-  int padding_length = TLS_REQUEST_LENGTH - 2 - pos;
-  assert (padding_length >= 0);
-  add_length (result, &pos, padding_length);
-  memset (result + pos, 0, TLS_REQUEST_LENGTH - pos);
+  if (b.pos < 9) {
+    free (result);
+    return NULL;
+  }
+  record_len = b.pos - 5;
+  handshake_len = b.pos - 9;
+  if (record_len <= 0 || record_len > 0xffff || handshake_len <= 0 || handshake_len > 0xffffff) {
+    free (result);
+    return NULL;
+  }
+  b.data[3] = (unsigned char)((record_len >> 8) & 0xff);
+  b.data[4] = (unsigned char)(record_len & 0xff);
+  b.data[6] = (unsigned char)((handshake_len >> 16) & 0xff);
+  b.data[7] = (unsigned char)((handshake_len >> 8) & 0xff);
+  b.data[8] = (unsigned char)(handshake_len & 0xff);
+
+  *out_len = b.pos;
   return result;
+}
+
+static unsigned char *create_request (const char *domain, int *out_len) {
+  return tcp_rpc_build_tls_probe_request (domain, out_len);
 }
 
 static int read_length (const unsigned char *response, int *pos) {
@@ -2125,6 +2479,7 @@ static int update_domain_info (struct domain_info *info) {
 #define MIN_PROBE_SUCCESSES 5
   int sockets[TRIES];
   unsigned char *requests[TRIES] = {};
+  int request_len[TRIES] = {};
   unsigned char *responses[TRIES] = {};
   int response_len[TRIES] = {};
   int is_encrypted_application_data_length_read[TRIES] = {};  // 0 = need first appdata length; 1 = have it
@@ -2194,8 +2549,8 @@ static int update_domain_info (struct domain_info *info) {
     if (is_failed[i]) {
       continue;
     }
-    requests[i] = create_request (domain);
-    if (requests[i] == NULL) {
+    requests[i] = create_request (domain, &request_len[i]);
+    if (requests[i] == NULL || request_len[i] <= 0) {
       kprintf ("Failed to build probe request for checking domain %s\n", domain);
       if (sockets[i] >= 0) {
         close (sockets[i]);
@@ -2381,8 +2736,8 @@ static int update_domain_info (struct domain_info *info) {
       }
       if (FD_ISSET(sockets[i], &write_fd)) {
         assert (!is_written[i]);
-        ssize_t write_res = write (sockets[i], requests[i], TLS_REQUEST_LENGTH);
-        if (write_res != TLS_REQUEST_LENGTH) {
+        ssize_t write_res = write (sockets[i], requests[i], (size_t)request_len[i]);
+        if (write_res != request_len[i]) {
           kprintf ("Failed to write request for checking domain %s: %s", domain, write_res == -1 ? strerror (errno) : "Written less bytes than expected");
           is_failed[i] = 1;
           completed_count++;
@@ -2564,7 +2919,7 @@ cleanup:
 #undef MIN_PROBE_SUCCESSES
 }
 
-#undef TLS_REQUEST_LENGTH
+#undef TLS_PROBE_REQUEST_MAX_LENGTH
 
 static const struct domain_info *get_sni_domain_info (const unsigned char *request, int len) {
 #define CHECK_LENGTH(length)  \

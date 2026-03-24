@@ -105,3 +105,11 @@ unsigned char *tcp_rpc_build_tls_startup_response (
   int *out_len,
   struct tcp_rpc_tls_startup_meta *meta
 );
+
+// Internal test/build helper: construct the outbound front-domain probe
+// ClientHello used for -D profile learning. The returned buffer must be freed
+// by caller.
+unsigned char *tcp_rpc_build_tls_probe_request (
+  const char *domain,
+  int *out_len
+);

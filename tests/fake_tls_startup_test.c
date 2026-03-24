@@ -15,6 +15,14 @@ static int read_u16 (const unsigned char *data, int pos) {
   return (data[pos] << 8) | data[pos + 1];
 }
 
+static int read_u24 (const unsigned char *data, int pos) {
+  return (data[pos] << 16) | (data[pos + 1] << 8) | data[pos + 2];
+}
+
+static int is_grease_u16 (int value) {
+  return (((value >> 8) & 0xff) == (value & 0xff)) && ((value & 0x0f) == 0x0a);
+}
+
 static void build_client_hello (unsigned char *client_hello, int len) {
   int i;
   memset (client_hello, 0, (size_t) len);
@@ -472,11 +480,215 @@ static void run_payload_family_cases (void) {
   }
 }
 
+static void check_probe_request_shape_once (const char *domain, int *order_hash_out) {
+  unsigned char *request;
+  int request_len = 0;
+  int pos;
+  int record_len;
+  int handshake_len;
+  int cipher_suites_len;
+  int compression_methods_len;
+  int extensions_len;
+  int extensions_end;
+  int found_sni = 0;
+  int found_alpn = 0;
+  int found_padding = 0;
+  int found_hybrid = 0;
+  int found_x25519 = 0;
+  int found_supported_versions = 0;
+  int found_grease_ext = 0;
+  int found_grease_group = 0;
+  int found_grease_cipher = 0;
+  int order_hash = 0;
+
+  request = tcp_rpc_build_tls_probe_request (domain, &request_len);
+  if (request == NULL) {
+    fail ("probe request: builder returned NULL");
+  }
+  if (request_len <= 517 || request_len > 4096) {
+    free (request);
+    fail ("probe request: unexpected total length");
+  }
+  if (memcmp (request, "\x16\x03\x01", 3) != 0) {
+    free (request);
+    fail ("probe request: bad TLS record prefix");
+  }
+  record_len = read_u16 (request, 3);
+  if (record_len != request_len - 5) {
+    free (request);
+    fail ("probe request: bad TLS record length");
+  }
+  if (request[5] != 0x01) {
+    free (request);
+    fail ("probe request: not a ClientHello");
+  }
+  handshake_len = read_u24 (request, 6);
+  if (handshake_len != request_len - 9) {
+    free (request);
+    fail ("probe request: bad handshake length");
+  }
+  if (memcmp (request + 9, "\x03\x03", 2) != 0) {
+    free (request);
+    fail ("probe request: bad ClientHello version");
+  }
+  if (request[43] != 0x20) {
+    free (request);
+    fail ("probe request: session id length is not 32");
+  }
+
+  pos = 44 + 32;
+  cipher_suites_len = read_u16 (request, pos);
+  if (cipher_suites_len < 4 || pos + 2 + cipher_suites_len + 1 > request_len) {
+    free (request);
+    fail ("probe request: bad cipher suite list length");
+  }
+  if (is_grease_u16 (read_u16 (request, pos + 2))) {
+    found_grease_cipher = 1;
+  }
+  pos += 2 + cipher_suites_len;
+  compression_methods_len = request[pos++];
+  if (compression_methods_len <= 0 || pos + compression_methods_len + 2 > request_len) {
+    free (request);
+    fail ("probe request: bad compression methods length");
+  }
+  pos += compression_methods_len;
+  extensions_len = read_u16 (request, pos);
+  pos += 2;
+  extensions_end = pos + extensions_len;
+  if (extensions_end != request_len) {
+    free (request);
+    fail ("probe request: extension block length mismatch");
+  }
+
+  while (pos < extensions_end) {
+    int ext = read_u16 (request, pos);
+    int ext_len = read_u16 (request, pos + 2);
+    const unsigned char *payload = request + pos + 4;
+    pos += 4;
+    if (pos + ext_len > extensions_end) {
+      free (request);
+      fail ("probe request: extension overruns block");
+    }
+    order_hash = order_hash * 131 + ext;
+    if (is_grease_u16 (ext)) {
+      found_grease_ext = 1;
+    }
+    switch (ext) {
+      case 0x0000:
+        if (ext_len >= 5) {
+          int server_name_list_len = read_u16 (payload, 0);
+          int host_len = read_u16 (payload, 3);
+          if (server_name_list_len == ext_len - 2 &&
+              payload[2] == 0x00 &&
+              host_len == (int)strlen (domain) &&
+              ext_len == host_len + 5 &&
+              !memcmp (payload + 5, domain, (size_t)host_len)) {
+            found_sni = 1;
+          }
+        }
+        break;
+      case 0x000a:
+        if (ext_len >= 6 && is_grease_u16 (read_u16 (payload, 2))) {
+          found_grease_group = 1;
+        }
+        break;
+      case 0x0010:
+        if (ext_len >= 14 &&
+            memmem (payload, (size_t)ext_len, "\x02\x68\x32", 3) != NULL &&
+            memmem (payload, (size_t)ext_len, "\x08\x68\x74\x74\x70\x2f\x31\x2e\x31", 9) != NULL) {
+          found_alpn = 1;
+        }
+        break;
+      case 0x0015:
+        found_padding = 1;
+        break;
+      case 0x002b:
+        if (ext_len >= 5 && payload[0] >= 4 && memmem (payload + 1, (size_t)(ext_len - 1), "\x03\x04\x03\x03", 4) != NULL) {
+          found_supported_versions = 1;
+        }
+        break;
+      case 0x0033: {
+        int kp = 0;
+        if (ext_len < 2) {
+          free (request);
+          fail ("probe request: short key_share extension");
+        }
+        kp += 2;
+        while (kp + 4 <= ext_len) {
+          int group = read_u16 (payload, kp);
+          int key_len = read_u16 (payload, kp + 2);
+          kp += 4;
+          if (kp + key_len > ext_len) {
+            free (request);
+            fail ("probe request: malformed key_share entry");
+          }
+          if (group == 0x11ec && key_len == 1216) {
+            found_hybrid = 1;
+          }
+          if (group == 0x001d && key_len == 32) {
+            found_x25519 = 1;
+          }
+          kp += key_len;
+        }
+        if (kp != ext_len) {
+          free (request);
+          fail ("probe request: trailing bytes in key_share extension");
+        }
+        break;
+      }
+    }
+    pos += ext_len;
+  }
+
+  free (request);
+
+  if (!found_sni) {
+    fail ("probe request: SNI missing or malformed");
+  }
+  if (!found_alpn) {
+    fail ("probe request: ALPN missing expected values");
+  }
+  if (!found_padding) {
+    fail ("probe request: padding extension missing");
+  }
+  if (!found_hybrid || !found_x25519) {
+    fail ("probe request: missing expected key shares");
+  }
+  if (!found_supported_versions) {
+    fail ("probe request: supported_versions missing TLS 1.3");
+  }
+  if (!found_grease_ext || !found_grease_group || !found_grease_cipher) {
+    fail ("probe request: GREASE markers missing");
+  }
+
+  *order_hash_out = order_hash;
+}
+
+static void run_probe_request_cases (void) {
+  int i;
+  int seen_distinct_order = 0;
+  int last_hash = 0;
+
+  for (i = 0; i < 16; i++) {
+    int order_hash = 0;
+    check_probe_request_shape_once ("scan.kaspersky.ru", &order_hash);
+    if (i > 0 && order_hash != last_hash) {
+      seen_distinct_order = 1;
+    }
+    last_hash = order_hash;
+  }
+
+  if (!seen_distinct_order) {
+    fail ("probe request: extension permutation was not exercised");
+  }
+}
+
 int main (void) {
   run_case (1);
   run_case (0);
   run_negative_cases ();
   run_payload_family_cases ();
+  run_probe_request_cases ();
   puts ("fake_tls_startup_test: ok");
   return 0;
 }
